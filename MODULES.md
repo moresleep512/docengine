@@ -6,9 +6,9 @@ orchestration, and editor-layout virtualization code were removed because their
 public contracts encoded TypeMD-specific document and UI policy.
 
 The source tree is an independent Go 1.26 module named
-`github.com/moresleep512/docengine`. CI runs formatting, vet, tests, the race
-detector, and a short Piece Tree fuzz smoke test on Linux; the regular test job
-also runs on Windows.
+`github.com/moresleep512/docengine`. CI runs formatting, vet, tests, a 100%
+statement-coverage gate, the race detector, and short Piece Tree and journal
+decoder fuzz smoke tests on Linux; the regular test job also runs on Windows.
 
 ## Dependency direction
 
@@ -122,6 +122,11 @@ batch is returned. The valid prefix is returned to the caller, which may call
 Journal methods are serialized with a mutex. Appending does not sync every
 frame; `document.Session` periodically calls `Sync`, trading at most a small
 window of recent edits for lower foreground latency.
+
+The journal file is accessed through a package-private minimal interface. This
+does not change the public API or file format, but lets tests deterministically
+cover stat, header-write, short-write, sync, seek, truncation, replay-read, and
+close failures. The current Windows build has 100% statement coverage.
 
 ### Important limitations
 
@@ -248,6 +253,11 @@ revision and batch limits, undo quota, default temporary directories,
 and file identity policy. These are generic local text-engine policies, not
 TypeMD/Markdown business behavior, but they may eventually become injected
 configuration.
+
+Session orchestration uses package-private runtime operations for base-file,
+recovery, tree-clone, stat, and atomic-save boundaries. Tests inject failures at
+each publication and rebase stage without changing the public `Session` API.
+The current Windows build has 100% statement coverage for `document`.
 
 ### Important limitations
 

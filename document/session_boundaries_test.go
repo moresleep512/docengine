@@ -378,6 +378,36 @@ func TestReplayErrorAndLegacyRootBranches(t *testing.T) {
 			t.Fatal("expected replacement source-range error")
 		}
 	})
+	t.Run("short read without error", func(t *testing.T) {
+		session, _, _ := openAtomicTestSession(t, "abc")
+		defer session.Close()
+		if err := session.ensureJournalLocked(); err != nil {
+			t.Fatal(err)
+		}
+		session.operations.readRecovery = func(*recovery.Journal, []byte, int64) (int, error) { return 0, nil }
+		err := session.replay(recovery.ReplayResult{Frames: []recovery.Frame{{Kind: recovery.FrameReplace, Revision: 1, InsertLength: 1}}})
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("replay error = %v", err)
+		}
+	})
+	t.Run("missing tree journal source", func(t *testing.T) {
+		session, _, _ := openAtomicTestSession(t, "abc")
+		defer session.Close()
+		if err := session.ensureJournalLocked(); err != nil {
+			t.Fatal(err)
+		}
+		offset, err := session.journal.AppendReplace(1, 0, 0, []byte("x"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		session.tree.SetSource(store.SourceJournal, nil)
+		err = session.replay(recovery.ReplayResult{Frames: []recovery.Frame{{
+			Kind: recovery.FrameReplace, Revision: 1, InsertLength: 1, PayloadOffset: offset,
+		}}})
+		if !errors.Is(err, store.ErrUnknownSource) {
+			t.Fatalf("replay error = %v", err)
+		}
+	})
 }
 
 func TestConcurrentSaveReportsNewJournalCreationFailure(t *testing.T) {

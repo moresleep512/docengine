@@ -74,9 +74,32 @@ type ReplayResult struct {
 	Truncated  bool
 }
 
+type journalFile interface {
+	io.ReaderAt
+	io.Writer
+	io.WriterAt
+	io.Seeker
+	Stat() (os.FileInfo, error)
+	Sync() error
+	Truncate(int64) error
+	Close() error
+}
+
+type journalOpenOperations struct {
+	mkdirAll func(string, os.FileMode) error
+	openFile func(string, int, os.FileMode) (journalFile, error)
+}
+
+var systemJournalOpenOperations = journalOpenOperations{
+	mkdirAll: os.MkdirAll,
+	openFile: func(path string, flag int, permission os.FileMode) (journalFile, error) {
+		return os.OpenFile(path, flag, permission)
+	},
+}
+
 type Journal struct {
 	mu   sync.Mutex
-	file *os.File
+	file journalFile
 	path string
 }
 
@@ -91,10 +114,14 @@ func FingerprintFor(path string, info os.FileInfo) Fingerprint {
 }
 
 func Open(path string, fingerprint Fingerprint) (*Journal, ReplayResult, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	return openJournal(path, fingerprint, systemJournalOpenOperations)
+}
+
+func openJournal(path string, fingerprint Fingerprint, operations journalOpenOperations) (*Journal, ReplayResult, error) {
+	if err := operations.mkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, ReplayResult{}, err
 	}
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	file, err := operations.openFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, ReplayResult{}, err
 	}
@@ -363,7 +390,7 @@ func (j *Journal) Close() error {
 	return err
 }
 
-func writeFileHeader(file *os.File, fingerprint Fingerprint) error {
+func writeFileHeader(file journalFile, fingerprint Fingerprint) error {
 	header := make([]byte, fileHeaderSize)
 	copy(header[:8], fileMagic[:])
 	binary.LittleEndian.PutUint32(header[8:12], journalVersion)
@@ -377,7 +404,7 @@ func writeFileHeader(file *os.File, fingerprint Fingerprint) error {
 	return file.Sync()
 }
 
-func readFileHeader(file *os.File) (Fingerprint, error) {
+func readFileHeader(file io.ReaderAt) (Fingerprint, error) {
 	header := make([]byte, fileHeaderSize)
 	if _, err := file.ReadAt(header, 0); err != nil {
 		return Fingerprint{}, err
@@ -461,7 +488,7 @@ func encodeBatchPayload(firstRevision uint64, operations []ReplaceOperation) ([]
 	return payload, relativeOffsets, nil
 }
 
-func decodeBatchFrames(file *os.File, frame Frame) ([]Frame, bool, error) {
+func decodeBatchFrames(file io.ReaderAt, frame Frame) ([]Frame, bool, error) {
 	if frame.Start <= 0 || frame.Start > maximumBatchSize || frame.DeleteLength != batchRecordSize {
 		return nil, false, nil
 	}

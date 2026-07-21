@@ -155,12 +155,10 @@ The current development environment has been verified with MinGW-w64 GCC using
 
 At the current milestone the repository contains:
 
-- 71 top-level conventional tests on Windows, with additional table-driven
+- 78 top-level conventional tests on Windows, with additional table-driven
   subtests;
-- 1 Go fuzz target;
-- 100% statement coverage for `document/store`;
-- 100% statement coverage for `document/save` on Windows;
-- 95.0% statement coverage for `document` and 94.9% for `recovery`;
+- 2 Go fuzz targets;
+- 100% statement coverage for every package in the current Windows build;
 - a randomized byte-slice reference-model test;
 - 10,000 sequential-insert balance coverage;
 - concurrent snapshot readers during edits;
@@ -179,7 +177,9 @@ go test -race -shuffle=on -count=3 ./...       PASS
 ```
 
 A 30-second local fuzz run completed 1,664,638 executions without finding a
-failure. CI also runs a short fuzz smoke test on every change.
+failure. A separate 30-second journal-decoder fuzz run completed 14,007,342
+executions without finding a failure. CI also enforces 100% statement coverage
+and runs short smoke tests for both fuzz targets on every change.
 
 Run the main checks:
 
@@ -223,7 +223,7 @@ MSVC-target `cl.exe` or `clang-cl.exe`.
 
 ### P1: recovery and persistence
 
-- Fuzz journal headers, frames, payload lengths, CRC failures, and replay.
+- Extend journal decoder fuzzing to stateful CRC and replay sequences.
 - Strengthen base-file identity and define a compatibility/migration policy.
 - Extend atomic-save fault injection to platform-specific durability behavior.
 - Review POSIX directory durability and Windows replacement edge cases.

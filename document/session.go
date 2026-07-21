@@ -96,6 +96,30 @@ type stagedOperation struct {
 
 const stagingSourceID store.SourceID = 255
 
+type sessionOperations struct {
+	openBase      func(string) (*os.File, error)
+	stat          func(string) (os.FileInfo, error)
+	openRecovery  func(string, recovery.Fingerprint) (*recovery.Journal, recovery.ReplayResult, error)
+	readRecovery  func(*recovery.Journal, []byte, int64) (int, error)
+	newTree       func(io.ReaderAt, store.Piece) (*store.Tree, error)
+	cloneTree     func(*store.Tree) (*store.Tree, error)
+	atomicChecked func(string, os.FileMode, []byte, func(io.Writer) (int64, error), func() error) (int64, error)
+}
+
+var systemSessionOperations = sessionOperations{
+	openBase:     openBase,
+	stat:         os.Stat,
+	openRecovery: recovery.Open,
+	readRecovery: func(journal *recovery.Journal, buffer []byte, offset int64) (int, error) {
+		return journal.ReadAt(buffer, offset)
+	},
+	newTree: store.NewWithBasePiece,
+	cloneTree: func(source *store.Tree) (*store.Tree, error) {
+		return cloneDocumentTree(source), nil
+	},
+	atomicChecked: save.AtomicChecked,
+}
+
 type fileIdentity struct {
 	size    int64
 	modTime int64
@@ -129,14 +153,19 @@ type Session struct {
 	commitHook        func(string)
 	stopSync          chan struct{}
 	syncDone          chan struct{}
+	operations        sessionOperations
 }
 
 func Open(path string, options OpenOptions) (*Session, error) {
+	return openSession(path, options, systemSessionOperations)
+}
+
+func openSession(path string, options OpenOptions, operations sessionOperations) (*Session, error) {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
 	}
-	base, err := openBase(absolute)
+	base, err := operations.openBase(absolute)
 	if err != nil {
 		return nil, err
 	}
@@ -173,13 +202,13 @@ func Open(path string, options OpenOptions) (*Session, error) {
 		return nil, err
 	}
 	fingerprint := recovery.FingerprintFor(absolute, info)
-	journal, replay, err := openMatchingJournal(options.RecoveryDir, fingerprint)
+	journal, replay, err := openMatchingJournalWith(options.RecoveryDir, fingerprint, operations.openRecovery)
 	if err != nil {
 		_ = undo.close()
 		_ = base.Close()
 		return nil, err
 	}
-	tree, err := store.NewWithBasePiece(base, store.Piece{Source: store.SourceBase, Offset: baseOffset, Length: info.Size() - baseOffset})
+	tree, err := operations.newTree(base, store.Piece{Source: store.SourceBase, Offset: baseOffset, Length: info.Size() - baseOffset})
 	if err != nil {
 		if journal != nil {
 			_ = journal.Close()
@@ -196,7 +225,7 @@ func Open(path string, options OpenOptions) (*Session, error) {
 		path: absolute, mode: info.Mode(), base: base, journal: journal, generation: generation, tree: tree,
 		undoStore: undo, hasBOM: hasBOM, eol: detectEOL(textSample), recoveryDir: options.RecoveryDir,
 		sessionDir: options.SessionDir, fingerprint: fingerprint, diskIdentity: identityFor(info),
-		stopSync: make(chan struct{}), syncDone: make(chan struct{}),
+		stopSync: make(chan struct{}), syncDone: make(chan struct{}), operations: operations,
 	}
 	if journal != nil {
 		if err := session.replay(replay); err != nil {
@@ -217,6 +246,10 @@ func Open(path string, options OpenOptions) (*Session, error) {
 }
 
 func openMatchingJournal(dir string, fingerprint recovery.Fingerprint) (*recovery.Journal, recovery.ReplayResult, error) {
+	return openMatchingJournalWith(dir, fingerprint, recovery.Open)
+}
+
+func openMatchingJournalWith(dir string, fingerprint recovery.Fingerprint, openRecovery func(string, recovery.Fingerprint) (*recovery.Journal, recovery.ReplayResult, error)) (*recovery.Journal, recovery.ReplayResult, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, recovery.ReplayResult{}, err
 	}
@@ -235,7 +268,7 @@ func openMatchingJournal(dir string, fingerprint recovery.Fingerprint) (*recover
 			_ = os.Rename(path, fmt.Sprintf("%s.stale-%d", path, time.Now().UnixNano()))
 			continue
 		}
-		journal, replay, openErr := recovery.Open(path, fingerprint)
+		journal, replay, openErr := openRecovery(path, fingerprint)
 		return journal, replay, openErr
 	}
 	return nil, recovery.ReplayResult{}, nil
@@ -260,7 +293,7 @@ func (s *Session) replay(result recovery.ReplayResult) error {
 			}
 			inserted := make([]byte, frame.InsertLength)
 			if frame.InsertLength > 0 {
-				n, readErr := s.journal.ReadAt(inserted, frame.PayloadOffset)
+				n, readErr := s.operations.readRecovery(s.journal, inserted, frame.PayloadOffset)
 				if readErr != nil && !(errors.Is(readErr, io.EOF) && n == len(inserted)) {
 					return readErr
 				}
@@ -387,7 +420,7 @@ func (s *Session) applyOperationsLocked(ctx context.Context, operations []Replac
 	if err != nil {
 		return err
 	}
-	finalTree, err := cloneDocumentTree(s.tree)
+	finalTree, err := s.operations.cloneTree(s.tree)
 	if err != nil {
 		_ = s.journal.RepairTail(appendResult.FrameOffset)
 		return err
@@ -445,7 +478,7 @@ func (s *Session) applyOperationsLocked(ctx context.Context, operations []Replac
 }
 
 func (s *Session) stageOperationsLocked(ctx context.Context, operations []ReplaceOperation) ([]stagedOperation, error) {
-	stagedTree, err := cloneDocumentTree(s.tree)
+	stagedTree, err := s.operations.cloneTree(s.tree)
 	if err != nil {
 		return nil, err
 	}
@@ -485,13 +518,10 @@ func (s *Session) stageOperationsLocked(ctx context.Context, operations []Replac
 	return result, nil
 }
 
-func cloneDocumentTree(source *store.Tree) (*store.Tree, error) {
-	clone, err := store.New(nil, 0)
-	if err != nil {
-		return nil, err
-	}
+func cloneDocumentTree(source *store.Tree) *store.Tree {
+	clone, _ := store.New(nil, 0) // Empty trees are valid by construction.
 	clone.Restore(source.Snapshot())
-	return clone, nil
+	return clone
 }
 
 func (s *Session) Undo() (ApplyResult, error) {
@@ -572,7 +602,7 @@ func (s *Session) ensureJournalLocked() error {
 		return nil
 	}
 	path := filepath.Join(s.recoveryDir, journalPrefix(s.fingerprint)+"."+randomSuffix()+".docengine-journal")
-	journal, _, err := recovery.Open(path, s.fingerprint)
+	journal, _, err := s.operations.openRecovery(path, s.fingerprint)
 	if err != nil {
 		return err
 	}
@@ -619,7 +649,7 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (Metadata, error) {
 	}
 
 	checkIdentity := func() error {
-		info, statErr := os.Stat(path)
+		info, statErr := s.operations.stat(path)
 		if statErr != nil {
 			return statErr
 		}
@@ -631,22 +661,22 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (Metadata, error) {
 	if err := checkIdentity(); err != nil {
 		return Metadata{}, err
 	}
-	if _, err := save.AtomicChecked(path, mode, prefix, lease.WriteTo, checkIdentity); err != nil {
+	if _, err := s.operations.atomicChecked(path, mode, prefix, lease.WriteTo, checkIdentity); err != nil {
 		return Metadata{}, err
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	info, err := os.Stat(path)
+	info, err := s.operations.stat(path)
 	if err != nil {
 		return Metadata{}, err
 	}
 	newFingerprint := recovery.FingerprintFor(path, info)
-	newBase, err := openBase(path)
+	newBase, err := s.operations.openBase(path)
 	if err != nil {
 		return Metadata{}, err
 	}
-	newTree, err := store.NewWithBasePiece(newBase, store.Piece{Source: store.SourceBase, Offset: boolOffset(s.hasBOM, 3), Length: info.Size() - boolOffset(s.hasBOM, 3)})
+	newTree, err := s.operations.newTree(newBase, store.Piece{Source: store.SourceBase, Offset: boolOffset(s.hasBOM, 3), Length: info.Size() - boolOffset(s.hasBOM, 3)})
 	if err != nil {
 		_ = newBase.Close()
 		return Metadata{}, err
@@ -655,7 +685,7 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (Metadata, error) {
 	remaining := make([]pendingOperation, 0)
 	if s.revision > targetRevision {
 		journalPath := filepath.Join(s.recoveryDir, journalPrefix(newFingerprint)+"."+randomSuffix()+".docengine-journal")
-		newJournal, _, openErr := recovery.Open(journalPath, newFingerprint)
+		newJournal, _, openErr := s.operations.openRecovery(journalPath, newFingerprint)
 		if openErr != nil {
 			newGeneration.retireAndWait(true)
 			return Metadata{}, openErr
@@ -679,7 +709,7 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (Metadata, error) {
 				operation := newer[index]
 				inserted := make([]byte, operation.insertLength)
 				if operation.insertLength > 0 {
-					n, readErr := s.journal.ReadAt(inserted, operation.insertOffset)
+					n, readErr := s.operations.readRecovery(s.journal, inserted, operation.insertOffset)
 					if readErr != nil && !(errors.Is(readErr, io.EOF) && int64(n) == operation.insertLength) {
 						newGeneration.retireAndWait(true)
 						return Metadata{}, readErr

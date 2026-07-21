@@ -122,11 +122,9 @@ Docengine 与 TypeMD 目前不会自动同步。本仓库的改动不会影响 T
 
 当前里程碑包含：
 
-- Windows 下有 71 个顶层普通测试，并包含更多表驱动子测试；
-- 1 个 Go fuzz target；
-- `document/store` 语句覆盖率 100%；
-- Windows 下 `document/save` 语句覆盖率 100%；
-- `document` 语句覆盖率 95.0%，`recovery` 为 94.9%；
+- Windows 下有 78 个顶层普通测试，并包含更多表驱动子测试；
+- 2 个 Go fuzz target；
+- 当前 Windows 构建下，每个 package 的语句覆盖率均为 100%；
 - 基于普通字节切片的随机参考模型测试；
 - 10,000 次顺序插入后的平衡性覆盖；
 - 编辑期间并发 Snapshot reader；
@@ -144,7 +142,7 @@ go test -race ./...                            PASS
 go test -race -shuffle=on -count=3 ./...       PASS
 ```
 
-一次 30 秒本机 fuzz 共完成 1,664,638 次执行，没有发现失败。CI 也会在每次改动时运行短时 fuzz smoke test。
+一次 30 秒 Piece Tree fuzz 共完成 1,664,638 次执行；另一次 30 秒 journal decoder fuzz 完成 14,007,342 次执行，均未发现失败。CI 会持续强制 100% 语句覆盖率，并在每次改动时对两个 fuzz target 都运行短时 smoke test。
 
 运行主要检查：
 
@@ -184,7 +182,7 @@ Windows race 构建需要 GCC 兼容的 MinGW-w64 工具链，不能直接使用
 
 ### P1：恢复与持久化
 
-- 对 journal header、frame、payload 长度、CRC 失败和 replay 进行 fuzz；
+- 把 journal decoder fuzz 扩展到有状态 CRC 与 replay 序列；
 - 加强基础文件身份检查，并定义兼容与迁移策略；
 - 把原子保存故障注入继续扩展到各平台特有的持久性行为；
 - 审查 POSIX 目录持久性和 Windows 文件替换边界。
