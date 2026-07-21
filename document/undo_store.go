@@ -70,6 +70,9 @@ func (s *undoStore) read(ref textRef) (string, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.file == nil {
+		return "", ErrClosed
+	}
 	buffer := make([]byte, ref.length)
 	n, err := s.file.ReadAt(buffer, ref.offset)
 	if err != nil && !(errors.Is(err, io.EOF) && int64(n) == ref.length) {
@@ -84,6 +87,9 @@ func (s *undoStore) reset() error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.file == nil {
+		return ErrClosed
+	}
 	if err := s.file.Truncate(0); err != nil {
 		return err
 	}

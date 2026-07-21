@@ -11,10 +11,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -31,6 +31,7 @@ var (
 	ErrNothingToUndo    = errors.New("document: nothing to undo")
 	ErrNothingToRedo    = errors.New("document: nothing to redo")
 	ErrExternalChange   = errors.New("document: file changed on disk")
+	ErrRevisionOverflow = errors.New("document: revision overflow")
 )
 
 type EOLStyle string
@@ -86,6 +87,14 @@ type pendingOperation struct {
 	start, deleteLength        int64
 	insertOffset, insertLength int64
 }
+
+type stagedOperation struct {
+	operation ReplaceOperation
+	inserted  []byte
+	deleted   []byte
+}
+
+const stagingSourceID store.SourceID = 255
 
 type fileIdentity struct {
 	size    int64
@@ -251,11 +260,22 @@ func (s *Session) replay(result recovery.ReplayResult) error {
 			}
 			inserted := make([]byte, frame.InsertLength)
 			if frame.InsertLength > 0 {
-				if _, err := s.journal.ReadAt(inserted, frame.PayloadOffset); err != nil && !errors.Is(err, io.EOF) {
-					return err
+				n, readErr := s.journal.ReadAt(inserted, frame.PayloadOffset)
+				if readErr != nil && !(errors.Is(readErr, io.EOF) && n == len(inserted)) {
+					return readErr
+				}
+				if n != len(inserted) {
+					return io.ErrUnexpectedEOF
 				}
 			}
-			forwardRef, inverseRef := s.historyText(inserted), s.historyText(deleted)
+			forwardRef, err := s.historyText(inserted)
+			if err != nil {
+				return err
+			}
+			inverseRef, err := s.historyText(deleted)
+			if err != nil {
+				return err
+			}
 			piece := store.Piece{}
 			if frame.InsertLength > 0 {
 				piece = store.Piece{Source: store.SourceJournal, Offset: frame.PayloadOffset, Length: frame.InsertLength, Newlines: int64(bytes.Count(inserted, []byte{'\n'})), NewlinesKnown: true}
@@ -342,51 +362,136 @@ func (s *Session) ApplyBatch(ctx context.Context, expectedRevision uint64, opera
 }
 
 func (s *Session) applyOperationsLocked(ctx context.Context, operations []ReplaceOperation, recordHistory bool) error {
+	if s.revision > math.MaxUint64-uint64(len(operations)) {
+		return ErrRevisionOverflow
+	}
 	group := s.revision + 1
 	epoch := s.undoEpoch
-	entry := historyEntry{}
-	for _, op := range operations {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if !utf8.ValidString(op.Insert) || len(op.Insert) > 1<<20 {
-			return errors.New("document: invalid or oversized insertion")
-		}
-		length := s.tree.Len()
-		if op.Start < 0 || op.DeleteLength < 0 || op.Start > length || op.DeleteLength > length-op.Start {
-			return store.ErrInvalidRange
-		}
-		deleted, err := readTreeRange(s.tree, op.Start, op.DeleteLength)
-		if err != nil {
-			return err
-		}
-		forwardRef, inverseRef := s.historyText([]byte(op.Insert)), s.historyText(deleted)
-		if err := s.ensureJournalLocked(); err != nil {
-			return err
-		}
-		nextRevision := s.revision + 1
-		offset, err := s.journal.AppendReplaceGroup(nextRevision, op.Start, op.DeleteLength, []byte(op.Insert), group)
-		if err != nil {
-			return err
-		}
-		piece := store.Piece{}
-		if op.Insert != "" {
-			piece = store.Piece{Source: store.SourceJournal, Offset: offset, Length: int64(len(op.Insert)), Newlines: int64(strings.Count(op.Insert, "\n")), NewlinesKnown: true}
-		}
-		if _, _, err := s.tree.ReplacePiece(op.Start, op.DeleteLength, piece); err != nil {
-			return err
-		}
-		s.pending = append(s.pending, pendingOperation{revision: nextRevision, group: group, start: op.Start, deleteLength: op.DeleteLength, insertOffset: offset, insertLength: int64(len(op.Insert))})
-		entry.forward = append(entry.forward, historyOperation{start: op.Start, deleteLength: op.DeleteLength, insert: forwardRef})
-		entry.inverse = append([]historyOperation{{start: op.Start, deleteLength: int64(len(op.Insert)), insert: inverseRef}}, entry.inverse...)
-		s.revision = nextRevision
-		s.dirty = s.revision > s.committedRevision
+	staged, err := s.stageOperationsLocked(ctx, operations)
+	if err != nil {
+		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := s.ensureJournalLocked(); err != nil {
+		return err
+	}
+	recoveryOperations := make([]recovery.ReplaceOperation, len(staged))
+	for index, operation := range staged {
+		recoveryOperations[index] = recovery.ReplaceOperation{
+			Start: operation.operation.Start, DeleteLength: operation.operation.DeleteLength, Inserted: operation.inserted,
+		}
+	}
+	appendResult, err := s.journal.AppendReplaceBatch(s.revision+1, group, recoveryOperations)
+	if err != nil {
+		return err
+	}
+	finalTree, err := cloneDocumentTree(s.tree)
+	if err != nil {
+		_ = s.journal.RepairTail(appendResult.FrameOffset)
+		return err
+	}
+	for index, operation := range staged {
+		piece := store.Piece{}
+		if len(operation.inserted) > 0 {
+			piece = store.Piece{
+				Source: store.SourceJournal, Offset: appendResult.PayloadOffsets[index], Length: int64(len(operation.inserted)),
+				Newlines: int64(bytes.Count(operation.inserted, []byte{'\n'})), NewlinesKnown: true,
+			}
+		}
+		if _, _, replaceErr := finalTree.ReplacePiece(operation.operation.Start, operation.operation.DeleteLength, piece); replaceErr != nil {
+			repairErr := s.journal.RepairTail(appendResult.FrameOffset)
+			return errors.Join(replaceErr, repairErr)
+		}
+	}
+
+	entry := historyEntry{}
+	if recordHistory {
+		for _, operation := range staged {
+			forwardRef, historyErr := s.historyText(operation.inserted)
+			if historyErr != nil {
+				return errors.Join(historyErr, s.journal.RepairTail(appendResult.FrameOffset))
+			}
+			inverseRef, historyErr := s.historyText(operation.deleted)
+			if historyErr != nil {
+				return errors.Join(historyErr, s.journal.RepairTail(appendResult.FrameOffset))
+			}
+			entry.forward = append(entry.forward, historyOperation{
+				start: operation.operation.Start, deleteLength: operation.operation.DeleteLength, insert: forwardRef,
+			})
+			entry.inverse = append([]historyOperation{{
+				start: operation.operation.Start, deleteLength: int64(len(operation.inserted)), insert: inverseRef,
+			}}, entry.inverse...)
+		}
+	}
+
+	s.tree = finalTree
+	firstRevision := s.revision + 1
+	for index, operation := range staged {
+		revision := firstRevision + uint64(index)
+		s.pending = append(s.pending, pendingOperation{
+			revision: revision, group: group, start: operation.operation.Start, deleteLength: operation.operation.DeleteLength,
+			insertOffset: appendResult.PayloadOffsets[index], insertLength: int64(len(operation.inserted)),
+		})
+	}
+	s.revision += uint64(len(staged))
+	s.dirty = s.revision > s.committedRevision
 	if recordHistory && epoch == s.undoEpoch {
 		s.undo = append(s.undo, entry)
 		s.redo = nil
 	}
 	return nil
+}
+
+func (s *Session) stageOperationsLocked(ctx context.Context, operations []ReplaceOperation) ([]stagedOperation, error) {
+	stagedTree, err := cloneDocumentTree(s.tree)
+	if err != nil {
+		return nil, err
+	}
+	var stagingBytes []byte
+	result := make([]stagedOperation, 0, len(operations))
+	for _, op := range operations {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !utf8.ValidString(op.Insert) || len(op.Insert) > 1<<20 {
+			return nil, errors.New("document: invalid or oversized insertion")
+		}
+		length := stagedTree.Len()
+		if op.Start < 0 || op.DeleteLength < 0 || op.Start > length || op.DeleteLength > length-op.Start {
+			return nil, store.ErrInvalidRange
+		}
+		deleted, err := readTreeRange(stagedTree, op.Start, op.DeleteLength)
+		if err != nil {
+			return nil, err
+		}
+		inserted := []byte(op.Insert)
+		offset := len(stagingBytes)
+		stagingBytes = append(stagingBytes, inserted...)
+		stagedTree.SetSource(stagingSourceID, bytes.NewReader(stagingBytes))
+		piece := store.Piece{}
+		if len(inserted) > 0 {
+			piece = store.Piece{
+				Source: stagingSourceID, Offset: int64(offset), Length: int64(len(inserted)),
+				Newlines: int64(bytes.Count(inserted, []byte{'\n'})), NewlinesKnown: true,
+			}
+		}
+		if _, _, err := stagedTree.ReplacePiece(op.Start, op.DeleteLength, piece); err != nil {
+			return nil, err
+		}
+		result = append(result, stagedOperation{operation: op, inserted: inserted, deleted: deleted})
+	}
+	return result, nil
+}
+
+func cloneDocumentTree(source *store.Tree) (*store.Tree, error) {
+	clone, err := store.New(nil, 0)
+	if err != nil {
+		return nil, err
+	}
+	clone.Restore(source.Snapshot())
+	return clone, nil
 }
 
 func (s *Session) Undo() (ApplyResult, error) {
@@ -439,18 +544,27 @@ func (s *Session) materializeHistory(source []historyOperation) ([]ReplaceOperat
 	return result, nil
 }
 
-func (s *Session) historyText(value []byte) textRef {
+func (s *Session) historyText(value []byte) (textRef, error) {
 	ref, err := s.undoStore.append(value)
 	if err == nil {
-		return ref
+		return ref, nil
 	}
+	if !errors.Is(err, errUndoQuota) {
+		return textRef{}, err
+	}
+	s.undo, s.redo = nil, nil
+	s.undoEpoch++
+	if err := s.undoStore.reset(); err != nil {
+		return textRef{}, err
+	}
+	ref, err = s.undoStore.append(value)
 	if errors.Is(err, errUndoQuota) {
-		s.undo, s.redo = nil, nil
-		s.undoEpoch++
-		_ = s.undoStore.reset()
-		ref, _ = s.undoStore.append(value)
+		// A single history value can exceed the quota (for example, deleting a
+		// very large range). The edit remains valid but intentionally has no
+		// undo entry after the epoch change above.
+		return textRef{}, nil
 	}
-	return ref
+	return ref, err
 }
 
 func (s *Session) ensureJournalLocked() error {
@@ -548,33 +662,57 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (Metadata, error) {
 		}
 		newGeneration.attachJournal(newJournal)
 		newTree.SetSource(store.SourceJournal, newJournal)
+		newer := make([]pendingOperation, 0, len(s.pending))
 		for _, operation := range s.pending {
-			if operation.revision <= targetRevision {
-				continue
+			if operation.revision > targetRevision {
+				newer = append(newer, operation)
 			}
-			inserted := make([]byte, operation.insertLength)
-			if operation.insertLength > 0 {
-				n, readErr := s.journal.ReadAt(inserted, operation.insertOffset)
-				if readErr != nil && !(errors.Is(readErr, io.EOF) && int64(n) == operation.insertLength) {
-					newGeneration.retireAndWait(true)
-					return Metadata{}, readErr
+		}
+		for first := 0; first < len(newer); {
+			last := first + 1
+			for last < len(newer) && newer[last].group == newer[first].group {
+				last++
+			}
+			batch := make([]recovery.ReplaceOperation, last-first)
+			payloads := make([][]byte, last-first)
+			for index := first; index < last; index++ {
+				operation := newer[index]
+				inserted := make([]byte, operation.insertLength)
+				if operation.insertLength > 0 {
+					n, readErr := s.journal.ReadAt(inserted, operation.insertOffset)
+					if readErr != nil && !(errors.Is(readErr, io.EOF) && int64(n) == operation.insertLength) {
+						newGeneration.retireAndWait(true)
+						return Metadata{}, readErr
+					}
 				}
+				batch[index-first] = recovery.ReplaceOperation{
+					Start: operation.start, DeleteLength: operation.deleteLength, Inserted: inserted,
+				}
+				payloads[index-first] = inserted
 			}
-			offset, appendErr := newJournal.AppendReplaceGroup(operation.revision, operation.start, operation.deleteLength, inserted, operation.group)
+			appendResult, appendErr := newJournal.AppendReplaceBatch(newer[first].revision, newer[first].group, batch)
 			if appendErr != nil {
 				newGeneration.retireAndWait(true)
 				return Metadata{}, appendErr
 			}
-			piece := store.Piece{}
-			if len(inserted) > 0 {
-				piece = store.Piece{Source: store.SourceJournal, Offset: offset, Length: int64(len(inserted)), Newlines: int64(bytes.Count(inserted, []byte{'\n'})), NewlinesKnown: true}
+			for index := first; index < last; index++ {
+				inserted := payloads[index-first]
+				piece := store.Piece{}
+				if len(inserted) > 0 {
+					piece = store.Piece{
+						Source: store.SourceJournal, Offset: appendResult.PayloadOffsets[index-first], Length: int64(len(inserted)),
+						Newlines: int64(bytes.Count(inserted, []byte{'\n'})), NewlinesKnown: true,
+					}
+				}
+				operation := newer[index]
+				if _, _, replaceErr := newTree.ReplacePiece(operation.start, operation.deleteLength, piece); replaceErr != nil {
+					newGeneration.retireAndWait(true)
+					return Metadata{}, replaceErr
+				}
+				operation.insertOffset = appendResult.PayloadOffsets[index-first]
+				remaining = append(remaining, operation)
 			}
-			if _, _, replaceErr := newTree.ReplacePiece(operation.start, operation.deleteLength, piece); replaceErr != nil {
-				newGeneration.retireAndWait(true)
-				return Metadata{}, replaceErr
-			}
-			operation.insertOffset = offset
-			remaining = append(remaining, operation)
+			first = last
 		}
 	}
 	oldGeneration := s.generation

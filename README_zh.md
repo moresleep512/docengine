@@ -33,7 +33,7 @@ Docengine 是一个**本地文本文档引擎**，不是应用服务器，也不
 - 远程存储或数据库存储；
 - 已稳定并完成版本化的公共 API。
 
-项目目前处于**早期/实验阶段**。最底层 Piece Tree 已经经过较严格的加固，但事务、恢复和保存语义仍需继续完善，暂时不应视为生产就绪版本。
+项目目前处于**早期/实验阶段**。最底层 Piece Tree 和多操作事务路径已经过较严格的加固，但恢复 fuzz、保存故障注入和公共 API 稳定化仍需继续完善，暂时不应视为生产就绪版本。
 
 ## 与 TypeMD 的关系
 
@@ -74,7 +74,7 @@ Docengine 与 TypeMD 目前不会自动同步。本仓库的改动不会影响 T
 
 ### `recovery`
 
-追加式恢复 journal，包含文件指纹、revision、分组替换 frame、payload CRC-32C 校验、重放和损坏尾部修复。
+追加式恢复 journal，包含文件指纹、revision、原子 batch frame、payload CRC-32C 校验、batch 全有或全无重放和损坏尾部修复；同时保留对旧单替换及 root frame 的读取兼容。
 
 ### `document/save`
 
@@ -106,6 +106,14 @@ Docengine 与 TypeMD 目前不会自动同步。本仓库的改动不会影响 T
 - 测试会检查每个子树缓存的字节数、Piece 数和换行统计；
 - Snapshot 隔离覆盖后续编辑、Source 替换、Source 移除和 Restore。
 
+### 事务与恢复加固
+
+- `ApplyBatch` 会先在隔离 Tree 上按顺序预演全部编辑，再发布任何状态；
+- 一个 batch 只写入一个带校验和的 journal frame，只有操作表和 payload 全部验证成功后才会参与重放；
+- 校验失败、取消、journal 故障、undo store 故障和 revision 溢出都不会改变正文、revision、pending 操作或历史；
+- 保存期间出现的新编辑，会按原编辑组以原子 batch 方式重基到新 journal；
+- 端到端测试把编辑、Snapshot 隔离、崩溃恢复、分组 undo/redo、保存和干净重开串在一起验证。
+
 ### 本机工具链验证
 
 当前开发环境已使用 MinGW-w64 GCC 和 `CGO_ENABLED=1` 完成验证，可以在 Windows 本机运行 Go race detector。
@@ -114,13 +122,17 @@ Docengine 与 TypeMD 目前不会自动同步。本仓库的改动不会影响 T
 
 当前里程碑包含：
 
-- 26 个普通测试；
+- Windows 下有 71 个顶层普通测试，并包含更多表驱动子测试；
 - 1 个 Go fuzz target；
 - `document/store` 语句覆盖率 100%；
+- Windows 下 `document/save` 语句覆盖率 100%；
+- `document` 语句覆盖率 95.0%，`recovery` 为 94.9%；
 - 基于普通字节切片的随机参考模型测试；
 - 10,000 次顺序插入后的平衡性覆盖；
 - 编辑期间并发 Snapshot reader；
 - 非法范围、整数溢出、短 Source 和错误传播测试。
+- 非法、损坏和逐字节截断的 journal batch 测试；
+- 跨模块的事务、恢复、undo/redo、保存综合测试。
 
 本机已验证：
 
@@ -132,7 +144,7 @@ go test -race ./...                            PASS
 go test -race -shuffle=on -count=3 ./...       PASS
 ```
 
-一次 30 秒本机 fuzz 共完成 407,827 次执行，没有发现失败。CI 也会在每次改动时运行短时 fuzz smoke test。
+一次 30 秒本机 fuzz 共完成 1,664,638 次执行，没有发现失败。CI 也会在每次改动时运行短时 fuzz smoke test。
 
 运行主要检查：
 
@@ -155,29 +167,26 @@ Windows race 构建需要 GCC 兼容的 MinGW-w64 工具链，不能直接使用
 
 ## 当前限制
 
-- `ApplyBatch` 还不是真正的原子事务：后面的操作失败时，前面的操作可能已经生效；
-- journal 还没有完整的事务批次提交 frame，因此恢复时无法保证多操作事务全有或全无；
 - 打开文件时只检查前 64 KiB 是否为合法 UTF-8；
 - 文件身份由路径、大小和修改时间组成，不是强内容指纹；
 - POSIX 原子替换后还没有同步父目录；
 - Session 目录清理和大部分限制仍由宿主负责或硬编码；
-- `document/save` 通过 Session 测试被间接覆盖，但缺少独立的故障注入测试；
 - 当前没有 release、语义版本承诺或兼容性保证。
 
 ## 路线图 / TODO
 
-### P0：事务正确性
+### 已完成的事务里程碑
 
-- 让 `ApplyBatch` 在内存中保证全有或全无；
-- 增加原子 journal batch 格式，例如单个 batch frame 或明确的 begin/commit 记录；
-- 恢复时忽略不完整 batch；
-- 增加取消和部分写入故障注入测试。
+- `ApplyBatch` 在内存和恢复日志中均保证全有或全无；
+- 每个逻辑 batch 使用一个带校验和的 frame；
+- 恢复时忽略不完整或损坏的 batch，不暴露看似有效的前缀；
+- 通过回滚测试覆盖取消和存储故障。
 
 ### P1：恢复与持久化
 
 - 对 journal header、frame、payload 长度、CRC 失败和 replay 进行 fuzz；
 - 加强基础文件身份检查，并定义兼容与迁移策略；
-- 为写入、同步、权限、冲突和替换失败增加独立原子保存测试；
+- 把原子保存故障注入继续扩展到各平台特有的持久性行为；
 - 审查 POSIX 目录持久性和 Windows 文件替换边界。
 
 ### P1：Session 策略与生命周期
@@ -185,7 +194,7 @@ Windows race 构建需要 GCC 兼容的 MinGW-w64 工具链，不能直接使用
 - 通过流式方式校验整个打开文件的 UTF-8 合法性；
 - 让 undo 配额、插入限制、同步周期和临时路径可配置；
 - 明确定义 Session 目录的所有权与清理；
-- 改进 undo store 写入错误的传播。
+- 在公共 API 中明确 undo store 策略和配额丢失历史的报告方式。
 
 ### P2：公共 API
 

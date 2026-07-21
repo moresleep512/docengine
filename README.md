@@ -39,9 +39,10 @@ The repository currently does **not** provide:
 - remote or database-backed storage;
 - a stable versioned public API.
 
-The current status is **early-stage/experimental**. The low-level Piece Tree has
-been heavily hardened, but transaction, recovery, and save semantics still need
-additional work before the module should be treated as production-ready.
+The current status is **early-stage/experimental**. The low-level Piece Tree and
+multi-operation transaction path have been hardened, but recovery fuzzing,
+save fault injection, and public API stabilization are still required before
+the module should be treated as production-ready.
 
 ## Relationship to TypeMD
 
@@ -92,8 +93,9 @@ operations, immutable roots, and bounded range reads.
 
 ### `recovery`
 
-An append-only recovery journal with file fingerprints, revisions, grouped
-replacement frames, payload CRC-32C validation, replay, and corrupt-tail repair.
+An append-only recovery journal with file fingerprints, revisions, atomic batch
+frames, payload CRC-32C validation, all-or-nothing batch replay, and corrupt-tail
+repair. Legacy single-replacement and root frames remain readable.
 
 ### `document/save`
 
@@ -132,6 +134,18 @@ file formats, limitations, and removed module rationale.
 - Snapshot isolation is tested across edits, source replacement, source removal,
   and restore.
 
+### Transaction and recovery hardening
+
+- `ApplyBatch` stages every sequential edit against an isolated tree before it
+  publishes any state.
+- A batch is stored as one checksummed journal frame and is exposed during
+  replay only after its complete operation table and payload validate.
+- Validation, cancellation, journal failure, undo-store failure, and revision
+  overflow leave content, revisions, pending operations, and history unchanged.
+- Saving while edits continue rebases each newer edit group as an atomic batch.
+- End-to-end tests cover edit, snapshot isolation, crash recovery, grouped
+  undo/redo, save, and clean reopen together.
+
 ### Local toolchain validation
 
 The current development environment has been verified with MinGW-w64 GCC using
@@ -141,13 +155,18 @@ The current development environment has been verified with MinGW-w64 GCC using
 
 At the current milestone the repository contains:
 
-- 26 conventional tests;
+- 71 top-level conventional tests on Windows, with additional table-driven
+  subtests;
 - 1 Go fuzz target;
 - 100% statement coverage for `document/store`;
+- 100% statement coverage for `document/save` on Windows;
+- 95.0% statement coverage for `document` and 94.9% for `recovery`;
 - a randomized byte-slice reference-model test;
 - 10,000 sequential-insert balance coverage;
 - concurrent snapshot readers during edits;
 - invalid range, integer overflow, short source, and error-propagation tests.
+- malformed, corrupt, and byte-truncated journal batch tests;
+- multi-module transaction/recovery/undo/redo/save integration tests.
 
 Verified locally:
 
@@ -159,7 +178,7 @@ go test -race ./...                            PASS
 go test -race -shuffle=on -count=3 ./...       PASS
 ```
 
-A 30-second local fuzz run completed 407,827 executions without finding a
+A 30-second local fuzz run completed 1,664,638 executions without finding a
 failure. CI also runs a short fuzz smoke test on every change.
 
 Run the main checks:
@@ -184,36 +203,29 @@ MSVC-target `cl.exe` or `clang-cl.exe`.
 
 ## Current limitations
 
-- `ApplyBatch` is not yet truly atomic: an error in a later operation can leave
-  earlier operations applied.
-- The journal does not yet have a committed batch frame, so recovery cannot
-  provide all-or-nothing replay for multi-operation transactions.
 - Only the first 64 KiB of an opened file is checked for valid UTF-8.
 - File identity is based on path, size, and modification time rather than a
   strong content fingerprint.
 - POSIX atomic replacement does not yet sync the containing directory.
 - Session-directory cleanup and most limits are still host-owned or hard-coded.
-- `document/save` is exercised through session tests but lacks focused
-  package-local fault-injection tests.
 - No release, semantic-versioning promise, or compatibility guarantee exists
   yet.
 
 ## Roadmap / TODO
 
-### P0: transactional correctness
+### Completed transactional milestone
 
-- Make `ApplyBatch` all-or-nothing in memory.
-- Add an atomic journal batch format, such as a single batch frame or explicit
-  begin/commit records.
-- Ignore incomplete batches during recovery.
-- Add cancellation and partial-write fault-injection tests.
+- Make `ApplyBatch` all-or-nothing in memory and in the recovery log.
+- Store each logical batch in one checksummed frame.
+- Ignore incomplete or corrupt batches during recovery without exposing a
+  valid-looking prefix.
+- Cover cancellation and storage failures with rollback tests.
 
 ### P1: recovery and persistence
 
 - Fuzz journal headers, frames, payload lengths, CRC failures, and replay.
 - Strengthen base-file identity and define a compatibility/migration policy.
-- Add focused atomic-save tests for write, sync, permission, conflict, and
-  replace failures.
+- Extend atomic-save fault injection to platform-specific durability behavior.
 - Review POSIX directory durability and Windows replacement edge cases.
 
 ### P1: session policy and lifecycle
@@ -222,7 +234,7 @@ MSVC-target `cl.exe` or `clang-cl.exe`.
 - Make undo quota, insertion limits, sync interval, and temporary paths
   configurable.
 - Define explicit ownership and cleanup of session directories.
-- Improve propagation of undo-store write failures.
+- Make undo-store policy and quota-loss reporting explicit in the public API.
 
 ### P2: public API
 

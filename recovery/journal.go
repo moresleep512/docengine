@@ -7,6 +7,7 @@ import (
 	"errors"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,9 +15,12 @@ import (
 )
 
 const (
-	fileHeaderSize  = 72
-	frameHeaderSize = 64
-	journalVersion  = 1
+	fileHeaderSize      = 72
+	frameHeaderSize     = 64
+	batchRecordSize     = 24
+	maximumBatchSize    = 256
+	maximumFramePayload = 1 << 30
+	journalVersion      = 1
 )
 
 var (
@@ -26,6 +30,7 @@ var (
 
 	ErrStaleJournal = errors.New("recovery: journal belongs to another file version")
 	ErrClosed       = errors.New("recovery: journal closed")
+	ErrInvalidBatch = errors.New("recovery: invalid replacement batch")
 )
 
 type FrameKind uint16
@@ -33,7 +38,19 @@ type FrameKind uint16
 const (
 	FrameReplace FrameKind = iota + 1
 	FrameRoot
+	FrameBatch
 )
+
+type ReplaceOperation struct {
+	Start        int64
+	DeleteLength int64
+	Inserted     []byte
+}
+
+type BatchAppendResult struct {
+	FrameOffset    int64
+	PayloadOffsets []int64
+}
 
 type Fingerprint struct {
 	BaseSize     int64
@@ -159,6 +176,40 @@ func (j *Journal) AppendReplaceGroup(revision uint64, start, deleteLength int64,
 	}, inserted)
 }
 
+// AppendReplaceBatch stores a complete logical edit batch in one checksummed
+// frame. Replay exposes the operations as ordinary FrameReplace entries only
+// after the entire outer frame and its operation table have been validated.
+func (j *Journal) AppendReplaceBatch(firstRevision, groupMarker uint64, operations []ReplaceOperation) (BatchAppendResult, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.file == nil {
+		return BatchAppendResult{}, ErrClosed
+	}
+	payload, relativeOffsets, err := encodeBatchPayload(firstRevision, operations)
+	if err != nil {
+		return BatchAppendResult{}, err
+	}
+	payloadOffset, err := j.appendFrame(Frame{
+		Kind:           FrameBatch,
+		Revision:       firstRevision,
+		TargetRevision: groupMarker,
+		Start:          int64(len(operations)),
+		DeleteLength:   batchRecordSize,
+		InsertLength:   int64(len(payload)),
+	}, payload)
+	if err != nil {
+		return BatchAppendResult{}, err
+	}
+	result := BatchAppendResult{
+		FrameOffset:    payloadOffset - frameHeaderSize,
+		PayloadOffsets: make([]int64, len(relativeOffsets)),
+	}
+	for index, relative := range relativeOffsets {
+		result.PayloadOffsets[index] = payloadOffset + relative
+	}
+	return result, nil
+}
+
 func (j *Journal) AppendRoot(revision, targetRevision uint64) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -174,14 +225,21 @@ func (j *Journal) appendFrame(frame Frame, payload []byte) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	rollback := func(cause error) (int64, error) {
+		return 0, errors.Join(cause, j.file.Truncate(end))
+	}
 	header := encodeFrameHeader(frame, payload)
-	if _, err := j.file.Write(header); err != nil {
-		return 0, err
+	if n, writeErr := j.file.Write(header); writeErr != nil {
+		return rollback(writeErr)
+	} else if n != len(header) {
+		return rollback(io.ErrShortWrite)
 	}
 	payloadOffset := end + frameHeaderSize
 	if len(payload) > 0 {
-		if _, err := j.file.Write(payload); err != nil {
-			return 0, err
+		if n, writeErr := j.file.Write(payload); writeErr != nil {
+			return rollback(writeErr)
+		} else if n != len(payload) {
+			return rollback(io.ErrShortWrite)
 		}
 	}
 	return payloadOffset, nil
@@ -208,7 +266,7 @@ func (j *Journal) Replay() (ReplayResult, error) {
 			return result, err
 		}
 		frame, storedCRC, ok := decodeFrameHeader(header)
-		if !ok || frame.InsertLength < 0 || frame.InsertLength > 1<<30 {
+		if !ok || frame.InsertLength < 0 || frame.InsertLength > maximumFramePayload {
 			result.Truncated = true
 			break
 		}
@@ -239,7 +297,19 @@ func (j *Journal) Replay() (ReplayResult, error) {
 			result.Truncated = true
 			break
 		}
-		result.Frames = append(result.Frames, frame)
+		if frame.Kind == FrameBatch {
+			frames, valid, decodeErr := decodeBatchFrames(j.file, frame)
+			if decodeErr != nil {
+				return result, decodeErr
+			}
+			if !valid {
+				result.Truncated = true
+				break
+			}
+			result.Frames = append(result.Frames, frames...)
+		} else {
+			result.Frames = append(result.Frames, frame)
+		}
 		result.ValidBytes = end
 		offset = end
 	}
@@ -358,8 +428,79 @@ func decodeFrameHeader(header []byte) (Frame, uint32, bool) {
 		DeleteLength:   int64(binary.LittleEndian.Uint64(header[40:48])),
 		InsertLength:   int64(binary.LittleEndian.Uint64(header[48:56])),
 	}
-	if frame.Kind != FrameReplace && frame.Kind != FrameRoot {
+	if frame.Kind != FrameReplace && frame.Kind != FrameRoot && frame.Kind != FrameBatch {
 		return Frame{}, 0, false
 	}
 	return frame, binary.LittleEndian.Uint32(header[56:60]), true
+}
+
+func encodeBatchPayload(firstRevision uint64, operations []ReplaceOperation) ([]byte, []int64, error) {
+	if len(operations) == 0 || len(operations) > maximumBatchSize || firstRevision == 0 || firstRevision > math.MaxUint64-uint64(len(operations)-1) {
+		return nil, nil, ErrInvalidBatch
+	}
+	metadataLength := int64(len(operations) * batchRecordSize)
+	total := metadataLength
+	for _, operation := range operations {
+		if operation.Start < 0 || operation.DeleteLength < 0 || int64(len(operation.Inserted)) > maximumFramePayload-total {
+			return nil, nil, ErrInvalidBatch
+		}
+		total += int64(len(operation.Inserted))
+	}
+	payload := make([]byte, int(total))
+	relativeOffsets := make([]int64, len(operations))
+	cursor := metadataLength
+	for index, operation := range operations {
+		record := payload[index*batchRecordSize : (index+1)*batchRecordSize]
+		binary.LittleEndian.PutUint64(record[0:8], uint64(operation.Start))
+		binary.LittleEndian.PutUint64(record[8:16], uint64(operation.DeleteLength))
+		binary.LittleEndian.PutUint64(record[16:24], uint64(len(operation.Inserted)))
+		relativeOffsets[index] = cursor
+		copy(payload[int(cursor):], operation.Inserted)
+		cursor += int64(len(operation.Inserted))
+	}
+	return payload, relativeOffsets, nil
+}
+
+func decodeBatchFrames(file *os.File, frame Frame) ([]Frame, bool, error) {
+	if frame.Start <= 0 || frame.Start > maximumBatchSize || frame.DeleteLength != batchRecordSize {
+		return nil, false, nil
+	}
+	count := int(frame.Start)
+	if frame.Revision == 0 || frame.Revision > math.MaxUint64-uint64(count-1) {
+		return nil, false, nil
+	}
+	metadataLength := int64(count * batchRecordSize)
+	if metadataLength > frame.InsertLength {
+		return nil, false, nil
+	}
+	metadata := make([]byte, int(metadataLength))
+	if _, err := file.ReadAt(metadata, frame.PayloadOffset); err != nil {
+		return nil, false, err
+	}
+	payloadEnd := frame.PayloadOffset + frame.InsertLength
+	cursor := frame.PayloadOffset + metadataLength
+	result := make([]Frame, 0, count)
+	for index := 0; index < count; index++ {
+		record := metadata[index*batchRecordSize : (index+1)*batchRecordSize]
+		start := int64(binary.LittleEndian.Uint64(record[0:8]))
+		deleteLength := int64(binary.LittleEndian.Uint64(record[8:16]))
+		insertLength := int64(binary.LittleEndian.Uint64(record[16:24]))
+		if start < 0 || deleteLength < 0 || insertLength < 0 || insertLength > payloadEnd-cursor {
+			return nil, false, nil
+		}
+		result = append(result, Frame{
+			Kind:           FrameReplace,
+			Revision:       frame.Revision + uint64(index),
+			TargetRevision: frame.TargetRevision,
+			Start:          start,
+			DeleteLength:   deleteLength,
+			InsertLength:   insertLength,
+			PayloadOffset:  cursor,
+		})
+		cursor += insertLength
+	}
+	if cursor != payloadEnd {
+		return nil, false, nil
+	}
+	return result, true, nil
 }

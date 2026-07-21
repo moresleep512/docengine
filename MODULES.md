@@ -95,10 +95,14 @@ the edit sequence after a crash.
 
 - A 72-byte file header contains format magic, version, base size, base
   modification time, normalized-path hash, and a CRC.
-- Each edit has a 64-byte frame header followed by inserted bytes.
+- Each physical record has a 64-byte frame header followed by its payload.
 - Frame CRC uses CRC-32C over the header prefix and payload.
 - Replace frames record revision, edit group, start, deleted length, and
   inserted length.
+- Batch frames contain a fixed-size operation table followed by all inserted
+  bytes. Replay expands them into logical replacement frames only after the
+  complete physical frame, CRC, table, revision range, lengths, and payload
+  boundaries validate.
 - Root frames remain for legacy replay semantics, although normal editing now
   records grouped replacements.
 
@@ -107,10 +111,11 @@ old `TMD...` format are deliberately incompatible.
 
 ### Replay and repair
 
-`Replay` walks frames sequentially. An incomplete header, invalid frame,
-oversized payload, incomplete payload, or CRC mismatch marks the remaining tail
-as truncated. The valid prefix is returned to the caller, which may call
-`RepairTail` to truncate the file to the last verified frame.
+`Replay` walks physical frames sequentially. An incomplete header, invalid
+frame, oversized payload, incomplete payload, CRC mismatch, or malformed batch
+marks the remaining tail as truncated. No logical operation from an invalid
+batch is returned. The valid prefix is returned to the caller, which may call
+`RepairTail` to truncate the file to the last verified physical frame.
 
 ### Durability and concurrency
 
@@ -153,12 +158,13 @@ Uncommitted temporary files are removed by a deferred cleanup.
   base file is opened with `FILE_SHARE_DELETE`, allowing old snapshot readers
   to keep their handle while the path is replaced.
 
-### Important limitations
+### Verification and limitations
 
-- The POSIX path syncs file content but does not sync the containing directory
-  after rename.
-- There are no package-local tests for the save package; it is exercised
-  indirectly through session tests.
+Package-local tests inject deterministic create, permission, prefix-write,
+content-write, sync, close, conflict-check, replace, and cleanup outcomes. The
+Windows build currently has 100% statement coverage for this package. The POSIX
+path syncs file content but does not yet sync the containing directory after
+rename.
 
 ## `document`
 
@@ -185,14 +191,16 @@ Default transient storage is under the system temporary directory in
 - A batch is limited to 256 operations.
 - Each inserted string must be valid UTF-8 and at most 1 MiB.
 - Deleted and inserted bytes are recorded in a disk-backed undo store.
-- Every accepted replacement is appended to the recovery journal before the
-  piece tree starts referencing its payload.
-
-The current implementation mutates one operation at a time. If a later
-operation fails or its context is cancelled, earlier operations in the same
-batch remain applied even though `ApplyBatch` returns an error. There is no
-rollback snapshot, and the incomplete batch is not appended as a normal undo
-entry. This is the highest-priority semantic defect in the retained core.
+- The complete batch is first applied to an isolated staging tree using
+  sequential coordinates.
+- After staging succeeds, all operations and inserted bytes are appended as one
+  checksummed recovery frame.
+- A second isolated tree is built against the durable journal offsets and is
+  published in one assignment together with revisions, pending operations, and
+  one undo entry.
+- Validation, cancellation, journal append, and undo-store failures publish no
+  document prefix; a post-append failure truncates the journal back to its
+  original frame boundary.
 
 ### Undo storage
 
@@ -224,9 +232,9 @@ callers must always close leases.
 3. Check size and modification-time identity before and immediately before
    replacement.
 4. Reopen the newly saved base as a new generation.
-5. If edits arrived during streaming, copy only the newer journal operations
-   into a new journal rooted at the saved file and rebuild their piece-tree
-   overlay.
+5. If edits arrived during streaming, copy only the newer journal operations,
+   preserving each edit group as one atomic batch in a new journal rooted at
+   the saved file, and rebuild their piece-tree overlay.
 6. Retire the old generation after outstanding readers finish.
 
 The result may therefore be clean or may remain dirty at a revision newer than
@@ -245,8 +253,6 @@ configuration.
 
 - Only the first 64 KiB of an opened file is validated as UTF-8.
 - External-change detection relies on size and modification time, not content.
-- `historyText` handles quota exhaustion but does not propagate other undo-store
-  write errors cleanly.
 - `Close` preserves a dirty recovery journal but leaves session-directory
   cleanup to its host.
 
@@ -282,9 +288,8 @@ an editor or presentation adapter, not the document persistence core.
 
 1. Decide whether `document.Session` is the final public facade or whether a
    smaller engine facade should hide recovery paths and generation management.
-2. Make batch application atomic before treating it as a transaction API.
-3. Move quotas, temporary paths, sync intervals, and identity policy into
+2. Move quotas, temporary paths, sync intervals, and identity policy into
    configuration.
-4. Add host-neutral cleanup ownership and explicit journal compatibility policy.
-5. Reintroduce structure, search, and presentation only through format-neutral
+3. Add host-neutral cleanup ownership and explicit journal compatibility policy.
+4. Reintroduce structure, search, and presentation only through format-neutral
    interfaces after their boundaries are designed.
