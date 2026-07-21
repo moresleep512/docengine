@@ -16,6 +16,14 @@ import (
 
 func TestOpenSessionInjectedStatTreeAndRepairFailures(t *testing.T) {
 	sentinel := errors.New("injected")
+	t.Run("absolute path failure", func(t *testing.T) {
+		operations := systemSessionOperations
+		operations.absolutePath = func(string) (string, error) { return "", sentinel }
+		if _, err := openSession("ignored", OpenOptions{}, operations); !errors.Is(err, sentinel) {
+			t.Fatalf("openSession error = %v", err)
+		}
+	})
+
 	t.Run("non-regular base is rejected and closed", func(t *testing.T) {
 		reader, writer, err := os.Pipe()
 		if err != nil {

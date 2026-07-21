@@ -97,6 +97,7 @@ type stagedOperation struct {
 const stagingSourceID store.SourceID = 255
 
 type sessionOperations struct {
+	absolutePath  func(string) (string, error)
 	openBase      func(string) (*os.File, error)
 	stat          func(string) (os.FileInfo, error)
 	openRecovery  func(string, recovery.Fingerprint) (*recovery.Journal, recovery.ReplayResult, error)
@@ -107,6 +108,7 @@ type sessionOperations struct {
 }
 
 var systemSessionOperations = sessionOperations{
+	absolutePath: filepath.Abs,
 	openBase:     openBase,
 	stat:         os.Stat,
 	openRecovery: recovery.Open,
@@ -161,7 +163,7 @@ func Open(path string, options OpenOptions) (*Session, error) {
 }
 
 func openSession(path string, options OpenOptions, operations sessionOperations) (*Session, error) {
-	absolute, err := filepath.Abs(path)
+	absolute, err := operations.absolutePath(path)
 	if err != nil {
 		return nil, err
 	}
