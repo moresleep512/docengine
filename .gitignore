@@ -1,0 +1,39 @@
+# Go build and test artifacts
+/bin/
+/build/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.*
+profile.*
+
+# Local caches and temporary files
+/.cache/
+/.tmp/
+*.log
+*.tmp
+
+# Docengine runtime artifacts
+.docengine-save-*.tmp
+*.docengine-journal
+undo.store
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Editors and operating systems
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
