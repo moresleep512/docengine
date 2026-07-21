@@ -12,6 +12,7 @@ import (
 	"time"
 
 	docsave "github.com/moresleep512/docengine/document/save"
+	"github.com/moresleep512/docengine/recovery"
 )
 
 func TestOpenContextScansCompleteUTF8AndEOL(t *testing.T) {
@@ -149,7 +150,10 @@ func TestSessionPinsResolvedSymlinkTarget(t *testing.T) {
 	}
 	defer session.Close()
 	requested, _ := filepath.Abs(link)
-	resolved, _ := filepath.Abs(first)
+	resolved, err := resolvePath(first)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if metadata := session.Metadata(); !samePath(metadata.Path, requested) || !samePath(metadata.ResolvedPath, resolved) {
 		t.Fatalf("metadata paths = %+v", metadata)
 	}
@@ -169,6 +173,61 @@ func TestSessionPinsResolvedSymlinkTarget(t *testing.T) {
 	secondBody, _ := os.ReadFile(second)
 	if string(firstBody) != "saved" || string(secondBody) != "second" {
 		t.Fatalf("targets = (%q, %q)", firstBody, secondBody)
+	}
+}
+
+func TestOpenUsesResolvedPathForRecoveryFingerprint(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "real-document")
+	if err := os.WriteFile(path, []byte("abc"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := recoveryFingerprintForTest(t, path)
+	recoveryDir := filepath.Join(dir, "recovery")
+	journalPath := filepath.Join(recoveryDir, journalPrefix(fingerprint)+".alias.docengine-journal-v2")
+	journal, _, err := recovery.Open(journalPath, fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := journal.AppendBatch(1, 1, []recovery.ReplaceOperation{{Start: 3, Inserted: []byte("!")}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	requested := filepath.Join(dir, "REQUESTED-ALIAS")
+	resolved, err := resolvePath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operations := systemSessionOperations
+	operations.absolutePath = func(value string) (string, error) {
+		if value == "alias" {
+			return requested, nil
+		}
+		return filepath.Abs(value)
+	}
+	operations.evalSymlinks = func(value string) (string, error) {
+		if value != requested {
+			t.Fatalf("resolved unexpected request path %q", value)
+		}
+		return resolved, nil
+	}
+	session, err := openSessionContext(context.Background(), "alias", OpenOptions{
+		RecoveryDir: recoveryDir,
+		SessionDir:  filepath.Join(dir, "session"),
+	}, operations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if metadata := session.Metadata(); !metadata.Recovered || !samePath(metadata.Path, requested) || !samePath(metadata.ResolvedPath, resolved) {
+		t.Fatalf("metadata = %+v", metadata)
+	}
+	body := make([]byte, 4)
+	if n, err := session.ReadAt(body, 0); n != len(body) || err != nil || string(body) != "abc!" {
+		t.Fatalf("ReadAt = (%d, %v, %q)", n, err, body)
 	}
 }
 

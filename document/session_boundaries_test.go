@@ -2,7 +2,6 @@ package document
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"io"
 	"os"
@@ -129,8 +128,7 @@ func TestOpenRejectsSemanticallyInvalidMatchingJournal(t *testing.T) {
 	if err := os.WriteFile(path, []byte("abc"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	info, _ := os.Stat(path)
-	fingerprint := recovery.FingerprintFor(path, info.Size(), sha256.Sum256([]byte("abc")))
+	fingerprint := recoveryFingerprintForTest(t, path)
 	recoveryDir := filepath.Join(dir, "recovery")
 	journalPath := filepath.Join(recoveryDir, journalPrefix(fingerprint)+".invalid.docengine-journal-v2")
 	journal, _, err := recovery.Open(journalPath, fingerprint)

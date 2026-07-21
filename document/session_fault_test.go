@@ -100,8 +100,7 @@ func TestOpenSessionInjectedStatTreeAndRepairFailures(t *testing.T) {
 		if err := os.WriteFile(path, []byte("abc"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		info, _ := os.Stat(path)
-		fingerprint := recovery.FingerprintFor(path, info.Size(), sha256.Sum256([]byte("abc")))
+		fingerprint := recoveryFingerprintForTest(t, path)
 		recoveryDir := filepath.Join(dir, "recovery")
 		journalPath := filepath.Join(recoveryDir, journalPrefix(fingerprint)+".test.docengine-journal-v2")
 		journal, _, err := recovery.Open(journalPath, fingerprint)
@@ -124,8 +123,7 @@ func TestOpenSessionInjectedStatTreeAndRepairFailures(t *testing.T) {
 		if err := os.WriteFile(path, []byte("abc"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		info, _ := os.Stat(path)
-		fingerprint := recovery.FingerprintFor(path, info.Size(), sha256.Sum256([]byte("abc")))
+		fingerprint := recoveryFingerprintForTest(t, path)
 		recoveryDir := filepath.Join(dir, "recovery")
 		journalPath := filepath.Join(recoveryDir, journalPrefix(fingerprint)+".test.docengine-journal-v2")
 		journal, _, err := recovery.Open(journalPath, fingerprint)
@@ -157,6 +155,19 @@ func TestOpenSessionInjectedStatTreeAndRepairFailures(t *testing.T) {
 			t.Fatalf("openSession error = %v", err)
 		}
 	})
+}
+
+func recoveryFingerprintForTest(t testing.TB, path string) recovery.Fingerprint {
+	t.Helper()
+	resolved, err := resolvePath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return recovery.FingerprintFor(resolved, int64(len(body)), sha256.Sum256(body))
 }
 
 func TestApplyBatchInjectedCloneAndInvariantFailuresAreAtomic(t *testing.T) {
