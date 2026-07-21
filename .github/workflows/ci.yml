@@ -66,5 +66,11 @@ jobs:
           go-version: "1.26.x"
           cache: true
       - run: go test ./document/store -run=^$ -fuzz=FuzzTreeMatchesReference -fuzztime=10s
+      - run: go test ./document/store -run=^$ -fuzz=FuzzTreeConcurrentReadDuringEdits -fuzztime=10s
       - run: go test ./recovery -run=^$ -fuzz=FuzzJournalDecoders -fuzztime=10s
       - run: go test ./recovery -run=^$ -fuzz=FuzzJournalStateMachine -fuzztime=10s
+      - run: go test ./recovery -run=^$ -fuzz=FuzzJournalBatchOperationsDecode -fuzztime=10s
+      - run: go test ./recovery -run=^$ -fuzz=FuzzJournalReplayResilience -fuzztime=10s
+      - run: go test ./document -run=^$ -fuzz=FuzzSessionStateMachine -fuzztime=10s
+      - run: go test ./document -run=^$ -fuzz=FuzzSessionConcurrentSaveEdit -fuzztime=10s
+      - run: go test ./document -run=^$ -fuzz=FuzzSessionCrashRecovery -fuzztime=10s

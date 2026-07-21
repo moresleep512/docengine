@@ -6,6 +6,9 @@ import (
 	"errors"
 	"syscall"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/windows"
 )
 
 func TestReplaceFileWithCallValidationAndResults(t *testing.T) {
@@ -32,5 +35,45 @@ func TestReplaceFileWithCallValidationAndResults(t *testing.T) {
 	}
 	if err := replaceFileWithCall("from", "to", func(*uint16, *uint16, *uint16, uint32, uintptr, uintptr) (uintptr, error) { return 0, syscall.Errno(0) }); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("zero call error = %v", err)
+	}
+}
+
+func TestReplaceFileRetriesOnlyTransientWindowsErrors(t *testing.T) {
+	retryable := []error{
+		windows.ERROR_SHARING_VIOLATION,
+		windows.ERROR_LOCK_VIOLATION,
+		windows.ERROR_UNABLE_TO_REMOVE_REPLACED,
+		windows.ERROR_UNABLE_TO_MOVE_REPLACEMENT,
+		windows.ERROR_UNABLE_TO_MOVE_REPLACEMENT_2,
+	}
+	for _, err := range retryable {
+		if !isRetryableReplaceError(err) {
+			t.Fatalf("%v is not retryable", err)
+		}
+	}
+	if isRetryableReplaceError(syscall.EACCES) || isRetryableReplaceError(errors.New("permanent")) {
+		t.Fatal("permanent error marked retryable")
+	}
+
+	calls := 0
+	var waits []time.Duration
+	err := replaceFileWithCallAndWait("from", "to", func(*uint16, *uint16, *uint16, uint32, uintptr, uintptr) (uintptr, error) {
+		calls++
+		if calls < 3 {
+			return 0, windows.ERROR_UNABLE_TO_REMOVE_REPLACED
+		}
+		return 1, nil
+	}, func(delay time.Duration) { waits = append(waits, delay) })
+	if err != nil || calls != 3 || len(waits) != 2 || waits[0] != time.Millisecond || waits[1] != 2*time.Millisecond {
+		t.Fatalf("retry success = (err=%v calls=%d waits=%v)", err, calls, waits)
+	}
+
+	calls, waits = 0, nil
+	err = replaceFileWithCallAndWait("from", "to", func(*uint16, *uint16, *uint16, uint32, uintptr, uintptr) (uintptr, error) {
+		calls++
+		return 0, windows.ERROR_LOCK_VIOLATION
+	}, func(delay time.Duration) { waits = append(waits, delay) })
+	if !errors.Is(err, windows.ERROR_LOCK_VIOLATION) || calls != replaceFileAttempts || len(waits) != replaceFileAttempts-1 {
+		t.Fatalf("retry exhaustion = (err=%v calls=%d waits=%v)", err, calls, waits)
 	}
 }

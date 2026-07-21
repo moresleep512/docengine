@@ -116,7 +116,9 @@ Atomic save performs:
 7. on POSIX, open and sync the parent directory.
 
 Windows uses `ReplaceFileW` with `REPLACEFILE_WRITE_THROUGH`. Base handles use
-`FILE_SHARE_DELETE`, so old Snapshot readers survive replacement.
+`FILE_SHARE_DELETE`, so old Snapshot readers survive replacement. Explicit
+sharing, lock, and replacement-transient errors receive a bounded exponential
+retry; permanent errors are returned immediately.
 
 On POSIX, a rename can succeed before parent-directory sync fails. That result
 is a `DurabilityError`: content is committed, but power-loss durability is
@@ -194,7 +196,7 @@ Every current package is held at 100% statement coverage. Tests include
 platform-specific replacement and directory-sync faults, complete UTF-8 and
 identity boundaries, every recovery batch truncation, transaction rollback,
 concurrent save/rebase, post-commit fault behavior, snapshot lifetime, integer
-overflow, randomized reference models, race runs, and three fuzz targets.
+overflow, randomized reference models, race runs, and nine fuzz targets.
 
 The v0.3.0 release suite was completed on native Windows and Debian under WSL 2
 on a native Linux temporary directory: every package reported 100% statement
