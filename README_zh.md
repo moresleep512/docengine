@@ -1,10 +1,9 @@
 # Docengine
 
-[English](README.md)
+[English](README.md) · [发展设计与路线图](develop.md)
 
-Docengine 是一个实验阶段的 Go 文本文档内核，目标是在不把完整文档加载到内存的情况下，编辑大型本地 UTF-8 文本文件。
-
-它最初从 [TypeMD](https://github.com/moresleep512/TypeMD) 的后端文档引擎中抽离。当前代码已经成为独立的 Go 模块和 Git 仓库，并从核心中移除了 TypeMD、Markdown、索引、搜索和编辑器呈现层的具体策略。
+Docengine 是一个实验阶段的 Go 本地 UTF-8 文档内核，目标是在不把完整文档载入
+内存的情况下编辑大型文件。它从 TypeMD 后端抽离，现已成为独立模块：
 
 ```go
 module github.com/moresleep512/docengine
@@ -12,214 +11,129 @@ module github.com/moresleep512/docengine
 
 ## 仓库定位
 
-Docengine 是一个**本地文本文档引擎**，不是应用服务器，也不是完整编辑器。
+Docengine 是本地文档编排内核，不是编辑器、渲染器或应用服务器。核心只理解字节、
+UTF-8、范围、revision 和不可变 Snapshot；它不能理解 Markdown、JSON、代码语法或
+任何其他文档格式。
 
-它负责为桌面应用、CLI、语言工具或未来的服务宿主提供底层存储与持久化能力：
+当前已经提供：
 
-- 通过持久化 Piece Tree 进行磁盘支撑的文本编辑；
-- 编辑和保存继续进行时，旧的不可变快照仍可稳定读取；
-- 带 revision 检查的替换操作和磁盘支撑的 undo/redo；
-- 追加式崩溃恢复；
-- 流式、带外部冲突检查的原子保存；
-- 文档体积增长时保持前台内存使用有界。
+- 磁盘支撑的持久化 Piece Tree 和不可变 Snapshot；
+- 带 revision 检查的原子编辑批次及磁盘 undo/redo；
+- 只以完整批次作为持久化编辑单位的 v2 追加式恢复 journal；
+- 全文件 UTF-8 校验和 SHA-256 基础文件身份；
+- 流式、带强冲突检查的原子保存；
+- POSIX 父目录同步，以及 Windows `ReplaceFileW` write-through 替换；
+- 符号链接真实目标固定，以及提交后故障的显式只读状态。
 
-当前仓库**不包含**：
-
-- HTTP、RPC 或 WebSocket 服务；
-- 桌面或 Web UI；
-- Markdown 解析或渲染；
-- 全文搜索或索引；
-- 多人协作、OT 或 CRDT；
-- 远程存储或数据库存储；
-- 已稳定并完成版本化的公共 API。
-
-项目目前处于**早期/实验阶段**。最底层 Piece Tree 和多操作事务路径已经过较严格的加固，但恢复 fuzz、保存故障注入和公共 API 稳定化仍需继续完善，暂时不应视为生产就绪版本。
+当前还没有全文搜索、Page/Fragment 虚拟化、多源 Composition、协作、远程存储、
+UI 或稳定的 1.0 API。各项能力的格式中立边界见 [develop.md](develop.md)。
 
 ## 与 TypeMD 的关系
 
-原始实现位于 TypeMD 的私有后端包中。最初抽离 Docengine，是为了让文档内核可以独立演进，不再依赖 Wails、TypeMD 前端、Markdown 块模型或编辑器布局策略。
+原实现位于 TypeMD 私有后端包中。抽离过程中删除了 Markdown 块扫描、格式专有元数据、
+SQLite 搜索、索引发布、Wails 绑定和编辑器布局策略。
 
-第一轮清理已经完成：
-
-- 删除 Markdown 块扫描和块元数据索引；
-- 删除 SQLite FTS 搜索；
-- 删除硬编码的索引构建与发布流水线；
-- 删除编辑器虚拟化和估算布局高度协议；
-- 替换或删除 TypeMD 专有路径、后缀、持久化 magic、JSON 桥接标签和导入路径。
-
-Docengine 与 TypeMD 目前不会自动同步。本仓库的改动不会影响 TypeMD，除非 TypeMD 后续明确迁移到这个模块。当前 `DOCLOG01`/`DOCJNL01` 恢复格式也有意不兼容旧 TypeMD journal magic。
+Docengine 与 TypeMD 不会自动同步；TypeMD 必须显式迁移到本模块后才能获得这里的更新。
 
 ## 架构
 
 ```text
-未来宿主：CLI / 桌面应用 / HTTP / RPC
-                    |
-                    v
-              document.Session
-       revision、编辑、undo/redo、保存
-          /          |             \
-         v           v              v
- document/store   recovery      document/save
-   Piece Tree      journal        原子替换
-         \           |              /
-          +----------+-------------+
-                     |
-                     v
-          操作系统文件与 io.ReaderAt 数据源
+未来宿主：桌面应用 / CLI / 服务 / 格式适配器
+                         |
+                         v
+                   document.Session
+            revision、事务、历史、保存
+             /             |              \
+            v              v               v
+   document/store       recovery       document/save
+     Piece Tree       v2 批次 WAL        原子替换
+             \             |              /
+              +------------+-------------+
+                           |
+                           v
+                 操作系统文件与 io.ReaderAt
 ```
 
-### `document/store`
+`document/store` 是最底层。它用指向外部 `io.ReaderAt` 字节范围的 Piece 表示逻辑
+正文；持久化随机 Treap 提供结构共享、平均对数编辑、有界读取和不可变 root。
 
-最底层的数据结构层。它把逻辑文档表示为多个 Piece，每个 Piece 指向外部 `io.ReaderAt` 数据源中的一个字节区间。持久化随机 Treap 提供结构共享、平均对数复杂度编辑、不可变 root 和有界范围读取。
+`recovery` 把每个逻辑事务存为一个带校验的 v2 batch。96 字节 `DOCLOG02` 文件头
+用规范化真实路径和完整基础内容 SHA-256 绑定 journal；只有 `DOCJNL02` 批次的头、
+操作表、payload 和 CRC-32C 全部合法后才会参与回放。损坏尾部可以修复且绝不会暴露
+半个事务。
 
-### `recovery`
+`document/save` 把 Snapshot 流式写入同目录临时文件，同步后做最后一次完整内容冲突
+检查，再原子替换目标。POSIX 替换已经成功但父目录同步失败时，会返回类型化
+`DurabilityError`，调用方不会把“已提交但耐久性未知”误当成“没有替换”。
 
-追加式恢复 journal，包含文件指纹、revision、原子 batch frame、payload CRC-32C 校验、batch 全有或全无重放和损坏尾部修复；同时保留对旧单替换及 root frame 的读取兼容。
+`document.Session` 负责 Piece Tree、revision 历史、恢复、Source generation、保存
+重基和生命周期。`OpenContext` 单次流式扫描完整文件，同时校验 UTF-8、计算 SHA-256
+并统计换行。Metadata 同时报告请求路径和真实路径，保存始终固定到真实目标。若原子
+替换后重绑定失败，Session 会保留读取能力并永久禁止继续修改。
 
-### `document/save`
+实现不变量和文件格式细节见 [MODULES.md](MODULES.md)。
 
-把不可变快照流式写入同目录临时文件，完成同步后检查原文件是否被外部修改，再原子替换目标。Windows 使用 `ReplaceFileW`，其他平台使用 `os.Rename`。
+## v0.3.0 破坏性变化
 
-### `document`
+- 删除 recovery v1、单 replacement frame、root frame 及其导出 API；
+- v2 使用 `.docengine-journal-v2`、`DOCLOG02` 和 `DOCJNL02`，旧 journal 不读取、
+  不迁移，也不属于 v2 扫描命名空间；
+- `recovery.Fingerprint` 改为基础长度、真实路径 SHA-256 和完整内容 SHA-256；
+- `ReplayResult` 返回原子 batch，不再返回旧逻辑 frame；
+- 新增 `document.OpenContext`、`Metadata.ResolvedPath`、耐久性/故障状态、
+  `Session.Fault`、`document.ErrFaulted` 和 `save.DurabilityError`。
 
-当前的公共协调层。`Session` 负责 revision、Piece Tree、恢复、磁盘 undo/redo、快照 generation、并发保存、UTF-8/BOM/EOL 策略和资源退休。
+1.0 之前不承诺兼容性。
 
-更详细的实现设计、不变量、文件格式、限制和已删除模块说明见 [MODULES.md](MODULES.md)。
+## 测试
 
-## 当前已经完成
+当前每个 package 都强制 100% 语句覆盖率，并包含三个 Go fuzz target：
 
-### 仓库基础
+- Piece Tree 与字节切片参考模型的随机编辑程序；
+- v2 文件头和 batch decoder；
+- journal append、sync、重开和截断的有状态模型。
 
-- 独立 Git 仓库和 Go 1.26 模块；
-- 公共模块路径：`github.com/moresleep512/docengine`；
-- Linux 和 Windows CI；
-- 格式检查、vet、单元测试、race 和 fuzz smoke job；
-- Go 源码中已移除 TypeMD 产品依赖。
+测试覆盖非法及逐字节截断批次、状态发布回滚、同长度同 mtime 外部篡改、全文件及
+跨缓冲区 UTF-8、符号链接重定向、并发编辑/保存/恢复、平台耐久性故障和提交后的
+只读状态。
 
-### Piece Tree 加固
+v0.3.0 发布测试已在 Windows 本机和 WSL 2 Debian 的原生 Linux 临时目录执行。
+两端所有 package 均达到 100% statement coverage，
+`-race -shuffle=on -count=3` 全部通过，三个 fuzz target 均至少运行 30 秒，未发现
+实现层反例。
 
-- 构造器会拒绝非法 base Piece；
-- replacement 校验覆盖负数范围、非法 offset、缺失 Source、换行元数据、Source 区间溢出和文档总长度溢出；
-- no-op 替换不会改变 root 或制造 Piece 碎片；
-- `Restore` 同时恢复不可变 root 和 Snapshot 捕获的 Source；
-- Piece 内部切分会保留 Treap priority，保证堆序不被破坏；
-- 测试会检查每个子树缓存的字节数、Piece 数和换行统计；
-- Snapshot 隔离覆盖后续编辑、Source 替换、Source 移除和 Restore。
-
-### 事务与恢复加固
-
-- `ApplyBatch` 会先在隔离 Tree 上按顺序预演全部编辑，再发布任何状态；
-- 一个 batch 只写入一个带校验和的 journal frame，只有操作表和 payload 全部验证成功后才会参与重放；
-- 校验失败、取消、journal 故障、undo store 故障和 revision 溢出都不会改变正文、revision、pending 操作或历史；
-- 保存期间出现的新编辑，会按原编辑组以原子 batch 方式重基到新 journal；
-- 端到端测试把编辑、Snapshot 隔离、崩溃恢复、分组 undo/redo、保存和干净重开串在一起验证。
-
-### 本机工具链验证
-
-当前开发环境已使用 MinGW-w64 GCC 和 `CGO_ENABLED=1` 完成验证，可以在 Windows 本机运行 Go race detector。
-
-## 测试现状
-
-当前里程碑包含：
-
-- Windows 下有 78 个顶层普通测试，并包含更多表驱动子测试；
-- 2 个 Go fuzz target；
-- 当前 Windows 构建下，每个 package 的语句覆盖率均为 100%；
-- 基于普通字节切片的随机参考模型测试；
-- 10,000 次顺序插入后的平衡性覆盖；
-- 编辑期间并发 Snapshot reader；
-- 非法范围、整数溢出、短 Source 和错误传播测试。
-- 非法、损坏和逐字节截断的 journal batch 测试；
-- 跨模块的事务、恢复、undo/redo、保存综合测试。
-
-本机已验证：
-
-```text
-go mod verify                                  PASS
-go vet ./...                                   PASS
-go test ./...                                  PASS
-go test -race ./...                            PASS
-go test -race -shuffle=on -count=3 ./...       PASS
-```
-
-一次 30 秒 Piece Tree fuzz 共完成 1,664,638 次执行；另一次 30 秒 journal decoder fuzz 完成 14,007,342 次执行，均未发现失败。CI 会持续强制 100% 语句覆盖率，并在每次改动时对两个 fuzz target 都运行短时 smoke test。
-
-运行主要检查：
+常规检查：
 
 ```bash
-go test ./...
+go mod verify
+gofmt -l .
 go vet ./...
-go test -race ./...
+go test ./...
+go test -race -shuffle=on -count=3 ./...
 ```
 
-运行 Piece Tree fuzz：
+Fuzz：
 
 ```bash
-go test ./document/store \
-  -run=^$ \
-  -fuzz=FuzzTreeMatchesReference \
-  -fuzztime=30s
+go test ./document/store -run=^$ -fuzz=FuzzTreeMatchesReference -fuzztime=30s
+go test ./recovery -run=^$ -fuzz=FuzzJournalDecoders -fuzztime=30s
+go test ./recovery -run=^$ -fuzz=FuzzJournalStateMachine -fuzztime=30s
 ```
 
-Windows race 构建需要 GCC 兼容的 MinGW-w64 工具链，不能直接使用 MSVC-target 的 `cl.exe` 或 `clang-cl.exe`。
+Windows race 构建需要 GCC 兼容的 MinGW-w64，MSVC 目标的 `cl.exe` 或
+`clang-cl.exe` 不能直接用于 Go Windows race build。
 
 ## 当前限制
 
-- 打开文件时只检查前 64 KiB 是否为合法 UTF-8；
-- 文件身份由路径、大小和修改时间组成，不是强内容指纹；
-- POSIX 原子替换后还没有同步父目录；
-- Session 目录清理和大部分限制仍由宿主负责或硬编码；
-- 当前没有 release、语义版本承诺或兼容性保证。
+- Session 限制、sync 周期、undo 配额和临时目录所有权仍有硬编码；
+- 原子替换后的重绑定失败会主动停止写入，必须显式重新打开；
+- 若宿主不提供更强文件锁，最后一次 hash 到 replace 之间仍存在无法完全消除的竞态；
+- Piece/journal/undo 压缩、稳定坐标映射、事件、索引、虚拟化和 Composition 尚未实现；
+- 公开 API 和磁盘格式在 1.0 前仍不稳定。
 
-## 路线图 / TODO
+## 下一步
 
-### 已完成的事务里程碑
-
-- `ApplyBatch` 在内存和恢复日志中均保证全有或全无；
-- 每个逻辑 batch 使用一个带校验和的 frame；
-- 恢复时忽略不完整或损坏的 batch，不暴露看似有效的前缀；
-- 通过回滚测试覆盖取消和存储故障。
-
-### P1：恢复与持久化
-
-- 把 journal decoder fuzz 扩展到有状态 CRC 与 replay 序列；
-- 加强基础文件身份检查，并定义兼容与迁移策略；
-- 把原子保存故障注入继续扩展到各平台特有的持久性行为；
-- 审查 POSIX 目录持久性和 Windows 文件替换边界。
-
-### P1：Session 策略与生命周期
-
-- 通过流式方式校验整个打开文件的 UTF-8 合法性；
-- 让 undo 配额、插入限制、同步周期和临时路径可配置；
-- 明确定义 Session 目录的所有权与清理；
-- 在公共 API 中明确 undo store 策略和配额丢失历史的报告方式。
-
-### P2：公共 API
-
-- 决定 `document.Session` 是否作为最终公共 facade；
-- 增加包级文档和可运行示例；
-- 稳定错误类型和取消语义；
-- API 稳定后建立 release 和语义版本。
-
-### P2：可选高层能力
-
-- 通过格式中立接口重新引入结构扫描；
-- 基于通用 fragment 构建搜索，而不是重新依赖 Markdown block metadata；
-- 渲染和视口虚拟化继续放在宿主/呈现适配层。
-
-## 开发
-
-要求：
-
-- Go 1.26 或更高版本；
-- Windows race 构建需要 GCC 兼容的 MinGW-w64 编译器。
-
-克隆并验证：
-
-```bash
-git clone https://github.com/moresleep512/docengine.git
-cd docengine
-go test ./...
-```
-
-API 仍在演进。当前阶段尝试使用该模块时应固定到具体 commit，不要假设早期版本之间保持兼容。
+下一块必要地基是配置化 Session 生命周期，以及 byte/line/rune 坐标和跨 revision
+ChangeMap。之后实现格式中立的逻辑 Page/Fragment 虚拟化，再向上实现内置持久化
+搜索和多源 Composition。完整完成度评估、目标架构、边界情况和 v0.4–v1.0 路线见
+[develop.md](develop.md)。

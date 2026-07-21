@@ -257,8 +257,8 @@ func TestTruncatedAtomicBatchRecoveryNeverExposesPrefix(t *testing.T) {
 	if reopened.Metadata().Recovered {
 		t.Fatal("truncated batch incorrectly marked as recovered")
 	}
-	if repaired, err := os.Stat(journalPath); err != nil || repaired.Size() != 72 {
-		t.Fatalf("repaired journal = (%v, %v), want 72 bytes", repaired, err)
+	if repaired, err := os.Stat(journalPath); err != nil || repaired.Size() != 96 {
+		t.Fatalf("repaired journal = (%v, %v), want 96 bytes", repaired, err)
 	}
 }
 

@@ -2,6 +2,7 @@ package document
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"os"
@@ -59,7 +60,7 @@ func TestOpenRejectsPathEncodingContentAndTransientStorageFailures(t *testing.T)
 	}
 }
 
-func TestOpenMatchingJournalGlobSortAndQuarantine(t *testing.T) {
+func TestOpenMatchingJournalV2IsolationAndQuarantine(t *testing.T) {
 	badPatternDir := filepath.Join(t.TempDir(), "[")
 	if err := os.Mkdir(badPatternDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -78,10 +79,28 @@ func TestOpenMatchingJournalGlobSortAndQuarantine(t *testing.T) {
 	dir := t.TempDir()
 	fingerprint := recovery.Fingerprint{PathHash: [32]byte{7}}
 	prefix := journalPrefix(fingerprint)
-	older := filepath.Join(dir, prefix+".older.docengine-journal")
-	newer := filepath.Join(dir, prefix+".newer.docengine-journal")
-	if err := os.WriteFile(older, []byte("bad"), 0o600); err != nil {
+	legacy := filepath.Join(dir, prefix+".legacy.docengine-journal")
+	if err := os.WriteFile(legacy, []byte("v1 is ignored"), 0o600); err != nil {
 		t.Fatal(err)
+	}
+	journal, replay, err := openMatchingJournal(dir, fingerprint)
+	if err != nil || journal != nil || len(replay.Batches) != 0 {
+		t.Fatalf("legacy openMatchingJournal = (%v, %+v, %v)", journal, replay, err)
+	}
+	if _, err := os.Stat(legacy); err != nil {
+		t.Fatalf("legacy journal was modified: %v", err)
+	}
+
+	older := filepath.Join(dir, prefix+".older.docengine-journal-v2")
+	newer := filepath.Join(dir, prefix+".newer.docengine-journal-v2")
+	for _, path := range []string{older, newer} {
+		created, _, createErr := recovery.Open(path, fingerprint)
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		if closeErr := created.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
 	}
 	if err := os.WriteFile(newer, []byte("bad"), 0o600); err != nil {
 		t.Fatal(err)
@@ -93,13 +112,14 @@ func TestOpenMatchingJournalGlobSortAndQuarantine(t *testing.T) {
 	if err := os.Chtimes(newer, now, now); err != nil {
 		t.Fatal(err)
 	}
-	journal, replay, err := openMatchingJournal(dir, fingerprint)
-	if err != nil || journal != nil || len(replay.Frames) != 0 {
-		t.Fatalf("openMatchingJournal = (%v, %+v, %v)", journal, replay, err)
+	journal, replay, err = openMatchingJournal(dir, fingerprint)
+	var recoveryErr *RecoveryOpenError
+	if !errors.As(err, &recoveryErr) || journal != nil || len(replay.Batches) != 0 {
+		t.Fatalf("ambiguous openMatchingJournal = (%v, %+v, %v)", journal, replay, err)
 	}
-	stale, err := filepath.Glob(filepath.Join(dir, "*.stale-*"))
-	if err != nil || len(stale) != 2 {
-		t.Fatalf("stale journals = %v, error = %v", stale, err)
+	quarantined, err := filepath.Glob(filepath.Join(dir, "*.quarantine-ambiguous-*"))
+	if err != nil || len(quarantined) != 2 {
+		t.Fatalf("quarantined journals = %v, error = %v", quarantined, err)
 	}
 }
 
@@ -110,14 +130,14 @@ func TestOpenRejectsSemanticallyInvalidMatchingJournal(t *testing.T) {
 		t.Fatal(err)
 	}
 	info, _ := os.Stat(path)
-	fingerprint := recovery.FingerprintFor(path, info)
+	fingerprint := recovery.FingerprintFor(path, info.Size(), sha256.Sum256([]byte("abc")))
 	recoveryDir := filepath.Join(dir, "recovery")
-	journalPath := filepath.Join(recoveryDir, journalPrefix(fingerprint)+".invalid.docengine-journal")
+	journalPath := filepath.Join(recoveryDir, journalPrefix(fingerprint)+".invalid.docengine-journal-v2")
 	journal, _, err := recovery.Open(journalPath, fingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := journal.AppendReplace(1, 99, 1, nil); err != nil {
+	if _, err := journal.AppendBatch(1, 1, []recovery.ReplaceOperation{{Start: 99, DeleteLength: 1}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := journal.Close(); err != nil {
@@ -276,46 +296,49 @@ func TestApplyBatchPropagatesTreeReadAndJournalCreationFailures(t *testing.T) {
 	})
 }
 
-func TestReplayErrorAndLegacyRootBranches(t *testing.T) {
-	t.Run("non-monotonic", func(t *testing.T) {
+func TestReplayV2BatchBoundariesAndFailures(t *testing.T) {
+	t.Run("zero first revision", func(t *testing.T) {
 		session, _, _ := openAtomicTestSession(t, "abc")
 		defer session.Close()
-		session.revision = 1
-		if err := session.replay(recovery.ReplayResult{Frames: []recovery.Frame{{Kind: recovery.FrameRoot, Revision: 1}}}); err == nil {
-			t.Fatal("expected non-monotonic error")
+		err := session.replay(recovery.ReplayResult{Batches: []recovery.Batch{{Group: 1, Operations: []recovery.Operation{{}}}}})
+		if err == nil {
+			t.Fatal("zero revision accepted")
 		}
 	})
-	t.Run("missing root", func(t *testing.T) {
+	t.Run("non-contiguous batches", func(t *testing.T) {
 		session, _, _ := openAtomicTestSession(t, "abc")
 		defer session.Close()
-		if err := session.replay(recovery.ReplayResult{Frames: []recovery.Frame{{Kind: recovery.FrameRoot, Revision: 1, TargetRevision: 99}}}); err == nil {
-			t.Fatal("expected missing-root error")
+		err := session.replay(recovery.ReplayResult{Batches: []recovery.Batch{
+			{FirstRevision: 1, Group: 1, Operations: []recovery.Operation{{}}},
+			{FirstRevision: 3, Group: 3, Operations: []recovery.Operation{{}}},
+		}})
+		if err == nil {
+			t.Fatal("non-contiguous batches accepted")
 		}
 	})
-	t.Run("valid groups and root", func(t *testing.T) {
+	t.Run("valid groups", func(t *testing.T) {
 		session, _, _ := openAtomicTestSession(t, "abc")
 		defer session.Close()
 		if err := session.ensureJournalLocked(); err != nil {
 			t.Fatal(err)
 		}
-		first, err := session.journal.AppendReplaceGroup(1, 0, 0, []byte("A"), 1)
+		first, err := session.journal.AppendBatch(1, 1, []recovery.ReplaceOperation{{Inserted: []byte("A")}})
 		if err != nil {
 			t.Fatal(err)
 		}
-		second, err := session.journal.AppendReplaceGroup(2, 1, 0, []byte("B"), 2)
+		second, err := session.journal.AppendBatch(2, 2, []recovery.ReplaceOperation{{Start: 1, Inserted: []byte("B")}})
 		if err != nil {
 			t.Fatal(err)
 		}
-		err = session.replay(recovery.ReplayResult{Frames: []recovery.Frame{
-			{Kind: recovery.FrameReplace, Revision: 1, TargetRevision: 1, Start: 0, InsertLength: 1, PayloadOffset: first},
-			{Kind: recovery.FrameReplace, Revision: 2, TargetRevision: 2, Start: 1, InsertLength: 1, PayloadOffset: second},
-			{Kind: recovery.FrameRoot, Revision: 3, TargetRevision: 0},
+		err = session.replay(recovery.ReplayResult{Batches: []recovery.Batch{
+			{FirstRevision: 1, Group: 1, Operations: []recovery.Operation{{InsertLength: 1, PayloadOffset: first.PayloadOffsets[0]}}},
+			{FirstRevision: 2, Group: 2, Operations: []recovery.Operation{{Start: 1, InsertLength: 1, PayloadOffset: second.PayloadOffsets[0]}}},
 		}})
 		if err != nil {
 			t.Fatal(err)
 		}
-		assertSessionText(t, session, "abc")
-		if session.revision != 3 || !session.dirty || !session.recovered || len(session.undo) != 0 {
+		assertSessionText(t, session, "ABabc")
+		if session.revision != 2 || !session.dirty || !session.recovered || len(session.undo) != 2 {
 			t.Fatalf("replay state: revision=%d dirty=%v recovered=%v undo=%d", session.revision, session.dirty, session.recovered, len(session.undo))
 		}
 	})
@@ -325,10 +348,8 @@ func TestReplayErrorAndLegacyRootBranches(t *testing.T) {
 		if err := session.ensureJournalLocked(); err != nil {
 			t.Fatal(err)
 		}
-		if err := session.journal.Close(); err != nil {
-			t.Fatal(err)
-		}
-		err := session.replay(recovery.ReplayResult{Frames: []recovery.Frame{{Kind: recovery.FrameReplace, Revision: 1, InsertLength: 1}}})
+		_ = session.journal.Close()
+		err := session.replay(singleReplayOperation(recovery.Operation{InsertLength: 1}))
 		if !errors.Is(err, recovery.ErrClosed) {
 			t.Fatalf("replay error = %v", err)
 		}
@@ -339,14 +360,12 @@ func TestReplayErrorAndLegacyRootBranches(t *testing.T) {
 		if err := session.ensureJournalLocked(); err != nil {
 			t.Fatal(err)
 		}
-		offset, err := session.journal.AppendReplace(1, 0, 0, []byte("x"))
+		result, err := session.journal.AppendBatch(1, 1, []recovery.ReplaceOperation{{Inserted: []byte("x")}})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := session.undoStore.close(); err != nil {
-			t.Fatal(err)
-		}
-		err = session.replay(recovery.ReplayResult{Frames: []recovery.Frame{{Kind: recovery.FrameReplace, Revision: 1, InsertLength: 1, PayloadOffset: offset}}})
+		_ = session.undoStore.close()
+		err = session.replay(singleReplayOperation(recovery.Operation{InsertLength: 1, PayloadOffset: result.PayloadOffsets[0]}))
 		if !errors.Is(err, ErrClosed) {
 			t.Fatalf("replay history error = %v", err)
 		}
@@ -357,10 +376,8 @@ func TestReplayErrorAndLegacyRootBranches(t *testing.T) {
 		if err := session.ensureJournalLocked(); err != nil {
 			t.Fatal(err)
 		}
-		if err := session.undoStore.close(); err != nil {
-			t.Fatal(err)
-		}
-		err := session.replay(recovery.ReplayResult{Frames: []recovery.Frame{{Kind: recovery.FrameReplace, Revision: 1, DeleteLength: 1}}})
+		_ = session.undoStore.close()
+		err := session.replay(singleReplayOperation(recovery.Operation{DeleteLength: 1}))
 		if !errors.Is(err, ErrClosed) {
 			t.Fatalf("replay inverse-history error = %v", err)
 		}
@@ -371,22 +388,18 @@ func TestReplayErrorAndLegacyRootBranches(t *testing.T) {
 		if err := session.ensureJournalLocked(); err != nil {
 			t.Fatal(err)
 		}
-		err := session.replay(recovery.ReplayResult{Frames: []recovery.Frame{{
-			Kind: recovery.FrameReplace, Revision: 1, InsertLength: 1, PayloadOffset: 1 << 30,
-		}}})
-		if err == nil {
-			t.Fatal("expected replacement source-range error")
+		if err := session.replay(singleReplayOperation(recovery.Operation{InsertLength: 1, PayloadOffset: 1 << 30})); err == nil {
+			t.Fatal("invalid payload offset accepted")
 		}
 	})
-	t.Run("short read without error", func(t *testing.T) {
+	t.Run("short read", func(t *testing.T) {
 		session, _, _ := openAtomicTestSession(t, "abc")
 		defer session.Close()
 		if err := session.ensureJournalLocked(); err != nil {
 			t.Fatal(err)
 		}
 		session.operations.readRecovery = func(*recovery.Journal, []byte, int64) (int, error) { return 0, nil }
-		err := session.replay(recovery.ReplayResult{Frames: []recovery.Frame{{Kind: recovery.FrameReplace, Revision: 1, InsertLength: 1}}})
-		if !errors.Is(err, io.ErrUnexpectedEOF) {
+		if err := session.replay(singleReplayOperation(recovery.Operation{InsertLength: 1})); !errors.Is(err, io.ErrUnexpectedEOF) {
 			t.Fatalf("replay error = %v", err)
 		}
 	})
@@ -396,18 +409,20 @@ func TestReplayErrorAndLegacyRootBranches(t *testing.T) {
 		if err := session.ensureJournalLocked(); err != nil {
 			t.Fatal(err)
 		}
-		offset, err := session.journal.AppendReplace(1, 0, 0, []byte("x"))
+		result, err := session.journal.AppendBatch(1, 1, []recovery.ReplaceOperation{{Inserted: []byte("x")}})
 		if err != nil {
 			t.Fatal(err)
 		}
 		session.tree.SetSource(store.SourceJournal, nil)
-		err = session.replay(recovery.ReplayResult{Frames: []recovery.Frame{{
-			Kind: recovery.FrameReplace, Revision: 1, InsertLength: 1, PayloadOffset: offset,
-		}}})
+		err = session.replay(singleReplayOperation(recovery.Operation{InsertLength: 1, PayloadOffset: result.PayloadOffsets[0]}))
 		if !errors.Is(err, store.ErrUnknownSource) {
 			t.Fatalf("replay error = %v", err)
 		}
 	})
+}
+
+func singleReplayOperation(operation recovery.Operation) recovery.ReplayResult {
+	return recovery.ReplayResult{Batches: []recovery.Batch{{FirstRevision: 1, Group: 1, Operations: []recovery.Operation{operation}}}}
 }
 
 func TestConcurrentSaveReportsNewJournalCreationFailure(t *testing.T) {

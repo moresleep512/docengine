@@ -2,11 +2,28 @@
 package save
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 )
+
+// DurabilityError means the target name was atomically replaced, but the
+// platform could not confirm that the directory entry is durable across a
+// power loss. Callers must treat the content as committed.
+type DurabilityError struct {
+	Path string
+	Err  error
+}
+
+func (e *DurabilityError) Error() string {
+	return fmt.Sprintf("save: replacement committed but durability is uncertain for %q: %v", e.Path, e.Err)
+}
+
+func (e *DurabilityError) Unwrap() error { return e.Err }
+
+func (e *DurabilityError) Committed() bool { return true }
 
 type temporaryFile interface {
 	io.Writer
@@ -40,6 +57,11 @@ func AtomicChecked(path string, mode os.FileMode, prefix []byte, writeContent fu
 	return atomicChecked(path, mode, prefix, writeContent, beforeReplace, systemAtomicOperations)
 }
 
+// SyncParent retries durability of the directory entry containing path. It is
+// a no-op on platforms whose replacement primitive already provides the
+// required guarantee.
+func SyncParent(path string) error { return syncParent(path) }
+
 func atomicChecked(path string, mode os.FileMode, prefix []byte, writeContent func(io.Writer) (int64, error), beforeReplace func() error, operations atomicOperations) (int64, error) {
 	dir := filepath.Dir(path)
 	temp, err := operations.createTemp(dir, ".docengine-save-*.tmp")
@@ -64,6 +86,9 @@ func atomicChecked(path string, mode os.FileMode, prefix []byte, writeContent fu
 		if err != nil {
 			return total, err
 		}
+		if n != len(prefix) {
+			return total, io.ErrShortWrite
+		}
 	}
 	n, err := writeContent(temp)
 	total += n
@@ -82,6 +107,10 @@ func atomicChecked(path string, mode os.FileMode, prefix []byte, writeContent fu
 		}
 	}
 	if err := operations.replace(tempPath, path); err != nil {
+		var durability *DurabilityError
+		if errors.As(err, &durability) {
+			committed = true
+		}
 		return total, fmt.Errorf("replace original: %w", err)
 	}
 	committed = true

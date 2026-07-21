@@ -10,7 +10,13 @@ import (
 
 func TestReplaceFileWithCallValidationAndResults(t *testing.T) {
 	called := false
-	call := func(*uint16, *uint16) (uintptr, error) { called = true; return 1, nil }
+	call := func(_, _, backup *uint16, flags uint32, exclude, reserved uintptr) (uintptr, error) {
+		called = true
+		if backup != nil || flags != replaceFileWriteThrough || exclude != 0 || reserved != 0 {
+			t.Fatalf("ReplaceFileW arguments = (backup=%v flags=%d exclude=%d reserved=%d)", backup, flags, exclude, reserved)
+		}
+		return 1, nil
+	}
 	if err := replaceFileWithCall("bad\x00from", "to", call); err == nil || called {
 		t.Fatalf("invalid from = %v, called=%v", err, called)
 	}
@@ -21,10 +27,10 @@ func TestReplaceFileWithCallValidationAndResults(t *testing.T) {
 		t.Fatalf("success = %v, called=%v", err, called)
 	}
 	sentinel := errors.New("replace failed")
-	if err := replaceFileWithCall("from", "to", func(*uint16, *uint16) (uintptr, error) { return 0, sentinel }); !errors.Is(err, sentinel) {
+	if err := replaceFileWithCall("from", "to", func(*uint16, *uint16, *uint16, uint32, uintptr, uintptr) (uintptr, error) { return 0, sentinel }); !errors.Is(err, sentinel) {
 		t.Fatalf("call error = %v", err)
 	}
-	if err := replaceFileWithCall("from", "to", func(*uint16, *uint16) (uintptr, error) { return 0, syscall.Errno(0) }); !errors.Is(err, syscall.EINVAL) {
+	if err := replaceFileWithCall("from", "to", func(*uint16, *uint16, *uint16, uint32, uintptr, uintptr) (uintptr, error) { return 0, syscall.Errno(0) }); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("zero call error = %v", err)
 	}
 }

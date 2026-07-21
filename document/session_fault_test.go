@@ -2,6 +2,7 @@ package document
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"math"
@@ -24,6 +25,32 @@ func TestOpenSessionInjectedStatTreeAndRepairFailures(t *testing.T) {
 		}
 	})
 
+	t.Run("resolved absolute path failure", func(t *testing.T) {
+		operations := systemSessionOperations
+		calls := 0
+		operations.absolutePath = func(path string) (string, error) {
+			calls++
+			if calls == 2 {
+				return "", sentinel
+			}
+			return path, nil
+		}
+		operations.evalSymlinks = func(path string) (string, error) { return path, nil }
+		if _, err := openSession("ignored", OpenOptions{}, operations); !errors.Is(err, sentinel) {
+			t.Fatalf("openSession error = %v", err)
+		}
+	})
+
+	t.Run("base open failure", func(t *testing.T) {
+		operations := systemSessionOperations
+		operations.absolutePath = func(path string) (string, error) { return path, nil }
+		operations.evalSymlinks = func(path string) (string, error) { return path, nil }
+		operations.openBase = func(string) (*os.File, error) { return nil, sentinel }
+		if _, err := openSession("ignored", OpenOptions{}, operations); !errors.Is(err, sentinel) {
+			t.Fatalf("openSession error = %v", err)
+		}
+	})
+
 	t.Run("non-regular base is rejected and closed", func(t *testing.T) {
 		reader, writer, err := os.Pipe()
 		if err != nil {
@@ -35,6 +62,7 @@ func TestOpenSessionInjectedStatTreeAndRepairFailures(t *testing.T) {
 		})
 
 		operations := systemSessionOperations
+		operations.evalSymlinks = func(path string) (string, error) { return path, nil }
 		operations.openBase = func(string) (*os.File, error) { return reader, nil }
 		if _, err := openSession("ignored", OpenOptions{}, operations); err == nil || err.Error() != "document: path is not a regular file" {
 			t.Fatalf("openSession error = %v", err)
@@ -73,9 +101,9 @@ func TestOpenSessionInjectedStatTreeAndRepairFailures(t *testing.T) {
 			t.Fatal(err)
 		}
 		info, _ := os.Stat(path)
-		fingerprint := recovery.FingerprintFor(path, info)
+		fingerprint := recovery.FingerprintFor(path, info.Size(), sha256.Sum256([]byte("abc")))
 		recoveryDir := filepath.Join(dir, "recovery")
-		journalPath := filepath.Join(recoveryDir, journalPrefix(fingerprint)+".test.docengine-journal")
+		journalPath := filepath.Join(recoveryDir, journalPrefix(fingerprint)+".test.docengine-journal-v2")
 		journal, _, err := recovery.Open(journalPath, fingerprint)
 		if err != nil {
 			t.Fatal(err)
@@ -97,9 +125,9 @@ func TestOpenSessionInjectedStatTreeAndRepairFailures(t *testing.T) {
 			t.Fatal(err)
 		}
 		info, _ := os.Stat(path)
-		fingerprint := recovery.FingerprintFor(path, info)
+		fingerprint := recovery.FingerprintFor(path, info.Size(), sha256.Sum256([]byte("abc")))
 		recoveryDir := filepath.Join(dir, "recovery")
-		journalPath := filepath.Join(recoveryDir, journalPrefix(fingerprint)+".test.docengine-journal")
+		journalPath := filepath.Join(recoveryDir, journalPrefix(fingerprint)+".test.docengine-journal-v2")
 		journal, _, err := recovery.Open(journalPath, fingerprint)
 		if err != nil {
 			t.Fatal(err)
@@ -158,7 +186,7 @@ func TestApplyBatchInjectedCloneAndInvariantFailuresAreAtomic(t *testing.T) {
 			t.Fatalf("ApplyBatch error = %v", err)
 		}
 		assertSessionState(t, session, Metadata{ByteLength: 3}, "abc")
-		if info, err := os.Stat(session.journal.Path()); err != nil || info.Size() != 72 {
+		if info, err := os.Stat(session.journal.Path()); err != nil || info.Size() != 96 {
 			t.Fatalf("journal after rollback = (%v, %v)", info, err)
 		}
 	})

@@ -1,14 +1,9 @@
 # Docengine module notes
 
-This repository now contains only the format-neutral local document core. The
-Markdown structure pipeline, SQLite search pipeline, index publication
-orchestration, and editor-layout virtualization code were removed because their
-public contracts encoded TypeMD-specific document and UI policy.
-
-The source tree is an independent Go 1.26 module named
-`github.com/moresleep512/docengine`. CI runs formatting, vet, tests, a 100%
-statement-coverage gate, the race detector, and short Piece Tree and journal
-decoder fuzz smoke tests on Linux; the regular test job also runs on Windows.
+Docengine is a format-neutral local UTF-8 document core. No core package may
+depend on Markdown, another file format, a renderer, Wails, or UI layout policy.
+The module path is `github.com/moresleep512/docengine` and the current toolchain
+target is Go 1.26.
 
 ## Dependency direction
 
@@ -18,288 +13,190 @@ document/save -----+--> document
 recovery ----------+
 ```
 
-The lower-level packages do not import `document`. The `document` package is the
-coordination layer that owns their lifecycle.
+The lower packages never import `document`. `document.Session` is the current
+coordination facade and owns their lifecycle.
 
 ## `document/store`
 
-### Responsibility
+The store represents logical content as immutable Pieces referencing byte
+ranges in external `io.ReaderAt` sources. The initial Piece references the base
+file; inserted Pieces reference journal payloads.
 
-`document/store` represents a logical document as immutable pieces that point
-into external `io.ReaderAt` sources. The initial document points into the base
-file; inserted text points into the recovery journal. Editing changes metadata
-nodes instead of copying the full document.
+A persistent randomized treap caches subtree byte length, Piece count, and
+optional newline totals. `ReplacePiece` splits at byte boundaries and clones
+only changed paths. Earlier roots therefore remain readable and average edit or
+coordinate traversal cost follows tree height rather than document length.
 
-### Data model
+Important invariants:
 
-- `SourceID` identifies a byte source. The built-in IDs are the base file and
-  the journal.
-- `Piece` stores source ID, source offset, logical length, and optional newline
-  metadata.
-- `Tree` owns the current root and the live source map.
-- `Snapshot` captures an immutable root plus a copy of the source map.
+- negative or overflowing ranges and missing sources are rejected before root
+  publication;
+- a no-op replacement preserves the root;
+- `Snapshot` captures both root and Source bindings;
+- split Pieces inherit the original treap priority;
+- callers must keep all referenced Source handles alive for a Snapshot.
 
-### Algorithm
-
-The tree is a persistent randomized treap. Each node caches total bytes, piece
-count, and newline information for its subtree. `ReplacePiece` splits the tree
-at the replacement boundaries, discards the deleted middle, and merges an
-optional replacement piece between the surviving sides.
-
-Nodes on changed paths are cloned, so earlier roots remain readable. Average
-edit and coordinate traversal cost is proportional to tree height rather than
-document byte length.
-
-Constructors and replacements reject negative or overflowing source ranges,
-invalid newline metadata, missing sources, and logical document-length
-overflow before publishing a new root. A no-op replacement preserves the
-existing root rather than fragmenting a Piece. Restoring a snapshot restores
-both its root and its captured source bindings.
-
-When a Piece is split, both fragments inherit the original node priority. Fresh
-random priorities would be able to outrank an ancestor while recursive `split`
-unwinds and silently violate the Treap heap invariant.
-
-### Concurrency and lifetime
-
-`Tree` protects its mutable root and source map with an RW mutex. A `Snapshot`
-does not own file handles; the higher-level generation lease must keep every
-referenced source open while the snapshot is in use.
-
-### Important limitations
-
-- Splitting a piece invalidates that piece's cached newline count; this package
-  does not rescan it.
-- The package validates logical ranges and source presence, but trusts source
-  offsets and lengths supplied by callers.
-- Source IDs are a small fixed integer namespace rather than a general source
-  registry contract.
-
-### Verification
-
-Tests compare edits against a byte-slice reference model, inspect every cached
-subtree invariant, retain old snapshots across later edits, exercise source
-replacement and removal, cover invalid ranges and integer overflow, perform
-10,000 sequential inserts, and read concurrently with edits. The package has
-100% statement coverage. A Go fuzz target continuously generates edit programs
-and compares reads, writes, snapshots, and invariants with the reference model.
+`document.sourceGeneration` provides that ownership through `SnapshotLease`.
+The store itself does not close files.
 
 ## `recovery`
 
-### Responsibility
+Recovery v2 is an append-only atomic-batch journal. There is no v1 decoder,
+migration path, single-replacement frame, or root frame.
 
-`recovery` stores unsaved replacements in an append-only journal and reconstructs
-the edit sequence after a crash.
+### Fingerprint
 
-### File format
+`Fingerprint` contains:
 
-- A 72-byte file header contains format magic, version, base size, base
-  modification time, normalized-path hash, and a CRC.
-- Each physical record has a 64-byte frame header followed by its payload.
-- Frame CRC uses CRC-32C over the header prefix and payload.
-- Replace frames record revision, edit group, start, deleted length, and
-  inserted length.
-- Batch frames contain a fixed-size operation table followed by all inserted
-  bytes. Replay expands them into logical replacement frames only after the
-  complete physical frame, CRC, table, revision range, lengths, and payload
-  boundaries validate.
-- Root frames remain for legacy replay semantics, although normal editing now
-  records grouped replacements.
+- base byte length;
+- SHA-256 of the normalized resolved path;
+- SHA-256 of the complete on-disk content, including a BOM.
 
-The magic values are now `DOCLOG01` and `DOCJNL01`; journals written by TypeMD's
-old `TMD...` format are deliberately incompatible.
+Windows path hashing is case-insensitive; POSIX path hashing preserves case.
+Modification time is not a durable identity field.
 
-### Replay and repair
+### File header
 
-`Replay` walks physical frames sequentially. An incomplete header, invalid
-frame, oversized payload, incomplete payload, CRC mismatch, or malformed batch
-marks the remaining tail as truncated. No logical operation from an invalid
-batch is returned. The valid prefix is returned to the caller, which may call
-`RepairTail` to truncate the file to the last verified physical frame.
+The fixed 96-byte `DOCLOG02` header is little-endian:
 
-### Durability and concurrency
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 8 | magic `DOCLOG02` |
+| 8 | 4 | version 2 |
+| 12 | 4 | header size 96 |
+| 16 | 8 | base byte length |
+| 24 | 32 | normalized resolved-path SHA-256 |
+| 56 | 32 | complete-content SHA-256 |
+| 88 | 4 | reserved, zero |
+| 92 | 4 | CRC-32C of bytes 0–91 |
 
-Journal methods are serialized with a mutex. Appending does not sync every
-frame; `document.Session` periodically calls `Sync`, trading at most a small
-window of recent edits for lower foreground latency.
+Journal filenames use `.docengine-journal-v2`. Old suffixes are outside the
+search namespace and are neither read nor modified.
 
-The journal file is accessed through a package-private minimal interface. This
-does not change the public API or file format, but lets tests deterministically
-cover stat, header-write, short-write, sync, seek, truncation, replay-read, and
-close failures. The current Windows build has 100% statement coverage.
+### Batch record
 
-### Important limitations
+Each durable transaction has a 64-byte `DOCJNL02` header followed by a payload:
 
-- The base identity is size, modification time, and a lower-cased absolute-path
-  hash; it is not a content hash.
-- Same-size external edits with a preserved timestamp can evade stale-journal
-  detection.
-- Lower-casing paths assumes case-insensitive path identity and needs review for
-  case-sensitive filesystems.
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 8 | magic `DOCJNL02` |
+| 8 | 2 | version 2 |
+| 10 | 2 | flags, zero |
+| 12 | 4 | header size 64 |
+| 16 | 8 | first revision |
+| 24 | 8 | nonzero edit group |
+| 32 | 4 | operation count |
+| 36 | 4 | operation record size 24 |
+| 40 | 8 | payload length |
+| 48 | 8 | reserved, zero |
+| 56 | 4 | CRC-32C of header bytes 0–55 plus payload |
+| 60 | 4 | reserved, zero |
+
+The payload begins with one 24-byte `(start, delete length, insert length)`
+record per operation, followed by inserted bytes in operation order. A batch is
+limited to 256 operations and 1 GiB total payload. Replay publishes a `Batch`
+only after the complete header, CRC, operation table, revision range, lengths,
+and payload cursor validate.
+
+An invalid or incomplete tail returns the last verified offset and never
+exposes part of a transaction. `document` repairs that tail. A corrupt header,
+base mismatch, or ambiguous set of v2 journals is quarantined and reported as a
+typed `RecoveryOpenError` instead of silently discarded.
 
 ## `document/save`
 
-### Responsibility
+Atomic save performs:
 
-`document/save` streams an immutable snapshot into a same-directory temporary
-file and replaces the original without holding the complete document in memory.
+1. create a same-directory `.docengine-save-*.tmp`;
+2. copy target permission bits;
+3. write the optional BOM and stream the immutable Snapshot;
+4. sync and close the temporary file;
+5. run the final strong-content conflict check;
+6. atomically replace the target;
+7. on POSIX, open and sync the parent directory.
 
-### Save sequence
+Windows uses `ReplaceFileW` with `REPLACEFILE_WRITE_THROUGH`. Base handles use
+`FILE_SHARE_DELETE`, so old Snapshot readers survive replacement.
 
-1. Create `.docengine-save-*.tmp` beside the target.
-2. Apply the original permission bits.
-3. Write an optional prefix, such as a UTF-8 BOM.
-4. Stream snapshot content.
-5. Sync and close the temporary file.
-6. Run an optional last-moment external-change check.
-7. Replace the original path.
-
-Uncommitted temporary files are removed by a deferred cleanup.
-
-### Platform behavior
-
-- Non-Windows builds use `os.Rename`.
-- Windows uses `ReplaceFileW` with write-through replacement semantics. The
-  base file is opened with `FILE_SHARE_DELETE`, allowing old snapshot readers
-  to keep their handle while the path is replaced.
-
-### Verification and limitations
-
-Package-local tests inject deterministic create, permission, prefix-write,
-content-write, sync, close, conflict-check, replace, and cleanup outcomes. The
-Windows build currently has 100% statement coverage for this package. The POSIX
-path syncs file content but does not yet sync the containing directory after
-rename.
+On POSIX, a rename can succeed before parent-directory sync fails. That result
+is a `DurabilityError`: content is committed, but power-loss durability is
+uncertain. `Session` records this state and a later clean `Save` retries the
+directory sync. Uncommitted temporary files are removed at every earlier fault
+boundary.
 
 ## `document`
 
-### Responsibility
+### Opening
 
-`document` is the public coordination layer for opening, reading, editing,
-recovering, snapshotting, undoing, redoing, and saving a local UTF-8 text file.
+`Open` wraps `OpenContext(context.Background(), ...)`. Opening resolves and
+pins the real target, opens a regular file, then scans the complete file once in
+256 KiB chunks. The scan:
 
-### Opening a session
+- validates UTF-8 across chunk boundaries;
+- detects and excludes only the initial BOM from logical content;
+- hashes all on-disk bytes;
+- counts all newline styles;
+- checks Context cancellation;
+- verifies before/after handle and path identity.
 
-`Open` resolves an absolute regular-file path, opens the base file, samples the
-first 64 KiB for UTF-8 validity, detects an optional BOM and newline style, and
-constructs the initial piece tree. It then finds the newest matching recovery
-journal, replays valid frames, repairs a truncated tail, opens the disk-backed
-undo store, and starts a once-per-second journal sync loop.
+`Metadata.Path` is the requested absolute path and `ResolvedPath` is the pinned
+target. A symlink later redirected elsewhere does not change the save target.
 
-Default transient storage is under the system temporary directory in
-`docengine/recovery` and `docengine/sessions`.
+### Transactions and history
 
-### Revisions and editing
+Every replacement increments revision. `ApplyBatch` checks expected revision,
+validates and stages at most 256 sequential operations on an isolated tree,
+appends one recovery batch, builds a second tree using durable payload offsets,
+and only then publishes content, pending operations, revisions, and one undo
+entry. Validation, cancellation, journal, tree, or undo-store failures publish
+nothing; post-append failures repair the journal to its previous batch boundary.
 
-- Every replacement increments the session revision.
-- `ApplyBatch` rejects a caller whose expected revision is stale.
-- A batch is limited to 256 operations.
-- Each inserted string must be valid UTF-8 and at most 1 MiB.
-- Deleted and inserted bytes are recorded in a disk-backed undo store.
-- The complete batch is first applied to an isolated staging tree using
-  sequential coordinates.
-- After staging succeeds, all operations and inserted bytes are appended as one
-  checksummed recovery frame.
-- A second isolated tree is built against the durable journal offsets and is
-  published in one assignment together with revisions, pending operations, and
-  one undo entry.
-- Validation, cancellation, journal append, and undo-store failures publish no
-  document prefix; a post-append failure truncates the journal back to its
-  original frame boundary.
-
-### Undo storage
-
-`undo_store.go` writes history text into `undo.store` inside the session
-directory instead of retaining large deleted ranges in memory. Its default
-quota is 256 MiB. Exceeding the quota clears both history stacks, truncates the
-store, and begins a new history epoch.
-
-The session closes the undo file but does not remove its directory; the future
-host layer must own transient-directory cleanup.
+Inserted strings must be valid UTF-8 and no larger than 1 MiB. Deleted and
+inserted history text is stored in `undo.store`; the current default quota is
+256 MiB. Quota exhaustion clears both history stacks and starts a new epoch.
 
 ### Snapshot generations
 
-`generation.go` couples an immutable tree snapshot to the base and journal file
-handles it references. Each snapshot lease increments the generation reference
-count. Saving may install a new base file and retire the old generation, but old
-handles are closed and the old journal is deleted only after every lease has
-been released.
+A generation owns its base and journal handles. Snapshot leases increment the
+generation reference count. Save can install a new generation while old leases
+continue reading the retired one. Handles close and committed journals are
+removed only after the last lease releases.
 
-This makes long-running readers independent of subsequent edits and saves, but
-callers must always close leases.
+### Saving and conflicts
 
-### Saving with concurrent edits
+Save captures an immutable target revision without blocking subsequent edits.
+Before streaming it rejects an obvious length change; immediately before
+replacement it stably reads and hashes the complete current target. A different
+hash returns `ErrExternalChange`, including same-length changes with a preserved
+mtime. A timestamp-only change with identical bytes is allowed.
 
-`CommitAtLeast` serializes saves separately from editing:
+After replacement, the committed file is reopened as a new generation. Edits
+that arrived during streaming are copied in their original groups into a new
+v2 journal rooted at the saved content and replayed onto the new Tree.
 
-1. Capture a target revision and lease its immutable snapshot.
-2. Release the session lock while streaming the snapshot.
-3. Check size and modification-time identity before and immediately before
-   replacement.
-4. Reopen the newly saved base as a new generation.
-5. If edits arrived during streaming, copy only the newer journal operations,
-   preserving each edit group as one atomic batch in a new journal rooted at
-   the saved file, and rebuild their piece-tree overlay.
-6. Retire the old generation after outstanding readers finish.
+If replacement committed but stat, reopen, Tree construction, new journal, or
+rebase fails, `CommittedRevision` is still advanced and the Session enters a
+permanent read-only fault state. `ReadAt`, `Snapshot`, `Metadata`, `Fault`, and
+`Close` remain usable; edit, undo, redo, and save return `ErrFaulted` joined with
+the cause. This prevents continued mutation on a partially rebound generation.
 
-The result may therefore be clean or may remain dirty at a revision newer than
-the committed snapshot.
+### Remaining policy
 
-### Metadata and policy still present
+The core intentionally retains generic text policy—UTF-8, BOM, newline
+metadata, revisions, ranges, and byte-oriented search foundations—but no format
+semantics. Limits, sync interval, transient-directory ownership, compaction,
+events, coordinate maps, virtualization, and indexing still require later
+work. See [develop.md](develop.md).
 
-The package is text-document-specific rather than binary-document-generic. It
-still defines UTF-8 insertion policy, BOM preservation, newline-style metadata,
-revision and batch limits, undo quota, default temporary directories,
-and file identity policy. These are generic local text-engine policies, not
-TypeMD/Markdown business behavior, but they may eventually become injected
-configuration.
+## Verification
 
-Session orchestration uses package-private runtime operations for base-file,
-recovery, tree-clone, stat, and atomic-save boundaries. Tests inject failures at
-each publication and rebase stage without changing the public `Session` API.
-The current Windows build has 100% statement coverage for `document`.
+Every current package is held at 100% statement coverage. Tests include
+platform-specific replacement and directory-sync faults, complete UTF-8 and
+identity boundaries, every recovery batch truncation, transaction rollback,
+concurrent save/rebase, post-commit fault behavior, snapshot lifetime, integer
+overflow, randomized reference models, race runs, and three fuzz targets.
 
-### Important limitations
-
-- Only the first 64 KiB of an opened file is validated as UTF-8.
-- External-change detection relies on size and modification time, not content.
-- `Close` preserves a dirty recovery journal but leaves session-directory
-  cleanup to its host.
-
-## Removed modules
-
-### `document/blocks`
-
-Removed because it combined Markdown syntax classification, semantic block
-identity, fragmentation, layout-height estimation, checkpointing, and the
-binary block-index format in one contract. The height fields also tied the
-storage representation to a particular editor layout model.
-
-### `search`
-
-Removed because the SQLite FTS index accepted `blocks.Meta`, persisted Markdown
-block kind, and used product-specific fragment limits. A future search package
-should accept a format-neutral fragment interface and define explicit
-completeness and candidate-selection semantics.
-
-### `indexing`
-
-Removed because it hard-wired the Markdown scanner, block-index writer, and FTS
-writer into one build pipeline. A future orchestration layer should receive
-scanner and index-writer policies from its host.
-
-### `virtualization`
-
-Removed because its public API directly exposed block metadata, estimated pixel
-height, overscan policy, and render response limits. Those decisions belong in
-an editor or presentation adapter, not the document persistence core.
-
-## Next structural decisions
-
-1. Decide whether `document.Session` is the final public facade or whether a
-   smaller engine facade should hide recovery paths and generation management.
-2. Move quotas, temporary paths, sync intervals, and identity policy into
-   configuration.
-3. Add host-neutral cleanup ownership and explicit journal compatibility policy.
-4. Reintroduce structure, search, and presentation only through format-neutral
-   interfaces after their boundaries are designed.
+The v0.3.0 release suite was completed on native Windows and Debian under WSL 2
+on a native Linux temporary directory: every package reported 100% statement
+coverage, three shuffled race runs passed, and all three fuzz targets ran for
+at least 30 seconds on each platform.

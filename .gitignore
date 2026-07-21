@@ -20,7 +20,7 @@ profile.*
 
 # Docengine runtime artifacts
 .docengine-save-*.tmp
-*.docengine-journal
+*.docengine-journal-v2*
 undo.store
 
 # Local environment files

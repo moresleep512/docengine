@@ -26,6 +26,9 @@ func TestAtomicWritesPrefixContentModeAndCleansTemporaryFile(t *testing.T) {
 	if err != nil || string(content) != "BOM:content" {
 		t.Fatalf("content = %q, error = %v", content, err)
 	}
+	if err := SyncParent(path); err != nil {
+		t.Fatalf("SyncParent = %v", err)
+	}
 	assertNoSaveTemps(t, dir)
 }
 
@@ -88,6 +91,7 @@ func TestAtomicCheckedInjectedFailureBoundaries(t *testing.T) {
 		{name: "create", createErr: sentinel},
 		{name: "chmod", file: &fakeTemporaryFile{chmodErr: sentinel}},
 		{name: "prefix write", file: &fakeTemporaryFile{writeErr: sentinel, writeCount: 1}, wantTotal: 1},
+		{name: "prefix short write", file: &fakeTemporaryFile{shortWrite: true}, wantTotal: 1},
 		{name: "content write", file: &fakeTemporaryFile{}, writer: func(io.Writer) (int64, error) { return 2, sentinel }, wantTotal: 5},
 		{name: "sync", file: &fakeTemporaryFile{syncErr: sentinel}, wantTotal: 6},
 		{name: "close", file: &fakeTemporaryFile{closeErr: sentinel}, wantTotal: 6},
@@ -116,8 +120,12 @@ func TestAtomicCheckedInjectedFailureBoundaries(t *testing.T) {
 				}
 			}
 			total, err := atomicChecked("doc", 0o640, []byte("pre"), writer, test.check, operations)
-			if total != test.wantTotal || !errors.Is(err, sentinel) {
-				t.Fatalf("atomicChecked = (%d, %v), want (%d, injected)", total, err, test.wantTotal)
+			wantErr := sentinel
+			if test.file != nil && test.file.shortWrite {
+				wantErr = io.ErrShortWrite
+			}
+			if total != test.wantTotal || !errors.Is(err, wantErr) {
+				t.Fatalf("atomicChecked = (%d, %v), want (%d, %v)", total, err, test.wantTotal, wantErr)
 			}
 			if test.createErr == nil && removed != 1 {
 				t.Fatalf("remove calls = %d, want 1", removed)
@@ -143,11 +151,31 @@ func TestAtomicCheckedInjectedSuccessCommitsWithoutRemoval(t *testing.T) {
 	}
 }
 
+func TestAtomicCheckedDurabilityErrorIsCommitted(t *testing.T) {
+	file := &fakeTemporaryFile{}
+	removed := 0
+	sentinel := errors.New("sync directory")
+	operations := atomicOperations{
+		createTemp: func(string, string) (temporaryFile, error) { return file, nil },
+		remove:     func(string) error { removed++; return nil },
+		replace:    func(string, string) error { return &DurabilityError{Path: "doc", Err: sentinel} },
+	}
+	total, err := atomicChecked("doc", 0o600, nil, func(writer io.Writer) (int64, error) {
+		n, writeErr := writer.Write([]byte("ok"))
+		return int64(n), writeErr
+	}, nil, operations)
+	var durability *DurabilityError
+	if total != 2 || !errors.As(err, &durability) || !durability.Committed() || !errors.Is(err, sentinel) || removed != 0 {
+		t.Fatalf("result=(%d,%v) durability=%+v removed=%d", total, err, durability, removed)
+	}
+}
+
 type fakeTemporaryFile struct {
 	content    bytes.Buffer
 	chmodErr   error
 	writeErr   error
 	writeCount int
+	shortWrite bool
 	syncErr    error
 	closeErr   error
 	closeCalls int
@@ -160,6 +188,9 @@ func (f *fakeTemporaryFile) Close() error            { f.closeCalls++; return f.
 func (f *fakeTemporaryFile) Write(value []byte) (int, error) {
 	if f.writeErr != nil {
 		return f.writeCount, f.writeErr
+	}
+	if f.shortWrite {
+		return 1, nil
 	}
 	return f.content.Write(value)
 }

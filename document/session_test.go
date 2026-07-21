@@ -241,7 +241,7 @@ func TestApplyBatchIsOneRecoverableUndoUnit(t *testing.T) {
 	}
 }
 
-func TestOpenQuarantinesRecoveryLogAfterExternalFileChange(t *testing.T) {
+func TestOpenQuarantinesAndReportsRecoveryAfterExternalFileChange(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "external.md")
 	recoveryDir := filepath.Join(dir, "recovery")
@@ -261,6 +261,11 @@ func TestOpenQuarantinesRecoveryLogAfterExternalFileChange(t *testing.T) {
 	if err := os.WriteFile(path, []byte("external version"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	_, err = Open(path, OpenOptions{RecoveryDir: recoveryDir})
+	var recoveryErr *RecoveryOpenError
+	if !errors.As(err, &recoveryErr) || recoveryErr.QuarantinedPath == "" {
+		t.Fatalf("first reopen error = %v", err)
+	}
 	reopened, err := Open(path, OpenOptions{RecoveryDir: recoveryDir})
 	if err != nil {
 		t.Fatal(err)
@@ -270,9 +275,9 @@ func TestOpenQuarantinesRecoveryLogAfterExternalFileChange(t *testing.T) {
 	if string(text) != "external version" {
 		t.Fatalf("opened %q", text)
 	}
-	stale, _ := filepath.Glob(filepath.Join(recoveryDir, "*.stale-*"))
-	if len(stale) != 1 {
-		t.Fatalf("stale logs = %v", stale)
+	quarantined, _ := filepath.Glob(filepath.Join(recoveryDir, "*.quarantine-base-mismatch-*"))
+	if len(quarantined) != 1 {
+		t.Fatalf("quarantined logs = %v", quarantined)
 	}
 }
 

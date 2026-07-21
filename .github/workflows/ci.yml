@@ -67,3 +67,4 @@ jobs:
           cache: true
       - run: go test ./document/store -run=^$ -fuzz=FuzzTreeMatchesReference -fuzztime=10s
       - run: go test ./recovery -run=^$ -fuzz=FuzzJournalDecoders -fuzztime=10s
+      - run: go test ./recovery -run=^$ -fuzz=FuzzJournalStateMachine -fuzztime=10s

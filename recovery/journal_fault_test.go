@@ -40,7 +40,7 @@ func TestOpenJournalInjectedStatHeaderAndReplayFailures(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := journal.AppendReplace(1, 0, 0, []byte("x")); err != nil {
+		if _, err := journal.AppendBatch(1, 1, []ReplaceOperation{{Inserted: []byte("x")}}); err != nil {
 			t.Fatal(err)
 		}
 		if err := journal.Close(); err != nil {
@@ -58,7 +58,7 @@ func TestOpenJournalInjectedStatHeaderAndReplayFailures(t *testing.T) {
 	})
 }
 
-func TestAppendFrameInjectedHeaderAndPayloadWriteFailures(t *testing.T) {
+func TestAppendBatchInjectedHeaderAndPayloadWriteFailures(t *testing.T) {
 	sentinel := errors.New("injected")
 	tests := []struct {
 		name   string
@@ -66,7 +66,7 @@ func TestAppendFrameInjectedHeaderAndPayloadWriteFailures(t *testing.T) {
 		want   error
 	}{
 		{name: "header error", faults: map[int]faultIOResult{1: {err: sentinel}}, want: sentinel},
-		{name: "header short", faults: map[int]faultIOResult{1: {n: frameHeaderSize - 1}}, want: io.ErrShortWrite},
+		{name: "header short", faults: map[int]faultIOResult{1: {n: batchHeaderSize - 1}}, want: io.ErrShortWrite},
 		{name: "payload error", faults: map[int]faultIOResult{2: {err: sentinel}}, want: sentinel},
 		{name: "payload short", faults: map[int]faultIOResult{2: {n: 1}}, want: io.ErrShortWrite},
 	}
@@ -75,8 +75,9 @@ func TestAppendFrameInjectedHeaderAndPayloadWriteFailures(t *testing.T) {
 			file := createFaultBase(t)
 			fault := &faultJournalFile{base: file, writeFaults: test.faults}
 			journal := &Journal{file: fault, path: "journal"}
-			if _, err := journal.appendFrame(Frame{Kind: FrameReplace, Revision: 1}, []byte("payload")); !errors.Is(err, test.want) {
-				t.Fatalf("appendFrame error = %v, want %v", err, test.want)
+			batch := Batch{FirstRevision: 1, Group: 1, Operations: make([]Operation, 1)}
+			if _, _, err := journal.appendBatch(batch, []byte("payload")); !errors.Is(err, test.want) {
+				t.Fatalf("appendBatch error = %v, want %v", err, test.want)
 			}
 			info, err := file.Stat()
 			if err != nil {
@@ -95,7 +96,7 @@ func TestAppendFrameInjectedHeaderAndPayloadWriteFailures(t *testing.T) {
 func TestReplayInjectedHeaderPayloadAndBatchMetadataReadFailures(t *testing.T) {
 	sentinel := errors.New("injected")
 	t.Run("frame header", func(t *testing.T) {
-		path := writeReplayFixture(t, false)
+		path := writeReplayFixture(t)
 		journal := openFaultJournal(t, path, &faultJournalFile{readFaults: map[int]error{1: sentinel}})
 		defer journal.Close()
 		if _, err := journal.Replay(); !errors.Is(err, sentinel) {
@@ -103,15 +104,23 @@ func TestReplayInjectedHeaderPayloadAndBatchMetadataReadFailures(t *testing.T) {
 		}
 	})
 	t.Run("frame payload", func(t *testing.T) {
-		path := writeReplayFixture(t, false)
+		path := writeReplayFixture(t)
 		journal := openFaultJournal(t, path, &faultJournalFile{readFaults: map[int]error{2: sentinel}})
 		defer journal.Close()
 		if _, err := journal.Replay(); !errors.Is(err, sentinel) {
 			t.Fatalf("Replay error = %v", err)
 		}
 	})
+	t.Run("zero payload read", func(t *testing.T) {
+		path := writeReplayFixture(t)
+		journal := openFaultJournal(t, path, &faultJournalFile{zeroReadCalls: map[int]bool{2: true}})
+		defer journal.Close()
+		if _, err := journal.Replay(); !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("Replay error = %v", err)
+		}
+	})
 	t.Run("batch metadata", func(t *testing.T) {
-		path := writeReplayFixture(t, true)
+		path := writeReplayFixture(t)
 		journal := openFaultJournal(t, path, &faultJournalFile{readFaults: map[int]error{3: sentinel}})
 		defer journal.Close()
 		if _, err := journal.Replay(); !errors.Is(err, sentinel) {
@@ -139,24 +148,28 @@ type faultIOResult struct {
 }
 
 type faultJournalFile struct {
-	base        *os.File
-	statCalls   int
-	statFaults  map[int]error
-	readCalls   int
-	readFaults  map[int]error
-	writeCalls  int
-	writeFaults map[int]faultIOResult
-	writeAtErr  error
-	seekErr     error
-	truncateErr error
-	syncErr     error
-	closeCalls  int
+	base          *os.File
+	statCalls     int
+	statFaults    map[int]error
+	readCalls     int
+	readFaults    map[int]error
+	zeroReadCalls map[int]bool
+	writeCalls    int
+	writeFaults   map[int]faultIOResult
+	writeAtErr    error
+	seekErr       error
+	truncateErr   error
+	syncErr       error
+	closeCalls    int
 }
 
 func (f *faultJournalFile) ReadAt(buffer []byte, offset int64) (int, error) {
 	f.readCalls++
 	if err := f.readFaults[f.readCalls]; err != nil {
 		return 0, err
+	}
+	if f.zeroReadCalls[f.readCalls] {
+		return 0, nil
 	}
 	return f.base.ReadAt(buffer, offset)
 }
@@ -226,18 +239,14 @@ func createFaultBase(t testing.TB) *os.File {
 	return file
 }
 
-func writeReplayFixture(t testing.TB, batch bool) string {
+func writeReplayFixture(t testing.TB) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "journal")
 	journal, _, err := Open(path, Fingerprint{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if batch {
-		_, err = journal.AppendReplaceBatch(1, 1, []ReplaceOperation{{Inserted: []byte("x")}})
-	} else {
-		_, err = journal.AppendReplace(1, 0, 0, []byte("x"))
-	}
+	_, err = journal.AppendBatch(1, 1, []ReplaceOperation{{Inserted: []byte("x")}})
 	if err != nil {
 		t.Fatal(err)
 	}
