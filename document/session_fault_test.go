@@ -16,6 +16,26 @@ import (
 
 func TestOpenSessionInjectedStatTreeAndRepairFailures(t *testing.T) {
 	sentinel := errors.New("injected")
+	t.Run("non-regular base is rejected and closed", func(t *testing.T) {
+		reader, writer, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = reader.Close()
+			_ = writer.Close()
+		})
+
+		operations := systemSessionOperations
+		operations.openBase = func(string) (*os.File, error) { return reader, nil }
+		if _, err := openSession("ignored", OpenOptions{}, operations); err == nil || err.Error() != "document: path is not a regular file" {
+			t.Fatalf("openSession error = %v", err)
+		}
+		if _, err := reader.Stat(); err == nil {
+			t.Fatal("non-regular base was not closed")
+		}
+	})
+
 	t.Run("base stat", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "doc")
