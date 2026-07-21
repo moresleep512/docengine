@@ -4,12 +4,15 @@ package store
 import (
 	"errors"
 	"io"
+	"math"
 	"sync"
 )
 
 var (
-	ErrInvalidRange  = errors.New("store: invalid range")
-	ErrUnknownSource = errors.New("store: unknown source")
+	ErrInvalidRange   = errors.New("store: invalid range")
+	ErrInvalidPiece   = errors.New("store: invalid piece")
+	ErrLengthOverflow = errors.New("store: document length overflow")
+	ErrUnknownSource  = errors.New("store: unknown source")
 )
 
 type SourceID uint8
@@ -49,25 +52,36 @@ type Tree struct {
 	rng     uint64
 }
 
-func New(base io.ReaderAt, length int64) *Tree {
+func New(base io.ReaderAt, length int64) (*Tree, error) {
 	return NewWithBasePiece(base, Piece{Source: SourceBase, Length: length})
 }
 
-func NewWithBasePiece(base io.ReaderAt, piece Piece) *Tree {
+func NewWithBasePiece(base io.ReaderAt, piece Piece) (*Tree, error) {
 	t := &Tree{
 		sources: map[SourceID]io.ReaderAt{SourceBase: base},
 		rng:     0x9e3779b97f4a7c15,
 	}
+	piece.Source = SourceBase
+	piece = normalizePiece(piece)
+	if err := validatePiece(piece); err != nil {
+		return nil, err
+	}
+	if piece.Length > 0 && base == nil {
+		return nil, ErrUnknownSource
+	}
 	if piece.Length > 0 {
-		piece.Source = SourceBase
 		t.root = t.makeNode(piece, nil, nil)
 	}
-	return t
+	return t, nil
 }
 
 func (t *Tree) SetSource(id SourceID, source io.ReaderAt) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if source == nil {
+		delete(t.sources, id)
+		return
+	}
 	t.sources[id] = source
 }
 
@@ -102,6 +116,7 @@ func (t *Tree) Restore(snapshot Snapshot) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.root = snapshot.root
+	t.sources = cloneSources(snapshot.sources)
 }
 
 // ReplacePiece replaces a logical byte range and returns immutable snapshots
@@ -113,10 +128,21 @@ func (t *Tree) ReplacePiece(start, deleteLength int64, replacement Piece) (Snaps
 	if start < 0 || deleteLength < 0 || start > length || deleteLength > length-start {
 		return Snapshot{}, Snapshot{}, ErrInvalidRange
 	}
-	if replacement.Length < 0 || (replacement.Length > 0 && t.sources[replacement.Source] == nil) {
+	replacement = normalizePiece(replacement)
+	if err := validatePiece(replacement); err != nil {
+		return Snapshot{}, Snapshot{}, err
+	}
+	if replacement.Length > 0 && t.sources[replacement.Source] == nil {
 		return Snapshot{}, Snapshot{}, ErrUnknownSource
 	}
+	remaining := length - deleteLength
+	if replacement.Length > math.MaxInt64-remaining {
+		return Snapshot{}, Snapshot{}, ErrLengthOverflow
+	}
 	before := Snapshot{root: t.root, sources: cloneSources(t.sources)}
+	if deleteLength == 0 && replacement.Length == 0 {
+		return before, before, nil
+	}
 	left, tail := t.split(t.root, start)
 	_, right := t.split(tail, deleteLength)
 	var middle *node
@@ -126,6 +152,26 @@ func (t *Tree) ReplacePiece(start, deleteLength int64, replacement Piece) (Snaps
 	t.root = merge(merge(left, middle), right)
 	after := Snapshot{root: t.root, sources: cloneSources(t.sources)}
 	return before, after, nil
+}
+
+func validatePiece(piece Piece) error {
+	if piece.Length == 0 {
+		return nil
+	}
+	if piece.Length < 0 || piece.Offset < 0 || piece.Offset > math.MaxInt64-piece.Length {
+		return ErrInvalidPiece
+	}
+	if piece.NewlinesKnown && (piece.Newlines < 0 || piece.Newlines > piece.Length) {
+		return ErrInvalidPiece
+	}
+	return nil
+}
+
+func normalizePiece(piece Piece) Piece {
+	if !piece.NewlinesKnown {
+		piece.Newlines = 0
+	}
+	return piece
 }
 
 func (t *Tree) ReadAt(p []byte, off int64) (int, error) {
@@ -204,8 +250,11 @@ func (t *Tree) split(current *node, pos int64) (*node, *node) {
 	rightPiece.Length = rightLength
 	rightPiece.NewlinesKnown = false
 	rightPiece.Newlines = 0
-	leftNode := t.makeNode(leftPiece, nil, nil)
-	rightNode := t.makeNode(rightPiece, nil, nil)
+	// Both fragments replace current in the treap and therefore inherit its
+	// priority. Generating fresh priorities here can make a fragment outrank an
+	// ancestor while split unwinds, violating the treap heap invariant.
+	leftNode := recalc(&node{piece: leftPiece, priority: current.priority})
+	rightNode := recalc(&node{piece: rightPiece, priority: current.priority})
 	return merge(current.left, leftNode), merge(rightNode, current.right)
 }
 

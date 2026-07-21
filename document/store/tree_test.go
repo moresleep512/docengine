@@ -10,7 +10,10 @@ import (
 func TestTreeReplaceReadAndRestore(t *testing.T) {
 	base := bytes.NewReader([]byte("hello world"))
 	journal := bytes.NewReader([]byte("engine"))
-	tree := New(base, 11)
+	tree, err := New(base, 11)
+	if err != nil {
+		t.Fatal(err)
+	}
 	tree.SetSource(SourceJournal, journal)
 	before, after, err := tree.ReplacePiece(6, 5, Piece{Source: SourceJournal, Length: 6})
 	if err != nil {
@@ -24,7 +27,10 @@ func TestTreeReplaceReadAndRestore(t *testing.T) {
 func TestTreeRandomReplacementsMatchReference(t *testing.T) {
 	baseBytes := []byte("0123456789abcdefghijklmnopqrstuvwxyz")
 	addBytes := make([]byte, 0, 32_000)
-	tree := New(bytes.NewReader(baseBytes), int64(len(baseBytes)))
+	tree, err := New(bytes.NewReader(baseBytes), int64(len(baseBytes)))
+	if err != nil {
+		t.Fatal(err)
+	}
 	reference := append([]byte(nil), baseBytes...)
 	rng := rand.New(rand.NewPCG(1, 2))
 
@@ -56,6 +62,7 @@ func TestTreeRandomReplacementsMatchReference(t *testing.T) {
 		next = append(next, reference[start+deleteLength:]...)
 		reference = next
 		assertSnapshotBytes(t, tree.Snapshot(), reference)
+		assertTreeInvariants(t, tree)
 	}
 }
 

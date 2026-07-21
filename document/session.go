@@ -19,9 +19,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"docengine/document/save"
-	"docengine/document/store"
-	"docengine/recovery"
+	"github.com/moresleep512/docengine/document/save"
+	"github.com/moresleep512/docengine/document/store"
+	"github.com/moresleep512/docengine/recovery"
 )
 
 var (
@@ -170,7 +170,15 @@ func Open(path string, options OpenOptions) (*Session, error) {
 		_ = base.Close()
 		return nil, err
 	}
-	tree := store.NewWithBasePiece(base, store.Piece{Source: store.SourceBase, Offset: baseOffset, Length: info.Size() - baseOffset})
+	tree, err := store.NewWithBasePiece(base, store.Piece{Source: store.SourceBase, Offset: baseOffset, Length: info.Size() - baseOffset})
+	if err != nil {
+		if journal != nil {
+			_ = journal.Close()
+		}
+		_ = undo.close()
+		_ = base.Close()
+		return nil, err
+	}
 	if journal != nil {
 		tree.SetSource(store.SourceJournal, journal)
 	}
@@ -524,7 +532,11 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (Metadata, error) {
 	if err != nil {
 		return Metadata{}, err
 	}
-	newTree := store.NewWithBasePiece(newBase, store.Piece{Source: store.SourceBase, Offset: boolOffset(s.hasBOM, 3), Length: info.Size() - boolOffset(s.hasBOM, 3)})
+	newTree, err := store.NewWithBasePiece(newBase, store.Piece{Source: store.SourceBase, Offset: boolOffset(s.hasBOM, 3), Length: info.Size() - boolOffset(s.hasBOM, 3)})
+	if err != nil {
+		_ = newBase.Close()
+		return Metadata{}, err
+	}
 	newGeneration := newSourceGeneration(newBase, nil)
 	remaining := make([]pendingOperation, 0)
 	if s.revision > targetRevision {

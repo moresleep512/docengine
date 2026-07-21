@@ -5,9 +5,10 @@ Markdown structure pipeline, SQLite search pipeline, index publication
 orchestration, and editor-layout virtualization code were removed because their
 public contracts encoded TypeMD-specific document and UI policy.
 
-The source tree is intentionally not a complete standalone Go module yet. Its
-internal imports assume a future module path named `docengine`, but no `go.mod`
-is present.
+The source tree is an independent Go 1.26 module named
+`github.com/moresleep512/docengine`. CI runs formatting, vet, tests, the race
+detector, and a short Piece Tree fuzz smoke test on Linux; the regular test job
+also runs on Windows.
 
 ## Dependency direction
 
@@ -49,6 +50,16 @@ Nodes on changed paths are cloned, so earlier roots remain readable. Average
 edit and coordinate traversal cost is proportional to tree height rather than
 document byte length.
 
+Constructors and replacements reject negative or overflowing source ranges,
+invalid newline metadata, missing sources, and logical document-length
+overflow before publishing a new root. A no-op replacement preserves the
+existing root rather than fragmenting a Piece. Restoring a snapshot restores
+both its root and its captured source bindings.
+
+When a Piece is split, both fragments inherit the original node priority. Fresh
+random priorities would be able to outrank an ancestor while recursive `split`
+unwinds and silently violate the Treap heap invariant.
+
 ### Concurrency and lifetime
 
 `Tree` protects its mutable root and source map with an RW mutex. A `Snapshot`
@@ -63,6 +74,15 @@ referenced source open while the snapshot is in use.
   offsets and lengths supplied by callers.
 - Source IDs are a small fixed integer namespace rather than a general source
   registry contract.
+
+### Verification
+
+Tests compare edits against a byte-slice reference model, inspect every cached
+subtree invariant, retain old snapshots across later edits, exercise source
+replacement and removal, cover invalid ranges and integer overflow, perform
+10,000 sequential inserts, and read concurrently with edits. The package has
+100% statement coverage. A Go fuzz target continuously generates edit programs
+and compares reads, writes, snapshots, and invariants with the reference model.
 
 ## `recovery`
 
@@ -260,12 +280,11 @@ an editor or presentation adapter, not the document persistence core.
 
 ## Next structural decisions
 
-1. Choose and declare the real Go module path.
-2. Decide whether `document.Session` is the final public facade or whether a
+1. Decide whether `document.Session` is the final public facade or whether a
    smaller engine facade should hide recovery paths and generation management.
-3. Make batch application atomic before treating it as a transaction API.
-4. Move quotas, temporary paths, sync intervals, and identity policy into
+2. Make batch application atomic before treating it as a transaction API.
+3. Move quotas, temporary paths, sync intervals, and identity policy into
    configuration.
-5. Add host-neutral cleanup ownership and explicit journal compatibility policy.
-6. Reintroduce structure, search, and presentation only through format-neutral
+4. Add host-neutral cleanup ownership and explicit journal compatibility policy.
+5. Reintroduce structure, search, and presentation only through format-neutral
    interfaces after their boundaries are designed.

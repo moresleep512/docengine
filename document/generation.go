@@ -6,8 +6,8 @@ import (
 	"os"
 	"sync"
 
-	"docengine/document/store"
-	"docengine/recovery"
+	"github.com/moresleep512/docengine/document/store"
+	"github.com/moresleep512/docengine/recovery"
 )
 
 // SnapshotLease keeps every source used by a snapshot alive until Close.
