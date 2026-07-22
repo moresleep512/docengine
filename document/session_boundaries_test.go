@@ -417,6 +417,29 @@ func TestReplayV2BatchBoundariesAndFailures(t *testing.T) {
 			t.Fatalf("replay error = %v", err)
 		}
 	})
+	t.Run("invalid inserted UTF-8", func(t *testing.T) {
+		session, _, _ := openAtomicTestSession(t, "abc")
+		defer session.Close()
+		if err := session.ensureJournalLocked(); err != nil {
+			t.Fatal(err)
+		}
+		result, err := session.journal.AppendBatch(1, 1, []recovery.ReplaceOperation{{Inserted: []byte{0xff}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = session.replay(singleReplayOperation(recovery.Operation{InsertLength: 1, PayloadOffset: result.PayloadOffsets[0]}))
+		if !errors.Is(err, ErrInvalidUTF8) {
+			t.Fatalf("replay error = %v", err)
+		}
+	})
+	t.Run("non-boundary edit", func(t *testing.T) {
+		session, _, _ := openAtomicTestSession(t, "é")
+		defer session.Close()
+		err := session.replay(singleReplayOperation(recovery.Operation{Start: 1}))
+		if !errors.Is(err, ErrInvalidUTF8Boundary) {
+			t.Fatalf("replay error = %v", err)
+		}
+	})
 }
 
 func singleReplayOperation(operation recovery.Operation) recovery.ReplayResult {
@@ -518,6 +541,9 @@ func TestReadTreeRangeAndEOLBoundaries(t *testing.T) {
 	tree.SetSource(store.SourceBase, failingReaderAt{})
 	if _, err := readTreeRange(tree, 0, 1); err == nil {
 		t.Fatal("expected tree source-read error")
+	}
+	if err := validateUTF8ReplacementBoundaries(tree, 1, 0); err == nil {
+		t.Fatal("expected boundary source-read error")
 	}
 	if got := detectEOL([]byte("a\r\nb\nc")); got != EOLMixed {
 		t.Fatalf("mixed EOL = %q", got)

@@ -19,20 +19,23 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/moresleep512/docengine/document/coordinate"
 	"github.com/moresleep512/docengine/document/save"
 	"github.com/moresleep512/docengine/document/store"
 	"github.com/moresleep512/docengine/recovery"
 )
 
 var (
-	ErrRevisionConflict = errors.New("document: revision conflict")
-	ErrInvalidUTF8      = errors.New("document: file is not UTF-8")
-	ErrClosed           = errors.New("document: session closed")
-	ErrNothingToUndo    = errors.New("document: nothing to undo")
-	ErrNothingToRedo    = errors.New("document: nothing to redo")
-	ErrExternalChange   = errors.New("document: file changed on disk")
-	ErrRevisionOverflow = errors.New("document: revision overflow")
-	ErrFaulted          = errors.New("document: session is faulted and read-only")
+	ErrRevisionConflict    = errors.New("document: revision conflict")
+	ErrInvalidUTF8         = errors.New("document: file is not UTF-8")
+	ErrInvalidUTF8Boundary = errors.New("document: edit is not aligned to UTF-8 boundaries")
+	ErrInvalidContext      = errors.New("document: nil context")
+	ErrClosed              = errors.New("document: session closed")
+	ErrNothingToUndo       = errors.New("document: nothing to undo")
+	ErrNothingToRedo       = errors.New("document: nothing to redo")
+	ErrExternalChange      = errors.New("document: file changed on disk")
+	ErrRevisionOverflow    = errors.New("document: revision overflow")
+	ErrFaulted             = errors.New("document: session is faulted and read-only")
 )
 
 const scanBufferSize = 256 << 10
@@ -44,11 +47,6 @@ const (
 	EOLCRLF  EOLStyle = "crlf"
 	EOLMixed EOLStyle = "mixed"
 )
-
-type OpenOptions struct {
-	RecoveryDir string
-	SessionDir  string
-}
 
 type Metadata struct {
 	Path                string
@@ -88,6 +86,7 @@ type ApplyResult struct {
 	Revision   uint64
 	ByteLength int64
 	Dirty      bool
+	Changes    coordinate.ChangeMap
 }
 
 type historyOperation struct {
@@ -174,6 +173,7 @@ type Session struct {
 	eol                 EOLStyle
 	recoveryDir         string
 	sessionDir          string
+	config              SessionConfig
 	fingerprint         recovery.Fingerprint
 	diskIdentity        fileIdentity
 	durabilityUncertain bool
@@ -183,6 +183,9 @@ type Session struct {
 	stopSync            chan struct{}
 	syncDone            chan struct{}
 	operations          sessionOperations
+	events              *eventHub
+	closeDone           chan struct{}
+	closeErr            error
 }
 
 func Open(path string, options OpenOptions) (*Session, error) {
@@ -198,7 +201,14 @@ func openSession(path string, options OpenOptions, operations sessionOperations)
 }
 
 func openSessionContext(ctx context.Context, path string, options OpenOptions, operations sessionOperations) (*Session, error) {
+	if ctx == nil {
+		return nil, ErrInvalidContext
+	}
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	config, err := resolveOpenOptions(options)
+	if err != nil {
 		return nil, err
 	}
 	absolute, err := operations.absolutePath(path)
@@ -231,56 +241,51 @@ func openSessionContext(ctx context.Context, path string, options OpenOptions, o
 		_ = base.Close()
 		return nil, fmt.Errorf("document: scan base: %w", err)
 	}
-	if options.RecoveryDir == "" {
-		options.RecoveryDir = filepath.Join(os.TempDir(), "docengine", "recovery")
-	}
-	if options.SessionDir == "" {
-		options.SessionDir = filepath.Join(os.TempDir(), "docengine", "sessions", randomSuffix())
-	}
-	undo, err := openUndoStore(options.SessionDir)
+	undo, err := openUndoStore(config.SessionDir, config.Limits.UndoBytes)
 	if err != nil {
 		_ = base.Close()
-		return nil, err
+		return nil, errors.Join(err, cleanupOwnedDirectories(config, false))
 	}
 	fingerprint := recovery.FingerprintFor(resolved, scan.size, scan.contentHash)
-	journal, replay, err := openMatchingJournalWith(options.RecoveryDir, fingerprint, operations.openRecovery)
+	journal, replay, err := openMatchingJournalWith(config.RecoveryDir, fingerprint, operations.openRecovery)
 	if err != nil {
-		_ = undo.close()
-		_ = base.Close()
-		return nil, err
+		return nil, errors.Join(err, undo.close(), base.Close(), cleanupOwnedDirectories(config, true))
 	}
 	tree, err := operations.newTree(base, store.Piece{Source: store.SourceBase, Offset: scan.baseOffset, Length: scan.size - scan.baseOffset, Newlines: scan.newlines, NewlinesKnown: true})
 	if err != nil {
+		var closeErr error
 		if journal != nil {
-			_ = journal.Close()
+			closeErr = journal.Close()
 		}
-		_ = undo.close()
-		_ = base.Close()
-		return nil, err
+		return nil, errors.Join(err, closeErr, undo.close(), base.Close(), cleanupOwnedDirectories(config, true))
 	}
 	if journal != nil {
 		tree.SetSource(store.SourceJournal, journal)
 	}
 	generation := newSourceGeneration(base, journal)
+	if config.RecoveryDirOwnership == DirectoryOwned {
+		generation.setJournalCleanupDirectory(config.RecoveryDir)
+	}
 	session := &Session{
 		path: absolute, resolvedPath: resolved, mode: info.Mode(), base: base, journal: journal, generation: generation, tree: tree,
-		undoStore: undo, hasBOM: scan.hasBOM, eol: scan.eol, recoveryDir: options.RecoveryDir,
-		sessionDir: options.SessionDir, fingerprint: fingerprint, diskIdentity: identityFor(info, scan.contentHash),
+		undoStore: undo, hasBOM: scan.hasBOM, eol: scan.eol, recoveryDir: config.RecoveryDir,
+		sessionDir: config.SessionDir, config: config, fingerprint: fingerprint, diskIdentity: identityFor(info, scan.contentHash),
 		stopSync: make(chan struct{}), syncDone: make(chan struct{}), operations: operations,
+		events: newEventHub(config.Limits.EventHistory), closeDone: make(chan struct{}),
 	}
 	if journal != nil {
 		if err := session.replay(replay); err != nil {
-			generation.retireAndWait(false)
-			_ = undo.close()
-			return nil, err
+			return nil, errors.Join(err, generation.retireAndWait(false), undo.close(), cleanupOwnedDirectories(config, true))
 		}
 		if replay.Truncated {
 			if err := journal.RepairTail(replay.ValidBytes); err != nil {
-				generation.retireAndWait(false)
-				_ = undo.close()
-				return nil, err
+				return nil, errors.Join(err, generation.retireAndWait(false), undo.close(), cleanupOwnedDirectories(config, true))
 			}
 		}
+	}
+	session.publishEventLocked(EventOpened, ChangeOriginNone, coordinate.ChangeMap{}, nil)
+	if session.recovered {
+		session.publishEventLocked(EventRecovered, ChangeOriginNone, coordinate.ChangeMap{}, nil)
 	}
 	go session.syncLoop()
 	return session, nil
@@ -359,6 +364,9 @@ func (s *Session) replay(result recovery.ReplayResult) error {
 			if err != nil {
 				return err
 			}
+			if err := validateUTF8ReplacementBoundaries(s.tree, operation.Start, operation.DeleteLength); err != nil {
+				return fmt.Errorf("replay revision %d: %w", revision, err)
+			}
 			inserted := make([]byte, operation.InsertLength)
 			if operation.InsertLength > 0 {
 				n, readErr := s.operations.readRecovery(s.journal, inserted, operation.PayloadOffset)
@@ -368,6 +376,9 @@ func (s *Session) replay(result recovery.ReplayResult) error {
 				if n != len(inserted) {
 					return io.ErrUnexpectedEOF
 				}
+			}
+			if !utf8.Valid(inserted) {
+				return fmt.Errorf("replay revision %d: %w", revision, ErrInvalidUTF8)
 			}
 			forwardRef, err := s.historyText(inserted)
 			if err != nil {
@@ -404,6 +415,32 @@ func (s *Session) Metadata() Metadata {
 	return s.metadataLocked()
 }
 
+// Config returns the immutable, fully resolved resource and directory policy
+// used by this Session. It remains available after Close.
+func (s *Session) Config() SessionConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.config
+}
+
+// Subscribe creates a nonblocking, ordered Session event stream. Historical
+// replay and live publication are joined atomically with respect to Session
+// transitions.
+func (s *Session) Subscribe(options SubscribeOptions) (*Subscription, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
+	return s.events.subscribe(options)
+}
+
+func (s *Session) publishEventLocked(kind EventKind, origin ChangeOrigin, changes coordinate.ChangeMap, cause error) {
+	s.events.publish(SessionEvent{
+		Kind: kind, Origin: origin, Metadata: s.metadataLocked(), Changes: changes, Cause: cause,
+	})
+}
+
 func (s *Session) metadataLocked() Metadata {
 	return Metadata{Path: s.path, ResolvedPath: s.resolvedPath, Name: filepath.Base(s.path), ByteLength: s.tree.Len(), Revision: s.revision, CommittedRevision: s.committedRevision, Dirty: s.dirty, Recovered: s.recovered, HasBOM: s.hasBOM, EOL: s.eol, DurabilityUncertain: s.durabilityUncertain, PersistenceFaulted: s.fault != nil}
 }
@@ -434,7 +471,41 @@ func (s *Session) Snapshot() (uint64, SnapshotLease, error) {
 	return s.revision, s.generation.acquire(s.tree.Snapshot()), nil
 }
 
+// CoordinateIndex builds a bounded-query UTF-8 coordinate index for one
+// immutable Session revision. The returned Index owns its Snapshot lease and
+// must be closed by the caller.
+func (s *Session) CoordinateIndex(ctx context.Context, options coordinate.Options) (*coordinate.Index, error) {
+	revision, snapshot, err := s.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	return coordinate.BuildOwned(ctx, snapshot, revision, options)
+}
+
+// RebuildCoordinateIndex derives the current revision's index from a previous
+// Session index and the exact ChangeMap chain between them. The new index keeps
+// its own Snapshot lease; the previous index remains independently usable.
+func (s *Session) RebuildCoordinateIndex(ctx context.Context, previous *coordinate.Index, changes coordinate.ChangeMap) (*coordinate.Index, error) {
+	if ctx == nil {
+		return nil, coordinate.ErrInvalidContext
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	revision, snapshot, err := s.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	if revision != changes.AfterRevision() {
+		return nil, errors.Join(coordinate.ErrRevisionMismatch, snapshot.Close())
+	}
+	return coordinate.RebuildOwned(ctx, snapshot, previous, changes)
+}
+
 func (s *Session) ApplyBatch(ctx context.Context, expectedRevision uint64, operations []ReplaceOperation) (ApplyResult, error) {
+	if ctx == nil {
+		return ApplyResult{}, ErrInvalidContext
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -447,32 +518,44 @@ func (s *Session) ApplyBatch(ctx context.Context, expectedRevision uint64, opera
 		return ApplyResult{}, ErrRevisionConflict
 	}
 	if len(operations) == 0 {
-		return ApplyResult{Revision: s.revision, ByteLength: s.tree.Len(), Dirty: s.dirty}, nil
+		changes, _ := coordinate.Identity(s.revision, s.tree.Len()) // Session lengths are always nonnegative.
+		return ApplyResult{Revision: s.revision, ByteLength: s.tree.Len(), Dirty: s.dirty, Changes: changes}, nil
 	}
-	if len(operations) > 256 {
-		return ApplyResult{}, errors.New("document: transaction batch too large")
+	if len(operations) > s.config.Limits.MaxBatchOperations {
+		return ApplyResult{}, fmt.Errorf("%w: transaction has %d operations, maximum is %d", ErrLimitExceeded, len(operations), s.config.Limits.MaxBatchOperations)
 	}
-	if err := s.applyOperationsLocked(ctx, operations, true); err != nil {
+	changes, err := s.applyOperationsLocked(ctx, operations, true)
+	if err != nil {
 		return ApplyResult{}, err
 	}
-	return ApplyResult{Revision: s.revision, ByteLength: s.tree.Len(), Dirty: s.dirty}, nil
+	s.publishEventLocked(EventChanged, ChangeOriginApply, changes, nil)
+	return ApplyResult{Revision: s.revision, ByteLength: s.tree.Len(), Dirty: s.dirty, Changes: changes}, nil
 }
 
-func (s *Session) applyOperationsLocked(ctx context.Context, operations []ReplaceOperation, recordHistory bool) error {
+func (s *Session) applyOperationsLocked(ctx context.Context, operations []ReplaceOperation, recordHistory bool) (coordinate.ChangeMap, error) {
 	if s.revision > math.MaxUint64-uint64(len(operations)) {
-		return ErrRevisionOverflow
+		return coordinate.ChangeMap{}, ErrRevisionOverflow
 	}
+	beforeRevision, beforeLength := s.revision, s.tree.Len()
 	group := s.revision + 1
 	epoch := s.undoEpoch
 	staged, err := s.stageOperationsLocked(ctx, operations)
 	if err != nil {
-		return err
+		return coordinate.ChangeMap{}, err
 	}
+	edits := make([]coordinate.Edit, len(staged))
+	for index, operation := range staged {
+		edits[index] = coordinate.Edit{
+			Start: operation.operation.Start, OldLength: operation.operation.DeleteLength, NewLength: int64(len(operation.inserted)),
+		}
+	}
+	// Staging has already proved every range and intermediate length valid.
+	changes, _ := coordinate.NewChangeMap(beforeRevision, beforeRevision+uint64(len(staged)), beforeLength, edits)
 	if err := ctx.Err(); err != nil {
-		return err
+		return coordinate.ChangeMap{}, err
 	}
 	if err := s.ensureJournalLocked(); err != nil {
-		return err
+		return coordinate.ChangeMap{}, err
 	}
 	recoveryOperations := make([]recovery.ReplaceOperation, len(staged))
 	for index, operation := range staged {
@@ -482,12 +565,12 @@ func (s *Session) applyOperationsLocked(ctx context.Context, operations []Replac
 	}
 	appendResult, err := s.journal.AppendBatch(s.revision+1, group, recoveryOperations)
 	if err != nil {
-		return err
+		return coordinate.ChangeMap{}, err
 	}
 	finalTree, err := s.operations.cloneTree(s.tree)
 	if err != nil {
 		_ = s.journal.RepairTail(appendResult.BatchOffset)
-		return err
+		return coordinate.ChangeMap{}, err
 	}
 	for index, operation := range staged {
 		piece := store.Piece{}
@@ -499,7 +582,7 @@ func (s *Session) applyOperationsLocked(ctx context.Context, operations []Replac
 		}
 		if _, _, replaceErr := finalTree.ReplacePiece(operation.operation.Start, operation.operation.DeleteLength, piece); replaceErr != nil {
 			repairErr := s.journal.RepairTail(appendResult.BatchOffset)
-			return errors.Join(replaceErr, repairErr)
+			return coordinate.ChangeMap{}, errors.Join(replaceErr, repairErr)
 		}
 	}
 
@@ -508,11 +591,11 @@ func (s *Session) applyOperationsLocked(ctx context.Context, operations []Replac
 		for _, operation := range staged {
 			forwardRef, historyErr := s.historyText(operation.inserted)
 			if historyErr != nil {
-				return errors.Join(historyErr, s.journal.RepairTail(appendResult.BatchOffset))
+				return coordinate.ChangeMap{}, errors.Join(historyErr, s.journal.RepairTail(appendResult.BatchOffset))
 			}
 			inverseRef, historyErr := s.historyText(operation.deleted)
 			if historyErr != nil {
-				return errors.Join(historyErr, s.journal.RepairTail(appendResult.BatchOffset))
+				return coordinate.ChangeMap{}, errors.Join(historyErr, s.journal.RepairTail(appendResult.BatchOffset))
 			}
 			entry.forward = append(entry.forward, historyOperation{
 				start: operation.operation.Start, deleteLength: operation.operation.DeleteLength, insert: forwardRef,
@@ -538,7 +621,7 @@ func (s *Session) applyOperationsLocked(ctx context.Context, operations []Replac
 		s.undo = append(s.undo, entry)
 		s.redo = nil
 	}
-	return nil
+	return changes, nil
 }
 
 func (s *Session) stageOperationsLocked(ctx context.Context, operations []ReplaceOperation) ([]stagedOperation, error) {
@@ -552,12 +635,18 @@ func (s *Session) stageOperationsLocked(ctx context.Context, operations []Replac
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if !utf8.ValidString(op.Insert) || len(op.Insert) > 1<<20 {
-			return nil, errors.New("document: invalid or oversized insertion")
+		if !utf8.ValidString(op.Insert) {
+			return nil, ErrInvalidUTF8
+		}
+		if int64(len(op.Insert)) > s.config.Limits.MaxInsertBytes {
+			return nil, fmt.Errorf("%w: insertion has %d bytes, maximum is %d", ErrLimitExceeded, len(op.Insert), s.config.Limits.MaxInsertBytes)
 		}
 		length := stagedTree.Len()
 		if op.Start < 0 || op.DeleteLength < 0 || op.Start > length || op.DeleteLength > length-op.Start {
 			return nil, store.ErrInvalidRange
+		}
+		if err := validateUTF8ReplacementBoundaries(stagedTree, op.Start, op.DeleteLength); err != nil {
+			return nil, err
 		}
 		deleted, err := readTreeRange(stagedTree, op.Start, op.DeleteLength)
 		if err != nil {
@@ -605,12 +694,14 @@ func (s *Session) Undo() (ApplyResult, error) {
 	if err != nil {
 		return ApplyResult{}, err
 	}
-	if err := s.applyOperationsLocked(context.Background(), operations, false); err != nil {
+	changes, err := s.applyOperationsLocked(context.Background(), operations, false)
+	if err != nil {
 		return ApplyResult{}, err
 	}
 	s.undo = s.undo[:len(s.undo)-1]
 	s.redo = append(s.redo, entry)
-	return ApplyResult{Revision: s.revision, ByteLength: s.tree.Len(), Dirty: true}, nil
+	s.publishEventLocked(EventChanged, ChangeOriginUndo, changes, nil)
+	return ApplyResult{Revision: s.revision, ByteLength: s.tree.Len(), Dirty: true, Changes: changes}, nil
 }
 
 func (s *Session) Redo() (ApplyResult, error) {
@@ -630,12 +721,14 @@ func (s *Session) Redo() (ApplyResult, error) {
 	if err != nil {
 		return ApplyResult{}, err
 	}
-	if err := s.applyOperationsLocked(context.Background(), operations, false); err != nil {
+	changes, err := s.applyOperationsLocked(context.Background(), operations, false)
+	if err != nil {
 		return ApplyResult{}, err
 	}
 	s.redo = s.redo[:len(s.redo)-1]
 	s.undo = append(s.undo, entry)
-	return ApplyResult{Revision: s.revision, ByteLength: s.tree.Len(), Dirty: true}, nil
+	s.publishEventLocked(EventChanged, ChangeOriginRedo, changes, nil)
+	return ApplyResult{Revision: s.revision, ByteLength: s.tree.Len(), Dirty: true, Changes: changes}, nil
 }
 
 func (s *Session) materializeHistory(source []historyOperation) ([]ReplaceOperation, error) {
@@ -811,6 +904,9 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (Metadata, error) {
 		return commitFailure(err)
 	}
 	newGeneration := newSourceGeneration(newBase, nil)
+	if s.config.RecoveryDirOwnership == DirectoryOwned {
+		newGeneration.setJournalCleanupDirectory(s.recoveryDir)
+	}
 	remaining := make([]pendingOperation, 0)
 	if s.revision > targetRevision {
 		journalPath := filepath.Join(s.recoveryDir, journalPrefix(newFingerprint)+"."+randomSuffix()+".docengine-journal-v2")
@@ -897,8 +993,13 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (Metadata, error) {
 func (s *Session) Close() error {
 	s.mu.Lock()
 	if s.closed {
+		done := s.closeDone
 		s.mu.Unlock()
-		return nil
+		<-done
+		s.mu.RLock()
+		err := s.closeErr
+		s.mu.RUnlock()
+		return err
 	}
 	s.closed = true
 	close(s.stopSync)
@@ -911,12 +1012,22 @@ func (s *Session) Close() error {
 	}
 	s.mu.Unlock()
 	err := generation.retireAndWait(!dirty)
-	return errors.Join(err, s.undoStore.close())
+	err = errors.Join(err, s.undoStore.close())
+	err = errors.Join(err, cleanupOwnedDirectories(s.config, !dirty))
+	s.mu.Lock()
+	s.publishEventLocked(EventClosed, ChangeOriginNone, coordinate.ChangeMap{}, err)
+	s.mu.Unlock()
+	s.events.close()
+	s.mu.Lock()
+	s.closeErr = err
+	close(s.closeDone)
+	s.mu.Unlock()
+	return err
 }
 
 func (s *Session) syncLoop() {
 	defer close(s.syncDone)
-	ticker := time.NewTicker(time.Second)
+	ticker := time.NewTicker(s.config.JournalSyncInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -943,6 +1054,27 @@ func readTreeRange(tree *store.Tree, start, length int64) ([]byte, error) {
 		return nil, err
 	}
 	return buffer[:n], nil
+}
+
+func validateUTF8ReplacementBoundaries(tree *store.Tree, start, deleteLength int64) error {
+	length := tree.Len()
+	end := start + deleteLength
+	for index, offset := range [...]int64{start, end} {
+		if index == 1 && offset == start {
+			continue
+		}
+		if offset == 0 || offset == length {
+			continue
+		}
+		value, err := readTreeRange(tree, offset, 1)
+		if err != nil {
+			return err
+		}
+		if !utf8.RuneStart(value[0]) {
+			return ErrInvalidUTF8Boundary
+		}
+	}
+	return nil
 }
 
 type baseScan struct {

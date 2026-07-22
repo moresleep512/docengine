@@ -20,15 +20,22 @@ type SnapshotLease interface {
 }
 
 type sourceGeneration struct {
-	mu            sync.Mutex
-	cond          *sync.Cond
-	base          *os.File
-	journal       *recovery.Journal
-	journalPath   string
-	refs          int
-	retired       bool
-	removeJournal bool
-	closeErr      error
+	mu                sync.Mutex
+	cond              *sync.Cond
+	base              *os.File
+	journal           *recovery.Journal
+	journalPath       string
+	journalCleanupDir string
+	refs              int
+	retired           bool
+	removeJournal     bool
+	closeErr          error
+}
+
+func (g *sourceGeneration) setJournalCleanupDirectory(path string) {
+	g.mu.Lock()
+	g.journalCleanupDir = path
+	g.mu.Unlock()
 }
 
 func newSourceGeneration(base *os.File, journal *recovery.Journal) *sourceGeneration {
@@ -106,6 +113,9 @@ func (g *sourceGeneration) closeIfUnusedLocked() {
 		if err := os.Remove(g.journalPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			g.closeErr = errors.Join(g.closeErr, err)
 		}
+	}
+	if g.removeJournal && g.journalCleanupDir != "" {
+		g.closeErr = errors.Join(g.closeErr, removeEmptyDirectory(g.journalCleanupDir))
 	}
 	g.cond.Broadcast()
 }

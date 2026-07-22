@@ -8,7 +8,7 @@ import (
 )
 
 func TestUndoStoreLifecycleQuotaAndErrors(t *testing.T) {
-	store, err := openUndoStore("")
+	store, err := openUndoStore("", DefaultUndoBytes)
 	if err != nil || store != nil {
 		t.Fatalf("empty open = (%v, %v)", store, err)
 	}
@@ -26,7 +26,7 @@ func TestUndoStoreLifecycleQuotaAndErrors(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	store, err = openUndoStore(dir)
+	store, err = openUndoStore(dir, DefaultUndoBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,8 +53,12 @@ func TestUndoStoreLifecycleQuotaAndErrors(t *testing.T) {
 	if err := store.reset(); err != nil || store.size != 0 {
 		t.Fatalf("reset = %v, size=%d", err, store.size)
 	}
+	path := store.path
 	if err := store.close(); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("undo file remains after close: %v", err)
 	}
 	if _, err := store.append([]byte("x")); !errors.Is(err, ErrClosed) {
 		t.Fatalf("closed append error = %v", err)
@@ -72,14 +76,36 @@ func TestOpenUndoStoreFilesystemFailures(t *testing.T) {
 	if err := os.WriteFile(parentFile, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openUndoStore(filepath.Join(parentFile, "session")); err == nil {
+	if _, err := openUndoStore(filepath.Join(parentFile, "session"), DefaultUndoBytes); err == nil {
 		t.Fatal("expected MkdirAll error")
 	}
 	dir := t.TempDir()
-	if err := os.Mkdir(filepath.Join(dir, "undo.store"), 0o700); err != nil {
+	sentinel := errors.New("create temp")
+	operations := systemUndoStoreOperations
+	operations.createTemp = func(string, string) (*os.File, error) { return nil, sentinel }
+	if _, err := openUndoStoreWith(dir, DefaultUndoBytes, operations); !errors.Is(err, sentinel) {
+		t.Fatalf("CreateTemp error = %v", err)
+	}
+}
+
+func TestUndoStoreCleanupErrors(t *testing.T) {
+	dir := t.TempDir()
+	store, err := openUndoStore(dir, DefaultUndoBytes)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openUndoStore(dir); err == nil {
-		t.Fatal("expected OpenFile error")
+	sentinel := errors.New("remove")
+	store.remove = func(string) error { return sentinel }
+	if err := store.close(); !errors.Is(err, sentinel) {
+		t.Fatalf("remove error = %v", err)
+	}
+
+	store, err = openUndoStore(dir, DefaultUndoBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.remove = func(string) error { return os.ErrNotExist }
+	if err := store.close(); err != nil {
+		t.Fatalf("missing cleanup = %v", err)
 	}
 }

@@ -4,11 +4,8 @@ import (
 	"errors"
 	"io"
 	"os"
-	"path/filepath"
 	"sync"
 )
-
-const defaultUndoQuota = int64(256 << 20)
 
 var errUndoQuota = errors.New("document: undo store quota exceeded")
 
@@ -18,26 +15,40 @@ type textRef struct {
 }
 
 type undoStore struct {
-	mu    sync.Mutex
-	file  *os.File
-	path  string
-	size  int64
-	quota int64
+	mu     sync.Mutex
+	file   *os.File
+	path   string
+	size   int64
+	quota  int64
+	remove func(string) error
 }
 
-func openUndoStore(sessionDir string) (*undoStore, error) {
+type undoStoreOperations struct {
+	mkdirAll   func(string, os.FileMode) error
+	createTemp func(string, string) (*os.File, error)
+	remove     func(string) error
+}
+
+var systemUndoStoreOperations = undoStoreOperations{
+	mkdirAll: os.MkdirAll, createTemp: os.CreateTemp, remove: os.Remove,
+}
+
+func openUndoStore(sessionDir string, quota int64) (*undoStore, error) {
+	return openUndoStoreWith(sessionDir, quota, systemUndoStoreOperations)
+}
+
+func openUndoStoreWith(sessionDir string, quota int64, operations undoStoreOperations) (*undoStore, error) {
 	if sessionDir == "" {
 		return nil, nil
 	}
-	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+	if err := operations.mkdirAll(sessionDir, 0o700); err != nil {
 		return nil, err
 	}
-	path := filepath.Join(sessionDir, "undo.store")
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+	file, err := operations.createTemp(sessionDir, ".docengine-undo-*.store")
 	if err != nil {
 		return nil, err
 	}
-	return &undoStore{file: file, path: path, quota: defaultUndoQuota}, nil
+	return &undoStore{file: file, path: file.Name(), quota: quota, remove: operations.remove}, nil
 }
 
 func (s *undoStore) append(value []byte) (textRef, error) {
@@ -108,5 +119,13 @@ func (s *undoStore) close() error {
 	}
 	err := s.file.Close()
 	s.file = nil
+	remove := s.remove
+	s.remove = nil
+	if remove != nil {
+		removeErr := remove(s.path)
+		if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			err = errors.Join(err, removeErr)
+		}
+	}
 	return err
 }

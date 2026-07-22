@@ -22,6 +22,7 @@ profile.*
 .docengine-save-*.tmp
 *.docengine-journal-v2*
 undo.store
+.docengine-undo-*.store
 
 # Local environment files
 .env
