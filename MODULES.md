@@ -160,6 +160,12 @@ state cannot be proved. The old and new Index own independent Source lifetimes.
 failure-cleanup guarantees as full construction. Stats expose reuse and scan
 extent so hosts can choose when a full rebuild is cheaper.
 
+Indexes may carry an opaque `Lineage`. Session overrides caller Options with a
+private lineage and requires it for both explicit rebuild and managed refresh,
+preventing a same-revision foreign Index from seeding incorrect checkpoints.
+`Session.RefreshCoordinateIndex` captures the retained ChangeMap and current
+Snapshot under one Session read lock, then releases the lock before scanning.
+
 ## `document`
 
 ### Opening
@@ -182,9 +188,10 @@ target. A symlink later redirected elsewhere does not change the save target.
 
 `OpenOptions` resolves into an immutable `SessionConfig`. The configurable
 limits are maximum operations per batch, bytes per insertion, undo-store bytes,
-retained Session events, and journal sync interval. Zero values select the
-documented defaults; negative values and limits beyond the v2 journal or event
-buffer envelopes are rejected before the base file is opened.
+retained Session events, retained ChangeMaps, Anchors per transform batch, and
+journal sync interval. Zero values select the documented defaults; negative
+values and limits beyond the v2 journal or in-memory envelopes are rejected
+before the base file is opened.
 
 Explicit RecoveryDir and SessionDir paths are shared unless marked owned. An
 omitted RecoveryDir uses the shared process-temporary recovery namespace; an
@@ -233,6 +240,27 @@ wait on one barrier and return the same joined cleanup result. Explicit
 subscription close is idempotent and races safely with publication and Session
 close.
 
+### Retained changes and batch anchors
+
+Session retains a dedicated bounded ring of committed Apply/Undo/Redo
+ChangeMaps. The default is 256 transaction maps and the hard maximum is 4,096;
+multi-operation batches remain one entry and their interior revisions are not
+observable boundaries. Recovery starts a fresh window at the recovered
+revision. Save changes Source generations but neither revision nor retained
+maps.
+
+`ChangesBetween` composes forward boundaries or returns an inverse map for a
+reverse query. A revision older than the ring returns
+`ErrChangeHistoryExpired`; a future or atomic-batch-interior revision returns
+`ErrRevisionUnavailable`. Both use `ChangeHistoryError`, which records the
+requested and retained windows. Stats and retained maps remain available after
+Session close.
+
+`TransformAnchors` preserves input order and validates the entire input before
+returning output. Session applies both a configured Anchor-count limit and a
+fixed checked work budget, and releases its lock before the pure transformation
+loop. Invalid input and budget failures return no partial result.
+
 ### Snapshot generations
 
 A generation owns its base and journal handles. Snapshot leases increment the
@@ -262,9 +290,9 @@ the cause. This prevents continued mutation on a partially rebound generation.
 
 The core intentionally retains generic text policy—UTF-8, BOM, newline
 metadata, revisions, ranges, and byte-oriented search foundations—but no format
-semantics. Crash-orphan reclamation, compaction, Session-managed multi-revision
-ChangeMap retention, persistence/progress event kinds, virtualization, and
-search indexing still require later work. See [develop.md](develop.md).
+semantics. Crash-orphan reclamation, compaction, generic retained intervals,
+persistence/progress event kinds, virtualization, and search indexing still
+require later work. See [develop.md](develop.md).
 
 ## Verification
 
@@ -272,11 +300,13 @@ Every current package is held at 100% statement coverage. Tests include
 platform-specific replacement and directory-sync faults, complete UTF-8 and
 identity boundaries, every recovery batch truncation, transaction rollback,
 concurrent save/rebase, post-commit fault behavior, snapshot lifetime, integer
-overflow, randomized reference models, race runs, and fourteen fuzz targets.
+overflow, randomized reference models, race runs, and fifteen fuzz targets.
 Event-specific tests exercise resumable history, exact overflow accounting,
 concurrent publish/unsubscribe, final-event delivery, and the close barrier.
 Incremental-index tests compare every byte, rune, and line coordinate with a
 fresh full build across randomized sequential UTF-8 edits.
+Change-history state-machine fuzzing covers bounded eviction, unavailable batch
+interiors, forward/reverse maps, metadata, and Anchor equivalence.
 
 The v0.3.0 release suite was completed on native Windows and Debian under WSL 2
 on a native Linux temporary directory: every package reported 100% statement
@@ -285,6 +315,6 @@ at least 30 seconds on each platform.
 
 The v0.4 coordinate, lifecycle, and event foundations were checked on native
 Windows and in a WSL native-Linux directory. All five packages retained 100%
-statement coverage, three shuffled race runs passed, and the eight affected
+statement coverage, three shuffled race runs passed, and the nine affected
 Session, event, and coordinate fuzz targets passed 10-second runs on both
 platforms.

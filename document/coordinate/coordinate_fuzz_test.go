@@ -89,12 +89,25 @@ func FuzzChangeMapBoundsAndComposition(f *testing.F) {
 		if change.AfterLength() != current {
 			t.Fatalf("AfterLength = %d, want %d", change.AfterLength(), current)
 		}
+		anchors := make([]Anchor, 0, (length+1)*2)
 		for offset := int64(0); offset <= length; offset++ {
 			for _, affinity := range []Affinity{AffinityBefore, AffinityAfter} {
-				got, err := change.Transform(Anchor{Offset: offset, Affinity: affinity})
+				anchor := Anchor{Offset: offset, Affinity: affinity}
+				anchors = append(anchors, anchor)
+				got, err := change.Transform(anchor)
 				if err != nil || got.Offset < 0 || got.Offset > current || got.Affinity != affinity {
 					t.Fatalf("Transform(%d,%d) = (%+v,%v), after=%d", offset, affinity, got, err, current)
 				}
+			}
+		}
+		batch, err := change.TransformAnchors(anchors)
+		if err != nil || len(batch) != len(anchors) {
+			t.Fatalf("TransformAnchors = (%d,%v), want %d", len(batch), err, len(anchors))
+		}
+		for index, anchor := range anchors {
+			want, _ := change.Transform(anchor)
+			if batch[index] != want {
+				t.Fatalf("batch anchor %d = %+v, want %+v", index, batch[index], want)
 			}
 		}
 		inverse := change.Invert()

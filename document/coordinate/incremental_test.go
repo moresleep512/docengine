@@ -87,11 +87,15 @@ func TestRebuildUsesEarliestSequentialEditAndUTF8Boundaries(t *testing.T) {
 
 func TestRebuildEOFInsertionAndIdentityReuse(t *testing.T) {
 	before := []byte("abcdef")
-	previous, err := Build(context.Background(), &testSource{body: before}, 4, Options{CheckpointBytes: 2})
+	lineage := NewLineage()
+	previous, err := Build(context.Background(), &testSource{body: before}, 4, Options{CheckpointBytes: 2, Lineage: lineage})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer previous.Close()
+	if !previous.BelongsTo(lineage) || previous.BelongsTo(NewLineage()) || previous.BelongsTo(nil) {
+		t.Fatal("initial lineage mismatch")
+	}
 	insert := []byte("é\n")
 	after := append(append([]byte(nil), before...), insert...)
 	changes, err := NewChangeMap(4, 5, int64(len(before)), []Edit{{Start: int64(len(before)), NewLength: int64(len(insert))}})
@@ -105,6 +109,9 @@ func TestRebuildEOFInsertionAndIdentityReuse(t *testing.T) {
 	defer appended.Close()
 	if stats := appended.Stats(); stats.ScannedBytes != int64(len(insert)) || stats.ReusedCheckpoints != previous.Stats().CheckpointCount {
 		t.Fatalf("EOF insertion stats = %+v", stats)
+	}
+	if !appended.BelongsTo(lineage) {
+		t.Fatal("Rebuild did not preserve lineage")
 	}
 
 	identity, err := Identity(5, int64(len(after)))
@@ -121,6 +128,9 @@ func TestRebuildEOFInsertionAndIdentityReuse(t *testing.T) {
 	}
 	if err := reused.Close(); err != nil || owned.closeCalls != 1 {
 		t.Fatalf("owned Close = (%v, calls=%d)", err, owned.closeCalls)
+	}
+	if !reused.BelongsTo(lineage) {
+		t.Fatal("closed Index lost lineage")
 	}
 }
 

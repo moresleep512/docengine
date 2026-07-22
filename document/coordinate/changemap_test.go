@@ -109,6 +109,53 @@ func TestChangeMapInsertionAffinityAndRanges(t *testing.T) {
 	}
 }
 
+func TestChangeMapTransformsAnchorBatchAtomically(t *testing.T) {
+	change, err := NewChangeMap(3, 5, 8, []Edit{
+		{Start: 2, OldLength: 2, NewLength: 4},
+		{Start: 7, OldLength: 1, NewLength: 0},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchors := []Anchor{
+		{Offset: 8, Affinity: AffinityAfter},
+		{Offset: 2, Affinity: AffinityBefore},
+		{Offset: 2, Affinity: AffinityAfter},
+		{Offset: 0, Affinity: AffinityBefore},
+	}
+	original := append([]Anchor(nil), anchors...)
+	transformed, err := change.TransformAnchors(anchors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, anchor := range anchors {
+		want, transformErr := change.Transform(anchor)
+		if transformErr != nil || transformed[index] != want {
+			t.Fatalf("anchor %d = (%+v, %v), want %+v", index, transformed[index], transformErr, want)
+		}
+	}
+	if len(transformed) != len(anchors) || len(anchors) != len(original) {
+		t.Fatal("batch length changed")
+	}
+	for index := range anchors {
+		if anchors[index] != original[index] {
+			t.Fatal("TransformAnchors modified its input")
+		}
+	}
+	if empty, err := change.TransformAnchors(nil); err != nil || empty != nil {
+		t.Fatalf("nil batch = (%v, %v)", empty, err)
+	}
+	for _, invalid := range [][]Anchor{
+		{{Offset: 1}},
+		{{Offset: 9, Affinity: AffinityBefore}},
+		{{Offset: 0, Affinity: AffinityBefore}, {Offset: -1, Affinity: AffinityAfter}},
+	} {
+		if got, err := change.TransformAnchors(invalid); err == nil || got != nil {
+			t.Fatalf("invalid batch %+v = (%+v, %v)", invalid, got, err)
+		}
+	}
+}
+
 func TestChangeMapValidationAndCompositionErrors(t *testing.T) {
 	invalid := []struct {
 		beforeRevision uint64

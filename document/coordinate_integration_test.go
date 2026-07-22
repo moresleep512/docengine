@@ -13,11 +13,15 @@ func TestSessionCoordinateIndexAndChangeMaps(t *testing.T) {
 	session, _, _ := openAtomicTestSession(t, "aé\nz")
 	defer session.Close()
 
-	original, err := session.CoordinateIndex(context.Background(), coordinate.Options{CheckpointBytes: 2})
+	hostLineage := coordinate.NewLineage()
+	original, err := session.CoordinateIndex(context.Background(), coordinate.Options{CheckpointBytes: 2, Lineage: hostLineage})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer original.Close()
+	if original.BelongsTo(hostLineage) {
+		t.Fatal("Session accepted a host-supplied coordinate lineage")
+	}
 	if stats := original.Stats(); stats.Revision != 0 || stats.ByteLength != 5 || stats.RuneCount != 4 || stats.LineCount != 2 {
 		t.Fatalf("original stats = %+v", stats)
 	}
@@ -115,6 +119,11 @@ func TestSessionRebuildCoordinateIndexAcrossChangeMapChain(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rebuilt.Close()
+	refreshed, err := session.RefreshCoordinateIndex(context.Background(), previous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer refreshed.Close()
 	fresh, err := session.CoordinateIndex(context.Background(), coordinate.Options{CheckpointBytes: 4})
 	if err != nil {
 		t.Fatal(err)
@@ -124,6 +133,9 @@ func TestSessionRebuildCoordinateIndexAcrossChangeMapChain(t *testing.T) {
 	if rebuiltStats.Revision != 2 || rebuiltStats.ReusedCheckpoints < 2 || rebuiltStats.ScannedBytes >= rebuiltStats.ByteLength ||
 		rebuiltStats.ByteLength != freshStats.ByteLength || rebuiltStats.RuneCount != freshStats.RuneCount || rebuiltStats.LineCount != freshStats.LineCount {
 		t.Fatalf("rebuilt=%+v fresh=%+v", rebuiltStats, freshStats)
+	}
+	if refreshedStats := refreshed.Stats(); refreshedStats.Revision != rebuiltStats.Revision || refreshedStats.ByteLength != rebuiltStats.ByteLength || refreshedStats.ReusedCheckpoints != rebuiltStats.ReusedCheckpoints {
+		t.Fatalf("refreshed=%+v rebuilt=%+v", refreshedStats, rebuiltStats)
 	}
 	for offset := int64(0); offset <= rebuiltStats.ByteLength; offset++ {
 		left, leftErr := rebuilt.ByteToPosition(context.Background(), offset)
@@ -159,6 +171,32 @@ func TestSessionRebuildCoordinateIndexAcrossChangeMapChain(t *testing.T) {
 	if afterRefs := generationReferences(session.generation); afterRefs != beforeRefs {
 		t.Fatalf("failed rebuild leaked Snapshot: %d -> %d", beforeRefs, afterRefs)
 	}
+	if _, err := session.RefreshCoordinateIndex(nil, previous); !errors.Is(err, coordinate.ErrInvalidContext) {
+		t.Fatalf("nil refresh context = %v", err)
+	}
+	if _, err := session.RefreshCoordinateIndex(canceled, previous); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled refresh context = %v", err)
+	}
+	if _, err := session.RefreshCoordinateIndex(context.Background(), nil); !errors.Is(err, coordinate.ErrInvalidIndex) {
+		t.Fatalf("nil refresh previous = %v", err)
+	}
+	other, _, _ := openAtomicTestSession(t, "abcdef\n123456\n")
+	foreign, err := other.CoordinateIndex(context.Background(), coordinate.Options{CheckpointBytes: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.RebuildCoordinateIndex(context.Background(), foreign, changes); !errors.Is(err, coordinate.ErrLineageMismatch) {
+		t.Fatalf("foreign rebuild = %v", err)
+	}
+	if _, err := session.RefreshCoordinateIndex(context.Background(), foreign); !errors.Is(err, coordinate.ErrLineageMismatch) {
+		t.Fatalf("foreign refresh = %v", err)
+	}
+	if err := foreign.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestRebuildCoordinateIndexAfterSessionClose(t *testing.T) {
@@ -174,11 +212,17 @@ func TestRebuildCoordinateIndexAfterSessionClose(t *testing.T) {
 	if _, err := session.RebuildCoordinateIndex(context.Background(), previous, identity); !errors.Is(err, coordinate.ErrClosed) {
 		t.Fatalf("closed previous = %v", err)
 	}
+	if _, err := session.RefreshCoordinateIndex(context.Background(), previous); !errors.Is(err, coordinate.ErrClosed) {
+		t.Fatalf("closed previous refresh = %v", err)
+	}
 	if err := session.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := session.RebuildCoordinateIndex(context.Background(), previous, identity); !errors.Is(err, ErrClosed) {
 		t.Fatalf("closed Session = %v", err)
+	}
+	if _, err := session.RefreshCoordinateIndex(context.Background(), previous); !errors.Is(err, ErrClosed) {
+		t.Fatalf("closed Session refresh = %v", err)
 	}
 }
 

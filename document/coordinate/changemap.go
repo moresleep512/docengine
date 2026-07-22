@@ -94,6 +94,26 @@ func (m ChangeMap) Transform(anchor Anchor) (Anchor, error) {
 	return Anchor{Offset: offset, Affinity: anchor.Affinity}, nil
 }
 
+// TransformAnchors applies this map to an anchor batch while preserving input
+// order. Validation is atomic: an invalid anchor returns no partial result.
+func (m ChangeMap) TransformAnchors(anchors []Anchor) ([]Anchor, error) {
+	result := append([]Anchor(nil), anchors...)
+	for _, anchor := range result {
+		if anchor.Affinity != AffinityBefore && anchor.Affinity != AffinityAfter {
+			return nil, ErrInvalidAffinity
+		}
+		if anchor.Offset < 0 || anchor.Offset > m.beforeLength {
+			return nil, ErrInvalidOffset
+		}
+	}
+	for _, edit := range m.edits {
+		for index := range result {
+			result[index].Offset = transformOffset(result[index].Offset, result[index].Affinity, edit)
+		}
+	}
+	return result, nil
+}
+
 func (m ChangeMap) TransformRange(value AnchoredRange) (AnchoredRange, error) {
 	if value.Start.Offset > value.End.Offset {
 		return AnchoredRange{}, ErrInvalidRange

@@ -29,6 +29,7 @@ var (
 	ErrClosed             = errors.New("coordinate: index closed")
 	ErrSourceInconsistent = errors.New("coordinate: source length or content changed")
 	ErrInvalidIndex       = errors.New("coordinate: invalid previous index")
+	ErrLineageMismatch    = errors.New("coordinate: index lineage mismatch")
 )
 
 // Source is an immutable byte source. It must remain readable for the lifetime
@@ -45,8 +46,16 @@ type OwnedSource interface {
 	io.Closer
 }
 
+// Lineage is an opaque identity shared by indexes derived from the same
+// trusted Source history. Pointer identity is intentional.
+type Lineage struct{ marker byte }
+
+// NewLineage creates a unique index lineage token.
+func NewLineage() *Lineage { return &Lineage{} }
+
 type Options struct {
 	CheckpointBytes int64
+	Lineage         *Lineage
 }
 
 type Stats struct {
@@ -90,6 +99,7 @@ type Index struct {
 	checkpoints     []checkpoint
 	reused          int
 	scannedBytes    int64
+	lineage         *Lineage
 }
 
 func Build(ctx context.Context, source Source, revision uint64, options Options) (*Index, error) {
@@ -153,6 +163,7 @@ func build(ctx context.Context, source Source, revision uint64, options Options,
 		byteLength:      length,
 		checkpointBytes: checkpointBytes,
 		checkpoints:     []checkpoint{{}},
+		lineage:         options.Lineage,
 	}
 	if err := index.scan(ctx); err != nil {
 		return nil, err
@@ -181,12 +192,18 @@ func rebuild(ctx context.Context, source Source, previous *Index, changes Change
 	index := &Index{
 		source: source, release: release, revision: changes.afterRevision,
 		byteLength: length, checkpointBytes: checkpointBytes, checkpoints: checkpoints,
-		reused: len(checkpoints),
+		reused: len(checkpoints), lineage: previousLineage(previous),
 	}
 	if err := index.scanFrom(ctx, checkpoints[len(checkpoints)-1], scanStart); err != nil {
 		return nil, err
 	}
 	return index, nil
+}
+
+func previousLineage(previous *Index) *Lineage {
+	previous.mu.RLock()
+	defer previous.mu.RUnlock()
+	return previous.lineage
 }
 
 func incrementalSeed(previous *Index, changes ChangeMap, afterLength int64) (int64, int64, []checkpoint, error) {
@@ -309,6 +326,14 @@ func (i *Index) Stats() Stats {
 		LineCount: i.lineCount, CheckpointCount: len(i.checkpoints), CheckpointBytes: i.checkpointBytes,
 		ReusedCheckpoints: i.reused, ScannedBytes: i.scannedBytes,
 	}
+}
+
+// BelongsTo reports whether this Index was built or derived with lineage. It
+// remains available after Close and does not expose the stored token.
+func (i *Index) BelongsTo(lineage *Lineage) bool {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return lineage != nil && i.lineage == lineage
 }
 
 func (i *Index) ByteToPosition(ctx context.Context, offset int64) (Position, error) {

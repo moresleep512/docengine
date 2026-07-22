@@ -32,6 +32,8 @@ It currently provides:
   conservative ChangeMap-driven checkpoint-prefix reuse;
 - sequential ChangeMaps and affinity-aware Anchors returned by edits,
   undo, and redo;
+- bounded Session-managed ChangeMap history, forward/reverse revision queries,
+  lineage-checked index refresh, and atomic batch Anchor transforms;
 - bounded, resumable Session event streams with precise slow-consumer loss
   reporting and a concurrent close barrier;
 - resolved Session resource limits, journal sync cadence, and explicit shared
@@ -96,12 +98,12 @@ but permanently non-mutating fault state instead of continuing unsafely.
 
 `OpenOptions` resolves zero-valued limits to documented defaults: 256
 operations per batch, 1 MiB per insertion, 256 MiB of undo storage, 256 retained
-events, and a one-second journal sync interval. Explicit directories are shared
-by default; an omitted Session directory is unique and owned. Undo files use
-collision-free temporary names and are removed on close. Owned directories are
-removed only when they are actual empty directories, while dirty recovery
-journals and unknown host files are preserved. `Session.Config` reports the
-resolved policy.
+events, 256 retained ChangeMaps, 65,536 Anchors per batch, and a one-second
+journal sync interval. Explicit directories are shared by default; an omitted
+Session directory is unique and owned. Undo files use collision-free temporary
+names and are removed on close. Owned directories are removed only when they
+are actual empty directories, while dirty recovery journals and unknown host
+files are preserved. `Session.Config` reports the resolved policy.
 
 `Session.Subscribe` atomically joins retained history to live events. Each
 subscriber has a bounded queue and never blocks a transaction; when its queue
@@ -127,6 +129,14 @@ unsafe suffix shifting when line/column state cannot be proved unchanged.
 `Session.RebuildCoordinateIndex` supplies the current Snapshot lease; Stats
 reports reused checkpoints and scanned bytes.
 
+Session-created indexes carry an opaque lineage that cannot be replaced through
+caller Options. `Session.RefreshCoordinateIndex` verifies that lineage, obtains
+the retained map chain atomically with the current Snapshot, and rejects expired
+history rather than silently rebuilding from an unrelated prefix.
+`ChangesBetween` supports forward and reverse observable revision boundaries;
+atomic-batch interior revisions are rejected. `TransformAnchors` applies that
+map to a bounded batch without returning partial output.
+
 See [MODULES.md](MODULES.md) for implementation invariants and file-format
 details.
 
@@ -147,13 +157,15 @@ No compatibility promise applies before 1.0.
 ## Testing
 
 The repository requires 100% statement coverage for every current package and
-contains fourteen Go fuzz targets:
+contains fifteen Go fuzz targets:
 
 - Piece Tree reference-model and concurrent snapshot/edit fuzzers;
 - v2 header, operation decoder, replay-resilience, and stateful journal fuzzers;
 - Session state-machine, concurrent save/edit, crash-recovery, and UTF-8 edit
   boundary fuzzers;
 - resumable event-history, subscriber-overflow, and close state-machine fuzzing;
+- bounded ChangeMap-history retention, expiry, reverse-query, and composition
+  state-machine fuzzing;
 - UTF-8 coordinate-reference, ChangeMap composition, and incremental-versus-
   full-index equivalence fuzzers.
 
@@ -173,7 +185,7 @@ fuzz targets ran for at least 30 seconds without a failing implementation input.
 
 The current v0.4 coordinate, lifecycle, and event foundations were verified on
 native Windows and in a WSL native-Linux directory: all five packages remained
-at 100% statement coverage, three shuffled race runs passed, and all eight
+at 100% statement coverage, three shuffled race runs passed, and all nine
 affected Session, event, and coordinate fuzz targets passed 10-second runs on
 both platforms.
 
@@ -201,6 +213,7 @@ go test ./document -run=^$ -fuzz=FuzzSessionConcurrentSaveEdit -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzSessionCrashRecovery -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzUTF8ReplacementBoundaries -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzEventHubStateMachine -fuzztime=30s
+go test ./document -run=^$ -fuzz=FuzzChangeHistoryStateMachine -fuzztime=30s
 go test ./document/coordinate -run=^$ -fuzz=FuzzIndexMatchesUTF8Reference -fuzztime=30s
 go test ./document/coordinate -run=^$ -fuzz=FuzzChangeMapBoundsAndComposition -fuzztime=30s
 go test ./document/coordinate -run=^$ -fuzz=FuzzIncrementalIndexMatchesFullBuild -fuzztime=30s
@@ -217,10 +230,10 @@ Windows race builds require a GCC-compatible MinGW-w64 toolchain; MSVC-target
   reopen is required.
 - External-change checking still has the unavoidable final hash-to-replace
   race unless a host provides stronger file locking.
-- Incremental coordinate rebuilding requires the exact caller-retained
-  ChangeMap chain and conservatively rescans from the earliest affected
-  checkpoint. Session-managed multi-revision map retention, automatic caching,
-  and proven suffix reuse are not implemented.
+- Session-managed ChangeMap history is bounded by retained transactions; an
+  expired revision requires a full rebuild. Incremental indexes conservatively
+  rescan from the earliest affected checkpoint; automatic cache ownership and
+  proven suffix reuse are not implemented.
 - Save, fault, external change, and background-progress event kinds are not yet
   published.
 - Piece/journal/undo compaction, search indexing, virtualization, and
@@ -229,9 +242,9 @@ Windows race builds require a GCC-compatible MinGW-w64 toolchain; MSVC-target
 
 ## Next work
 
-The next v0.4 work is stale-session reclamation, retained multi-revision change
-chains and batch anchor transforms, the remaining persistence/progress event
-kinds, and the first compaction policy.
+The next v0.4 work is stale-session reclamation, the remaining
+persistence/progress event kinds, generic retained interval/annotation
+transforms, and the first compaction policy.
 Format-neutral logical Page/Fragment virtualization then builds on these
 foundations, followed by persistent search and multi-source composition. The
 decision-complete target architecture, readiness assessment, edge cases, and

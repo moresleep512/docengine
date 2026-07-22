@@ -13,6 +13,10 @@ const (
 	DefaultMaxInsertBytes      = int64(1 << 20)
 	DefaultUndoBytes           = int64(256 << 20)
 	MaximumInsertBytes         = int64((1 << 30) - 24)
+	DefaultChangeHistory       = 256
+	MaximumChangeHistory       = 4_096
+	DefaultMaxAnchorBatch      = 65_536
+	MaximumAnchorBatch         = 1_048_576
 	DefaultJournalSyncInterval = time.Second
 )
 
@@ -34,6 +38,8 @@ type SessionLimits struct {
 	MaxInsertBytes     int64
 	UndoBytes          int64
 	EventHistory       int
+	ChangeHistory      int
+	MaxAnchorBatch     int
 }
 
 type OpenOptions struct {
@@ -70,6 +76,12 @@ func resolveOpenOptions(options OpenOptions) (SessionConfig, error) {
 	if limits.EventHistory == 0 {
 		limits.EventHistory = DefaultEventHistory
 	}
+	if limits.ChangeHistory == 0 {
+		limits.ChangeHistory = DefaultChangeHistory
+	}
+	if limits.MaxAnchorBatch == 0 {
+		limits.MaxAnchorBatch = DefaultMaxAnchorBatch
+	}
 	if limits.MaxBatchOperations < 0 || limits.MaxBatchOperations > DefaultMaxBatchOperations {
 		return SessionConfig{}, fmt.Errorf("%w: MaxBatchOperations must be between 1 and %d", ErrInvalidOptions, DefaultMaxBatchOperations)
 	}
@@ -81,6 +93,12 @@ func resolveOpenOptions(options OpenOptions) (SessionConfig, error) {
 	}
 	if limits.EventHistory < 0 || limits.EventHistory > MaximumEventHistory {
 		return SessionConfig{}, fmt.Errorf("%w: EventHistory must be between 1 and %d", ErrInvalidOptions, MaximumEventHistory)
+	}
+	if limits.ChangeHistory < 0 || limits.ChangeHistory > MaximumChangeHistory {
+		return SessionConfig{}, fmt.Errorf("%w: ChangeHistory must be between 1 and %d", ErrInvalidOptions, MaximumChangeHistory)
+	}
+	if limits.MaxAnchorBatch < 0 || limits.MaxAnchorBatch > MaximumAnchorBatch {
+		return SessionConfig{}, fmt.Errorf("%w: MaxAnchorBatch must be between 1 and %d", ErrInvalidOptions, MaximumAnchorBatch)
 	}
 	syncInterval := options.JournalSyncInterval
 	if syncInterval == 0 {

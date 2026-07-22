@@ -184,6 +184,8 @@ type Session struct {
 	syncDone            chan struct{}
 	operations          sessionOperations
 	events              *eventHub
+	changeHistory       *changeHistory
+	coordinateLineage   *coordinate.Lineage
 	closeDone           chan struct{}
 	closeErr            error
 }
@@ -271,7 +273,7 @@ func openSessionContext(ctx context.Context, path string, options OpenOptions, o
 		undoStore: undo, hasBOM: scan.hasBOM, eol: scan.eol, recoveryDir: config.RecoveryDir,
 		sessionDir: config.SessionDir, config: config, fingerprint: fingerprint, diskIdentity: identityFor(info, scan.contentHash),
 		stopSync: make(chan struct{}), syncDone: make(chan struct{}), operations: operations,
-		events: newEventHub(config.Limits.EventHistory), closeDone: make(chan struct{}),
+		events: newEventHub(config.Limits.EventHistory), coordinateLineage: coordinate.NewLineage(), closeDone: make(chan struct{}),
 	}
 	if journal != nil {
 		if err := session.replay(replay); err != nil {
@@ -283,6 +285,7 @@ func openSessionContext(ctx context.Context, path string, options OpenOptions, o
 			}
 		}
 	}
+	session.changeHistory = newChangeHistory(config.Limits.ChangeHistory, session.revision, session.tree.Len())
 	session.publishEventLocked(EventOpened, ChangeOriginNone, coordinate.ChangeMap{}, nil)
 	if session.recovered {
 		session.publishEventLocked(EventRecovered, ChangeOriginNone, coordinate.ChangeMap{}, nil)
@@ -479,6 +482,7 @@ func (s *Session) CoordinateIndex(ctx context.Context, options coordinate.Option
 	if err != nil {
 		return nil, err
 	}
+	options.Lineage = s.coordinateLineage
 	return coordinate.BuildOwned(ctx, snapshot, revision, options)
 }
 
@@ -492,12 +496,49 @@ func (s *Session) RebuildCoordinateIndex(ctx context.Context, previous *coordina
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if previous == nil {
+		return nil, coordinate.ErrInvalidIndex
+	}
+	if !previous.BelongsTo(s.coordinateLineage) {
+		return nil, coordinate.ErrLineageMismatch
+	}
 	revision, snapshot, err := s.Snapshot()
 	if err != nil {
 		return nil, err
 	}
 	if revision != changes.AfterRevision() {
 		return nil, errors.Join(coordinate.ErrRevisionMismatch, snapshot.Close())
+	}
+	return coordinate.RebuildOwned(ctx, snapshot, previous, changes)
+}
+
+// RefreshCoordinateIndex rebuilds the current index from a previous index made
+// by this Session and the retained ChangeMap chain between revisions.
+func (s *Session) RefreshCoordinateIndex(ctx context.Context, previous *coordinate.Index) (*coordinate.Index, error) {
+	if ctx == nil {
+		return nil, coordinate.ErrInvalidContext
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if previous == nil {
+		return nil, coordinate.ErrInvalidIndex
+	}
+	if !previous.BelongsTo(s.coordinateLineage) {
+		return nil, coordinate.ErrLineageMismatch
+	}
+	previousStats := previous.Stats()
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return nil, ErrClosed
+	}
+	history := s.changeHistory.clone()
+	snapshot := s.generation.acquire(s.tree.Snapshot())
+	s.mu.RUnlock()
+	changes, err := history.between(previousStats.Revision, history.currentRevision)
+	if err != nil {
+		return nil, errors.Join(err, snapshot.Close())
 	}
 	return coordinate.RebuildOwned(ctx, snapshot, previous, changes)
 }
@@ -528,6 +569,7 @@ func (s *Session) ApplyBatch(ctx context.Context, expectedRevision uint64, opera
 	if err != nil {
 		return ApplyResult{}, err
 	}
+	s.changeHistory.append(changes)
 	s.publishEventLocked(EventChanged, ChangeOriginApply, changes, nil)
 	return ApplyResult{Revision: s.revision, ByteLength: s.tree.Len(), Dirty: s.dirty, Changes: changes}, nil
 }
@@ -700,6 +742,7 @@ func (s *Session) Undo() (ApplyResult, error) {
 	}
 	s.undo = s.undo[:len(s.undo)-1]
 	s.redo = append(s.redo, entry)
+	s.changeHistory.append(changes)
 	s.publishEventLocked(EventChanged, ChangeOriginUndo, changes, nil)
 	return ApplyResult{Revision: s.revision, ByteLength: s.tree.Len(), Dirty: true, Changes: changes}, nil
 }
@@ -727,6 +770,7 @@ func (s *Session) Redo() (ApplyResult, error) {
 	}
 	s.redo = s.redo[:len(s.redo)-1]
 	s.undo = append(s.undo, entry)
+	s.changeHistory.append(changes)
 	s.publishEventLocked(EventChanged, ChangeOriginRedo, changes, nil)
 	return ApplyResult{Revision: s.revision, ByteLength: s.tree.Len(), Dirty: true, Changes: changes}, nil
 }
