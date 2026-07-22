@@ -97,6 +97,9 @@ failed replacement.
 `document.Session` owns the Piece Tree, revision history, recovery, source
 generations, save rebasing, and lifecycle. `OpenContext` scans the complete
 file once to validate UTF-8, compute SHA-256, and collect newline metadata.
+Before and after that single pass it compares the OS change generation (`ctime`
+or Windows `ChangeTime`), so a same-length rewrite with restored mtime is
+rejected without reading the file twice.
 Requested and resolved paths are both reported; saves remain pinned to the
 resolved target. A failure after replacement puts the Session into a readable
 but permanently non-mutating fault state instead of continuing unsafely.

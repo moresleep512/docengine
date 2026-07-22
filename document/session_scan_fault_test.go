@@ -92,6 +92,99 @@ func TestScanDiskIdentityFaultBoundaries(t *testing.T) {
 	}
 }
 
+func TestFileChangeCaptureFaultBoundaries(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "base")
+	if err := os.WriteFile(path, []byte("abc"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sentinel := errors.New("change stamp")
+	initialFailure := func(readStatFile, os.FileInfo) (fileChangeStamp, error) {
+		return fileChangeStamp{}, sentinel
+	}
+	finalFailure := func() fileChangeCapture {
+		calls := 0
+		return func(readStatFile, os.FileInfo) (fileChangeStamp, error) {
+			calls++
+			if calls == 2 {
+				return fileChangeStamp{}, sentinel
+			}
+			return fileChangeStamp{}, nil
+		}
+	}
+	for _, test := range []struct {
+		name    string
+		capture fileChangeCapture
+	}{
+		{name: "initial", capture: initialFailure},
+		{name: "final", capture: finalFailure()},
+	} {
+		t.Run("base "+test.name, func(t *testing.T) {
+			file := &scannerFile{body: []byte("abc"), info: info}
+			if _, err := scanOpenedBaseWithChange(context.Background(), file, path, info, os.Stat, test.capture); !errors.Is(err, sentinel) {
+				t.Fatalf("scanOpenedBaseWithChange = %v", err)
+			}
+		})
+	}
+	for _, test := range []struct {
+		name    string
+		capture fileChangeCapture
+	}{
+		{name: "initial", capture: initialFailure},
+		{name: "final", capture: finalFailure()},
+	} {
+		t.Run("identity "+test.name, func(t *testing.T) {
+			file := &scannerFile{body: []byte("abc"), info: info}
+			if _, err := scanDiskIdentityOpenedWithChange(context.Background(), path, file, os.Stat, test.capture); !errors.Is(err, sentinel) {
+				t.Fatalf("scanDiskIdentityOpenedWithChange = %v", err)
+			}
+		})
+	}
+}
+
+func TestScannersKeepSingleContentPass(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "large-base")
+	body := bytes.Repeat([]byte{'x'}, 2*scanBufferSize+1)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantReads := 3
+	base := &scannerFile{body: body, info: info}
+	if _, err := scanOpenedBase(context.Background(), base, path, info, os.Stat); err != nil {
+		t.Fatal(err)
+	}
+	if base.readCalls != wantReads {
+		t.Fatalf("base scan ReadAt calls = %d, want one pass (%d)", base.readCalls, wantReads)
+	}
+	identity := &scannerFile{body: body, info: info}
+	if _, err := scanDiskIdentityOpened(context.Background(), path, identity, os.Stat); err != nil {
+		t.Fatal(err)
+	}
+	if identity.readCalls != wantReads {
+		t.Fatalf("identity scan ReadAt calls = %d, want one pass (%d)", identity.readCalls, wantReads)
+	}
+}
+
+func TestSameFileChangeStamp(t *testing.T) {
+	unavailable := fileChangeStamp{}
+	first := fileChangeStamp{first: 1, second: 2, available: true}
+	same := fileChangeStamp{first: 1, second: 2, available: true}
+	different := fileChangeStamp{first: 1, second: 3, available: true}
+	if !sameFileChange(unavailable, unavailable) || sameFileChange(unavailable, first) ||
+		!sameFileChange(first, same) || sameFileChange(first, different) {
+		t.Fatal("file change stamp comparison is inconsistent")
+	}
+}
+
 func TestRecoveryOpenErrorAndQuarantineFailure(t *testing.T) {
 	sentinel := errors.New("injected")
 	recoveryErr := &RecoveryOpenError{JournalPath: "old", QuarantinedPath: "new", Reason: "test", Err: sentinel}
@@ -185,11 +278,13 @@ type scannerFile struct {
 	info       os.FileInfo
 	readErr    error
 	zeroRead   bool
+	readCalls  int
 	statCalls  int
 	statErrors map[int]error
 }
 
 func (f *scannerFile) ReadAt(buffer []byte, offset int64) (int, error) {
+	f.readCalls++
 	if f.readErr != nil {
 		return 0, f.readErr
 	}

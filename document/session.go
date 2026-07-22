@@ -1237,9 +1237,19 @@ func (v *utf8StreamValidator) Write(value []byte) bool {
 
 func (v *utf8StreamValidator) Complete() bool { return len(v.pending) == 0 }
 
+type fileChangeCapture func(readStatFile, os.FileInfo) (fileChangeStamp, error)
+
 func scanOpenedBase(ctx context.Context, file readStatFile, path string, initial os.FileInfo, stat func(string) (os.FileInfo, error)) (baseScan, error) {
+	return scanOpenedBaseWithChange(ctx, file, path, initial, stat, captureFileChange)
+}
+
+func scanOpenedBaseWithChange(ctx context.Context, file readStatFile, path string, initial os.FileInfo, stat func(string) (os.FileInfo, error), capture fileChangeCapture) (baseScan, error) {
 	if initial.Size() < 0 {
 		return baseScan{}, ErrExternalChange
+	}
+	initialChange, err := capture(file, initial)
+	if err != nil {
+		return baseScan{}, err
 	}
 	hasher := sha256.New()
 	validator := utf8StreamValidator{}
@@ -1315,15 +1325,19 @@ func scanOpenedBase(ctx context.Context, file readStatFile, path string, initial
 	if err := ctx.Err(); err != nil {
 		return baseScan{}, err
 	}
-	final, err := file.Stat()
-	if err != nil {
-		return baseScan{}, err
-	}
 	pathInfo, err := stat(path)
 	if err != nil {
 		return baseScan{}, err
 	}
-	if !sameFileVersion(initial, final) || !sameFileVersion(final, pathInfo) {
+	final, err := file.Stat()
+	if err != nil {
+		return baseScan{}, err
+	}
+	finalChange, err := capture(file, final)
+	if err != nil {
+		return baseScan{}, err
+	}
+	if !sameFileVersion(initial, final) || !sameFileVersion(final, pathInfo) || !sameFileChange(initialChange, finalChange) {
 		return baseScan{}, ErrExternalChange
 	}
 	style := EOLLF
@@ -1347,12 +1361,20 @@ func scanDiskIdentity(ctx context.Context, path string, operations sessionOperat
 }
 
 func scanDiskIdentityOpened(ctx context.Context, path string, file readStatFile, stat func(string) (os.FileInfo, error)) (fileIdentity, error) {
+	return scanDiskIdentityOpenedWithChange(ctx, path, file, stat, captureFileChange)
+}
+
+func scanDiskIdentityOpenedWithChange(ctx context.Context, path string, file readStatFile, stat func(string) (os.FileInfo, error), capture fileChangeCapture) (fileIdentity, error) {
 	initial, err := file.Stat()
 	if err != nil {
 		return fileIdentity{}, err
 	}
 	if !initial.Mode().IsRegular() {
 		return fileIdentity{}, ErrExternalChange
+	}
+	initialChange, err := capture(file, initial)
+	if err != nil {
+		return fileIdentity{}, err
 	}
 	hasher := sha256.New()
 	buffer := make([]byte, scanBufferSize)
@@ -1373,15 +1395,19 @@ func scanDiskIdentityOpened(ctx context.Context, path string, file readStatFile,
 			return fileIdentity{}, io.ErrUnexpectedEOF
 		}
 	}
-	final, err := file.Stat()
-	if err != nil {
-		return fileIdentity{}, err
-	}
 	pathInfo, err := stat(path)
 	if err != nil {
 		return fileIdentity{}, err
 	}
-	if !sameFileVersion(initial, final) || !sameFileVersion(final, pathInfo) {
+	final, err := file.Stat()
+	if err != nil {
+		return fileIdentity{}, err
+	}
+	finalChange, err := capture(file, final)
+	if err != nil {
+		return fileIdentity{}, err
+	}
+	if !sameFileVersion(initial, final) || !sameFileVersion(final, pathInfo) || !sameFileChange(initialChange, finalChange) {
 		return fileIdentity{}, ErrExternalChange
 	}
 	var hash [32]byte
@@ -1391,6 +1417,18 @@ func scanDiskIdentityOpened(ctx context.Context, path string, file readStatFile,
 
 func sameFileVersion(left, right os.FileInfo) bool {
 	return left.Size() == right.Size() && left.ModTime().UnixNano() == right.ModTime().UnixNano() && os.SameFile(left, right)
+}
+
+type fileChangeStamp struct {
+	first, second int64
+	available     bool
+}
+
+func sameFileChange(left, right fileChangeStamp) bool {
+	if left.available != right.available {
+		return false
+	}
+	return !left.available || left.first == right.first && left.second == right.second
 }
 
 func detectEOL(sample []byte) EOLStyle {

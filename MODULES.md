@@ -179,7 +179,12 @@ pins the real target, opens a regular file, then scans the complete file once in
 - hashes all on-disk bytes;
 - counts all newline styles;
 - checks Context cancellation;
-- verifies before/after handle and path identity.
+- verifies before/after handle and path identity, including the OS change
+  generation (`ctime` on supported POSIX systems and `ChangeTime` on Windows).
+
+The change generation detects an in-place, same-length rewrite even when its
+mtime is restored, without a second content pass. Linux/BSD reuse metadata
+already returned by `stat`; Windows adds two constant-time handle queries.
 
 `Metadata.Path` is the requested absolute path and `ResolvedPath` is the pinned
 target. A symlink later redirected elsewhere does not change the save target.

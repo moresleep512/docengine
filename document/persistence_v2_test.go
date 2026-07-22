@@ -125,8 +125,43 @@ func TestOpenRejectsChangeAtEndOfScan(t *testing.T) {
 		}
 		return os.Stat(statPath)
 	}
-	if _, err := openSessionContext(context.Background(), path, OpenOptions{}, operations); !errors.Is(err, ErrExternalChange) {
+	session, err := openSessionContext(context.Background(), path, OpenOptions{}, operations)
+	if session != nil {
+		t.Cleanup(func() { _ = session.Close() })
+	}
+	if !errors.Is(err, ErrExternalChange) {
 		t.Fatalf("openSessionContext = %v", err)
+	}
+}
+
+func TestOpenRejectsMetadataPreservingChangeAtEndOfScan(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "changing-same-metadata")
+	original := bytes.Repeat([]byte{'a'}, scanBufferSize+1)
+	changed := bytes.Repeat([]byte{'b'}, len(original))
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operations := systemSessionOperations
+	operations.stat = func(statPath string) (os.FileInfo, error) {
+		if err := os.WriteFile(statPath, changed, initial.Mode()); err != nil {
+			return nil, err
+		}
+		if err := os.Chtimes(statPath, initial.ModTime(), initial.ModTime()); err != nil {
+			return nil, err
+		}
+		return os.Stat(statPath)
+	}
+	session, err := openSessionContext(context.Background(), path, OpenOptions{}, operations)
+	if session != nil {
+		t.Cleanup(func() { _ = session.Close() })
+	}
+	if !errors.Is(err, ErrExternalChange) {
+		t.Fatalf("metadata-preserving openSessionContext = %v", err)
 	}
 }
 
