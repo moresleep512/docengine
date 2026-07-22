@@ -1,6 +1,7 @@
 # Docengine
 
-[简体中文](README_zh.md) · [Development architecture and roadmap (Chinese)](develop.md)
+[简体中文](README_zh.md) · [Development architecture and roadmap (Chinese)](develop.md) ·
+[Implementation history and design decisions (Chinese)](modules_develop.md)
 
 Docengine is an experimental Go core for editing large local UTF-8 documents
 without loading the complete document into memory. It was extracted from the

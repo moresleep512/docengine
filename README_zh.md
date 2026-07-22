@@ -1,6 +1,7 @@
 # Docengine
 
-[English](README.md) · [发展设计与路线图](develop.md)
+[English](README.md) · [发展设计与路线图](develop.md) ·
+[模块开发历程与设计决策](modules_develop.md)
 
 Docengine 是一个实验阶段的 Go 本地 UTF-8 文档内核，目标是在不把完整文档载入
 内存的情况下编辑大型文件。它从 TypeMD 后端抽离，现已成为独立模块：
