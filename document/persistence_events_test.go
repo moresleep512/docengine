@@ -141,6 +141,113 @@ func TestSessionPersistenceEventsPostCommitFaultAndDurabilityRetry(t *testing.T)
 	})
 }
 
+func TestSessionPersistenceEventsTrackConcurrentEditAndCommittedSnapshot(t *testing.T) {
+	session, path, _ := openAtomicTestSession(t, "a")
+	if _, err := session.ApplyBatch(context.Background(), 0, []ReplaceOperation{{Start: 1, Insert: "x"}}); err != nil {
+		t.Fatal(err)
+	}
+	subscription, err := session.Subscribe(SubscribeOptions{Buffer: 8, FutureOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	captured, proceed := make(chan struct{}), make(chan struct{})
+	session.commitHook = func(stage string) {
+		if stage == "snapshot" {
+			close(captured)
+			<-proceed
+		}
+	}
+	type saveResult struct {
+		metadata Metadata
+		err      error
+	}
+	saved := make(chan saveResult, 1)
+	go func() {
+		metadata, saveErr := session.Save()
+		saved <- saveResult{metadata: metadata, err: saveErr}
+	}()
+	<-captured
+	if _, err := session.ApplyBatch(context.Background(), 1, []ReplaceOperation{{Start: 2, Insert: "y"}}); err != nil {
+		t.Fatal(err)
+	}
+	close(proceed)
+	result := <-saved
+	session.commitHook = nil
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+
+	events := drainEvents(subscription.Events(), 4, t)
+	started, changed, progress, complete := events[0], events[1], events[2], events[3]
+	operationID := started.Persistence.OperationID
+	if started.Kind != EventSaveStarted || changed.Kind != EventChanged || progress.Kind != EventSaveProgress || complete.Kind != EventSaved {
+		t.Fatalf("event order = %+v", events)
+	}
+	if operationID == 0 || progress.Persistence.OperationID != operationID || complete.Persistence.OperationID != operationID ||
+		started.Persistence.TargetRevision != 1 || progress.Persistence.TargetRevision != 1 || complete.Persistence.TargetRevision != 1 {
+		t.Fatalf("persistence correlation = %+v", events)
+	}
+	if started.Metadata.Revision != 1 || changed.Metadata.Revision != 2 || progress.Metadata.Revision != 1 ||
+		complete.Metadata.Revision != 2 || complete.Metadata.CommittedRevision != 1 || !complete.Metadata.Dirty ||
+		!complete.Persistence.Committed || complete.Persistence.CompletedBytes != complete.Persistence.TotalBytes {
+		t.Fatalf("revision metadata = %+v", events)
+	}
+	if result.metadata != complete.Metadata {
+		t.Fatalf("Save metadata = %+v, event = %+v", result.metadata, complete.Metadata)
+	}
+	if got := compactSessionContent(t, session); got != "axy" {
+		t.Fatalf("current content = %q", got)
+	}
+	if disk, err := os.ReadFile(path); err != nil || string(disk) != "ax" {
+		t.Fatalf("committed content = %q, %v", disk, err)
+	}
+	if err := errors.Join(subscription.Close(), session.Close()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSessionPersistenceEventsReportPartialWriteFailure(t *testing.T) {
+	session, path, _ := openAtomicTestSession(t, "abcdef")
+	if _, err := session.ApplyBatch(context.Background(), 0, []ReplaceOperation{{Start: 6, Insert: "Z"}}); err != nil {
+		t.Fatal(err)
+	}
+	subscription, err := session.Subscribe(SubscribeOptions{Buffer: 4, FutureOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sentinel := errors.New("mid-stream write")
+	session.operations.atomicChecked = func(_ string, _ os.FileMode, prefix []byte, write func(io.Writer) (int64, error), check func() error) (int64, error) {
+		if err := check(); err != nil {
+			return 0, err
+		}
+		n, err := write(&partialErrorWriter{err: sentinel})
+		return int64(len(prefix)) + n, err
+	}
+	if _, err := session.Save(); !errors.Is(err, sentinel) {
+		t.Fatalf("Save error = %v", err)
+	}
+	events := drainEvents(subscription.Events(), 3, t)
+	started, progress, failed := events[0], events[1], events[2]
+	if started.Kind != EventSaveStarted || progress.Kind != EventSaveProgress || failed.Kind != EventSaveFailed ||
+		started.Persistence.OperationID == 0 || progress.Persistence.OperationID != started.Persistence.OperationID ||
+		failed.Persistence.OperationID != started.Persistence.OperationID || progress.Persistence.CompletedBytes <= 0 ||
+		progress.Persistence.CompletedBytes >= progress.Persistence.TotalBytes ||
+		failed.Persistence.CompletedBytes != progress.Persistence.CompletedBytes || failed.Persistence.Committed ||
+		!errors.Is(failed.Cause, sentinel) {
+		t.Fatalf("partial-write events = %+v", events)
+	}
+	metadata := session.Metadata()
+	if metadata.Revision != 1 || metadata.CommittedRevision != 0 || !metadata.Dirty || session.Fault() != nil {
+		t.Fatalf("post-failure state = %+v, fault=%v", metadata, session.Fault())
+	}
+	if disk, err := os.ReadFile(path); err != nil || string(disk) != "abcdef" {
+		t.Fatalf("disk after failed write = %q, %v", disk, err)
+	}
+	if err := errors.Join(subscription.Close(), session.Close()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSaveProgressWriterBoundaries(t *testing.T) {
 	var reports []int64
 	w := newSaveProgressWriter(&shortErrorWriter{}, 0, 10, func(value int64) { reports = append(reports, value) })
@@ -208,6 +315,12 @@ type shortErrorWriter struct{}
 
 func (*shortErrorWriter) Write(value []byte) (int, error) {
 	return len(value) / 2, io.ErrShortWrite
+}
+
+type partialErrorWriter struct{ err error }
+
+func (w *partialErrorWriter) Write(value []byte) (int, error) {
+	return max(1, len(value)/2), w.err
 }
 
 func drainEvents(events <-chan SessionEvent, count int, t testing.TB) []SessionEvent {

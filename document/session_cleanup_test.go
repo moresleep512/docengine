@@ -1,9 +1,15 @@
 package document
 
 import (
+	"bufio"
+	"bytes"
 	"errors"
+	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -105,6 +111,78 @@ func TestOwnedSessionMarkerLockAndCrashReclamation(t *testing.T) {
 	}
 	if err := removeEmptyDirectory(dir); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOwnedSessionMarkerReleasedByProcessExit(t *testing.T) {
+	const childEnvironment = "DOCENGINE_MARKER_EXIT_TEST_CHILD"
+	if os.Getenv(childEnvironment) == "1" {
+		dir := os.Getenv("DOCENGINE_MARKER_EXIT_TEST_DIR")
+		marker, err := openOwnedSessionMarker(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".docengine-undo-crash.store"), []byte("orphan"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		fmt.Println("marker-ready")
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		// Deliberately do not close marker. The test is specifically about the
+		// operating system releasing the inherited file lock at process exit.
+		runtime.KeepAlive(marker)
+		return
+	}
+
+	root := filepath.Join(t.TempDir(), "sessions")
+	dir := filepath.Join(root, "crashed-child")
+	command := exec.Command(os.Args[0], "-test.run=^TestOwnedSessionMarkerReleasedByProcessExit$")
+	command.Env = append(os.Environ(), childEnvironment+"=1", "DOCENGINE_MARKER_EXIT_TEST_DIR="+dir)
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdin, err := command.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if command.ProcessState == nil {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+		}
+	})
+
+	scanner := bufio.NewScanner(stdout)
+	if !scanner.Scan() || scanner.Text() != "marker-ready" {
+		_ = stdin.Close()
+		_ = command.Wait()
+		t.Fatalf("child did not acquire marker lock: stdout=%q scan=%v stderr=%q", scanner.Text(), scanner.Err(), stderr.String())
+	}
+	cutoff := time.Now().Add(time.Hour)
+	stats, err := ReclaimStaleSessionDirectories(root, cutoff)
+	if err != nil || stats.Reclaimed != 0 || stats.Skipped != 1 {
+		_ = stdin.Close()
+		_ = command.Wait()
+		t.Fatalf("live child reclaim = (%+v, %v), stderr=%q", stats, err, stderr.String())
+	}
+
+	if err := stdin.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Wait(); err != nil {
+		t.Fatalf("child exit = %v, stderr=%q", err, stderr.String())
+	}
+	stats, err = ReclaimStaleSessionDirectories(root, cutoff)
+	if err != nil || stats.Reclaimed != 1 || stats.Skipped != 0 {
+		t.Fatalf("post-exit reclaim = (%+v, %v)", stats, err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("crashed child directory remains: %v", err)
 	}
 }
 

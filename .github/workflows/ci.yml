@@ -67,6 +67,7 @@ jobs:
           cache: true
       - run: go test ./document/store -run=^$ -fuzz=FuzzTreeMatchesReference -fuzztime=10s
       - run: go test ./document/store -run=^$ -fuzz=FuzzTreeConcurrentReadDuringEdits -fuzztime=10s
+      - run: go test ./document/store -run=^$ -fuzz=FuzzTreeCompactionPreservesSnapshots -fuzztime=10s
       - run: go test ./recovery -run=^$ -fuzz=FuzzJournalDecoders -fuzztime=10s
       - run: go test ./recovery -run=^$ -fuzz=FuzzJournalStateMachine -fuzztime=10s
       - run: go test ./recovery -run=^$ -fuzz=FuzzJournalBatchOperationsDecode -fuzztime=10s

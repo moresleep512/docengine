@@ -1,6 +1,7 @@
 package document
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -141,6 +142,83 @@ func TestSessionCompactReturnsJournalCheckpointFailure(t *testing.T) {
 	result, err := session.Compact(context.Background(), CompactOptions{CheckpointJournal: true})
 	if !errors.Is(err, sentinel) || result.JournalCheckpointed {
 		t.Fatalf("checkpoint failure = (%+v, %v)", result, err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSessionCompactCheckpointPreservesConcurrentEditAndOldSnapshot(t *testing.T) {
+	session, path, _ := openAtomicTestSession(t, "a")
+	if _, err := session.ApplyBatch(context.Background(), 0, []ReplaceOperation{{Start: 1, Insert: "x"}}); err != nil {
+		t.Fatal(err)
+	}
+	oldJournalPath := session.journal.Path()
+	revision, oldSnapshot, err := session.Snapshot()
+	if err != nil || revision != 1 {
+		t.Fatalf("Snapshot = (%d, %v)", revision, err)
+	}
+	captured, proceed := make(chan struct{}), make(chan struct{})
+	session.commitHook = func(stage string) {
+		if stage == "snapshot" {
+			close(captured)
+			<-proceed
+		}
+	}
+	type compactResult struct {
+		result CompactionResult
+		err    error
+	}
+	completed := make(chan compactResult, 1)
+	go func() {
+		result, compactErr := session.Compact(context.Background(), CompactOptions{CheckpointJournal: true})
+		completed <- compactResult{result: result, err: compactErr}
+	}()
+	<-captured
+	if _, err := session.ApplyBatch(context.Background(), 1, []ReplaceOperation{{Start: 2, Insert: "y"}}); err != nil {
+		t.Fatal(err)
+	}
+	close(proceed)
+	compact := <-completed
+	session.commitHook = nil
+	if compact.err != nil {
+		t.Fatal(compact.err)
+	}
+	if !compact.result.JournalCheckpointed || compact.result.Metadata.Revision != 2 ||
+		compact.result.Metadata.CommittedRevision != 1 || !compact.result.Metadata.Dirty ||
+		compact.result.Pieces.AfterPieces > compact.result.Pieces.BeforePieces {
+		t.Fatalf("compaction = %+v", compact.result)
+	}
+	if got := compactSessionContent(t, session); got != "axy" {
+		t.Fatalf("current content = %q", got)
+	}
+	if disk, err := os.ReadFile(path); err != nil || string(disk) != "ax" {
+		t.Fatalf("checkpoint content = %q, %v", disk, err)
+	}
+	if session.journal == nil || session.journal.Path() == oldJournalPath || len(session.pending) != 1 {
+		t.Fatalf("rebased journal = %v, pending=%d", session.journal, len(session.pending))
+	}
+	var snapshotContent bytes.Buffer
+	if n, err := oldSnapshot.WriteTo(&snapshotContent); err != nil || n != 2 || snapshotContent.String() != "ax" {
+		t.Fatalf("old Snapshot = (%d, %v, %q)", n, err, snapshotContent.String())
+	}
+	if _, err := os.Stat(oldJournalPath); err != nil {
+		t.Fatalf("old journal retired before Snapshot close: %v", err)
+	}
+	if err := oldSnapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(oldJournalPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old journal remains after Snapshot close: %v", err)
+	}
+	if _, err := oldSnapshot.ReadAt(make([]byte, 1), 0); !errors.Is(err, ErrClosed) {
+		t.Fatalf("closed Snapshot ReadAt = %v", err)
+	}
+	if _, err := session.Undo(); err != nil || compactSessionContent(t, session) != "ax" {
+		t.Fatalf("Undo after concurrent compaction = %v", err)
+	}
+	if _, err := session.Redo(); err != nil || compactSessionContent(t, session) != "axy" {
+		t.Fatalf("Redo after concurrent compaction = %v", err)
 	}
 	if err := session.Close(); err != nil {
 		t.Fatal(err)

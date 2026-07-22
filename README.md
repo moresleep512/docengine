@@ -175,9 +175,10 @@ No compatibility promise applies before 1.0.
 ## Testing
 
 The repository requires 100% statement coverage for every current package and
-contains fifteen Go fuzz targets:
+contains sixteen Go fuzz targets:
 
-- Piece Tree reference-model and concurrent snapshot/edit fuzzers;
+- Piece Tree reference-model, concurrent snapshot/edit, and compaction/Snapshot
+  preservation fuzzers;
 - v2 header, operation decoder, replay-resilience, and stateful journal fuzzers;
 - Session state-machine, concurrent save/edit, crash-recovery, and UTF-8 edit
   boundary fuzzers;
@@ -223,6 +224,7 @@ Run the fuzz targets:
 ```bash
 go test ./document/store -run=^$ -fuzz=FuzzTreeMatchesReference -fuzztime=30s
 go test ./document/store -run=^$ -fuzz=FuzzTreeConcurrentReadDuringEdits -fuzztime=30s
+go test ./document/store -run=^$ -fuzz=FuzzTreeCompactionPreservesSnapshots -fuzztime=30s
 go test ./recovery -run=^$ -fuzz=FuzzJournalDecoders -fuzztime=30s
 go test ./recovery -run=^$ -fuzz=FuzzJournalStateMachine -fuzztime=30s
 go test ./recovery -run=^$ -fuzz=FuzzJournalBatchOperationsDecode -fuzztime=30s

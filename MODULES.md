@@ -339,7 +339,7 @@ Every current package is held at 100% statement coverage. Tests include
 platform-specific replacement and directory-sync faults, complete UTF-8 and
 identity boundaries, every recovery batch truncation, transaction rollback,
 concurrent save/rebase, post-commit fault behavior, snapshot lifetime, integer
-overflow, randomized reference models, race runs, and fifteen fuzz targets.
+overflow, randomized reference models, race runs, and sixteen fuzz targets.
 Event-specific tests exercise resumable history, exact overflow accounting,
 save progress and failure phase, WAL Sync failure/restoration, concurrent
 publish/unsubscribe, final-event delivery, and the close barrier. Lifecycle and
