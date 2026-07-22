@@ -23,10 +23,19 @@ It currently provides:
 - revision-checked atomic edit batches and disk-backed undo/redo;
 - a v2 append-only crash journal whose only durable edit unit is a batch;
 - full-file UTF-8 validation and SHA-256 base identity;
+- UTF-8-boundary-safe transactional edits and recovery replay;
 - streaming, conflict-checked atomic saves;
 - POSIX parent-directory synchronization and Windows `ReplaceFileW` with
   write-through replacement plus bounded transient-error retry;
-- symlink-target pinning and explicit post-commit fault handling.
+- symlink-target pinning and explicit post-commit fault handling;
+- revision-bound byte/line/rune coordinate indexes with bounded reads and
+  conservative ChangeMap-driven checkpoint-prefix reuse;
+- sequential ChangeMaps and affinity-aware Anchors returned by edits,
+  undo, and redo;
+- bounded, resumable Session event streams with precise slow-consumer loss
+  reporting and a concurrent close barrier;
+- resolved Session resource limits, journal sync cadence, and explicit shared
+  or owned runtime-directory policies.
 
 It does not yet provide full-text search, Page/Fragment virtualization,
 multi-source composition, collaboration, remote storage, UI, or a stable 1.0
@@ -49,13 +58,13 @@ Future host: desktop / CLI / service / format adapter
                          |
                          v
                    document.Session
-          revision, transaction, history, save
-             /             |              \
-            v              v               v
-   document/store       recovery       document/save
-    Piece Tree       v2 batch WAL     atomic replace
-             \             |              /
-              +------------+-------------+
+       revision, transaction, history, save
+       /          |          |            \
+      v           v          v             v
+ document/store recovery document/save document/coordinate
+  Piece Tree   v2 WAL    atomic replace  index / ChangeMap
+       \          |          /             /
+        +---------+---------+-------------+
                            |
                            v
                 OS files and io.ReaderAt
@@ -85,6 +94,39 @@ Requested and resolved paths are both reported; saves remain pinned to the
 resolved target. A failure after replacement puts the Session into a readable
 but permanently non-mutating fault state instead of continuing unsafely.
 
+`OpenOptions` resolves zero-valued limits to documented defaults: 256
+operations per batch, 1 MiB per insertion, 256 MiB of undo storage, 256 retained
+events, and a one-second journal sync interval. Explicit directories are shared
+by default; an omitted Session directory is unique and owned. Undo files use
+collision-free temporary names and are removed on close. Owned directories are
+removed only when they are actual empty directories, while dirty recovery
+journals and unknown host files are preserved. `Session.Config` reports the
+resolved policy.
+
+`Session.Subscribe` atomically joins retained history to live events. Each
+subscriber has a bounded queue and never blocks a transaction; when its queue
+overflows, the newest event replaces stale pending events and reports the exact
+omitted count in `Dropped`. `AfterSequence` resumes a consumer when history is
+still available and also reports any history gap. Open, recovery, committed
+Apply/Undo/Redo changes, and close are currently published. Concurrent `Close`
+callers wait for the same resource-retirement barrier and receive the same
+result.
+
+`document/coordinate` builds an immutable index for one Snapshot revision.
+Checkpoints are placed only at UTF-8 boundaries, so byte/line/rune queries read
+at most one bounded checkpoint window. `ChangeMap` transforms Anchors and
+ranges across the sequential replacements in one committed edit, including
+explicit before/after insertion affinity. A Session coordinate index owns its
+Snapshot lease until `Close`.
+
+`coordinate.Rebuild` and `RebuildOwned` accept the exact ChangeMap chain from a
+previous Index to a new immutable Source. They validate both revisions and
+lengths, inherit the checkpoint interval, reuse only the prefix ending at or
+before every sequential edit, and rescan the remaining new content. This avoids
+unsafe suffix shifting when line/column state cannot be proved unchanged.
+`Session.RebuildCoordinateIndex` supplies the current Snapshot lease; Stats
+reports reused checkpoints and scanned bytes.
+
 See [MODULES.md](MODULES.md) for implementation invariants and file-format
 details.
 
@@ -105,21 +147,35 @@ No compatibility promise applies before 1.0.
 ## Testing
 
 The repository requires 100% statement coverage for every current package and
-contains nine Go fuzz targets:
+contains fourteen Go fuzz targets:
 
 - Piece Tree reference-model and concurrent snapshot/edit fuzzers;
 - v2 header, operation decoder, replay-resilience, and stateful journal fuzzers;
-- Session state-machine, concurrent save/edit, and crash-recovery fuzzers.
+- Session state-machine, concurrent save/edit, crash-recovery, and UTF-8 edit
+  boundary fuzzers;
+- resumable event-history, subscriber-overflow, and close state-machine fuzzing;
+- UTF-8 coordinate-reference, ChangeMap composition, and incremental-versus-
+  full-index equivalence fuzzers.
 
 Tests cover malformed and byte-truncated batches, state publication rollback,
 same-size/same-mtime external modification, full-file and boundary-split UTF-8,
 symlink retargeting, concurrent edit/save/recovery, platform durability faults,
-and the post-commit read-only state.
+the post-commit read-only state, configured resource limits, concurrent shared
+runtime directories, and owned-directory cleanup.
+Event tests additionally cover exact loss accounting, replay cursors, a final
+close event under queue overflow, concurrent publish/unsubscribe, and multiple
+callers waiting on one close barrier.
 
 The v0.3.0 release suite was run on native Windows and Debian under WSL 2 using
 a native Linux temporary directory. On both platforms every package reached
-100% statement coverage, `-race -shuffle=on -count=3` passed, and each fuzz
-target ran for at least 30 seconds without a failing implementation input.
+100% statement coverage, `-race -shuffle=on -count=3` passed, and three core
+fuzz targets ran for at least 30 seconds without a failing implementation input.
+
+The current v0.4 coordinate, lifecycle, and event foundations were verified on
+native Windows and in a WSL native-Linux directory: all five packages remained
+at 100% statement coverage, three shuffled race runs passed, and all eight
+affected Session, event, and coordinate fuzz targets passed 10-second runs on
+both platforms.
 
 Run the normal checks:
 
@@ -143,6 +199,11 @@ go test ./recovery -run=^$ -fuzz=FuzzJournalReplayResilience -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzSessionStateMachine -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzSessionConcurrentSaveEdit -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzSessionCrashRecovery -fuzztime=30s
+go test ./document -run=^$ -fuzz=FuzzUTF8ReplacementBoundaries -fuzztime=30s
+go test ./document -run=^$ -fuzz=FuzzEventHubStateMachine -fuzztime=30s
+go test ./document/coordinate -run=^$ -fuzz=FuzzIndexMatchesUTF8Reference -fuzztime=30s
+go test ./document/coordinate -run=^$ -fuzz=FuzzChangeMapBoundsAndComposition -fuzztime=30s
+go test ./document/coordinate -run=^$ -fuzz=FuzzIncrementalIndexMatchesFullBuild -fuzztime=30s
 ```
 
 Windows race builds require a GCC-compatible MinGW-w64 toolchain; MSVC-target
@@ -150,21 +211,28 @@ Windows race builds require a GCC-compatible MinGW-w64 toolchain; MSVC-target
 
 ## Current limitations
 
-- Session limits, sync cadence, undo quota, and transient-directory ownership
-  are still partly hard-coded.
+- Process crashes can leave orphaned ephemeral Session directories; they are
+  collision-safe but automatic stale-process reclamation is not implemented.
 - A post-replacement rebind failure deliberately stops mutation; an explicit
   reopen is required.
 - External-change checking still has the unavoidable final hash-to-replace
   race unless a host provides stronger file locking.
-- Piece/journal/undo compaction, stable coordinate maps, events, indexing,
-  virtualization, and composition are not implemented.
+- Incremental coordinate rebuilding requires the exact caller-retained
+  ChangeMap chain and conservatively rescans from the earliest affected
+  checkpoint. Session-managed multi-revision map retention, automatic caching,
+  and proven suffix reuse are not implemented.
+- Save, fault, external change, and background-progress event kinds are not yet
+  published.
+- Piece/journal/undo compaction, search indexing, virtualization, and
+  composition are not implemented.
 - The API and on-disk formats remain unstable until 1.0.
 
 ## Next work
 
-The next required foundation is configurable Session lifecycle plus
-byte/line/rune coordinates and cross-revision ChangeMap. Format-neutral logical
-Page/Fragment virtualization follows that foundation, then built-in persistent
-search and multi-source composition. The decision-complete target architecture,
-readiness assessment, edge cases, and v0.4–v1.0 milestones are in
-[develop.md](develop.md).
+The next v0.4 work is stale-session reclamation, retained multi-revision change
+chains and batch anchor transforms, the remaining persistence/progress event
+kinds, and the first compaction policy.
+Format-neutral logical Page/Fragment virtualization then builds on these
+foundations, followed by persistent search and multi-source composition. The
+decision-complete target architecture, readiness assessment, edge cases, and
+v0.4–v1.0 milestones are in [develop.md](develop.md).

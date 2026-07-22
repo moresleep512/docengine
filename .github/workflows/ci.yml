@@ -49,7 +49,7 @@ jobs:
       - name: Require full statement coverage
         shell: bash
         run: |
-          for package in ./document ./document/save ./document/store ./recovery; do
+          for package in ./document ./document/coordinate ./document/save ./document/store ./recovery; do
             profile="$(mktemp)"
             go test -coverprofile="$profile" "$package"
             total="$(go tool cover -func="$profile" | awk '/^total:/ { print $3 }')"
@@ -74,3 +74,8 @@ jobs:
       - run: go test ./document -run=^$ -fuzz=FuzzSessionStateMachine -fuzztime=10s
       - run: go test ./document -run=^$ -fuzz=FuzzSessionConcurrentSaveEdit -fuzztime=10s
       - run: go test ./document -run=^$ -fuzz=FuzzSessionCrashRecovery -fuzztime=10s
+      - run: go test ./document -run=^$ -fuzz=FuzzUTF8ReplacementBoundaries -fuzztime=10s
+      - run: go test ./document -run=^$ -fuzz=FuzzEventHubStateMachine -fuzztime=10s
+      - run: go test ./document/coordinate -run=^$ -fuzz=FuzzIndexMatchesUTF8Reference -fuzztime=10s
+      - run: go test ./document/coordinate -run=^$ -fuzz=FuzzChangeMapBoundsAndComposition -fuzztime=10s
+      - run: go test ./document/coordinate -run=^$ -fuzz=FuzzIncrementalIndexMatchesFullBuild -fuzztime=10s
