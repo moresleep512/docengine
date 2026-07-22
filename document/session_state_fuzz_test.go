@@ -15,7 +15,7 @@ import (
 // the recovery journal in isolation, but never the coordination layer that
 // owns revision history, undo/redo, the WAL, and atomic save together.
 //
-// A byte program drives ApplyBatch / Undo / Redo / Save / Snapshot against a
+// A byte program drives ApplyBatch / Undo / Redo / Save / Compact / Snapshot against a
 // single open session. A parallel reference model maintains the document
 // content and the undo/redo edit stacks, and after every operation the live
 // session content is asserted byte-for-byte equal to the model. After every
@@ -83,7 +83,7 @@ func FuzzSessionStateMachine(f *testing.F) {
 			if !ok {
 				break
 			}
-			switch op % 5 {
+			switch op % 6 {
 			case 0: // ApplyBatch (one operation)
 				startByte, ok1 := readByte()
 				deleteByte, ok2 := readByte()
@@ -157,7 +157,12 @@ func FuzzSessionStateMachine(f *testing.F) {
 				if disk, err := os.ReadFile(path); err != nil || !bytes.Equal(disk, reference) {
 					t.Fatalf("disk after save = %q (err %v), want %q", disk, err, reference)
 				}
-			case 4: // Snapshot + verify
+			case 4: // Piece/undo compaction + verify
+				if _, err := session.Compact(context.Background(), CompactOptions{}); err != nil {
+					t.Fatalf("Compact: %v", err)
+				}
+				assertContent()
+			case 5: // Snapshot + verify
 				_, lease, err := session.Snapshot()
 				if err != nil {
 					t.Fatalf("Snapshot: %v", err)

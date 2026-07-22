@@ -214,3 +214,24 @@ func (s *Session) TransformAnchors(fromRevision, toRevision uint64, anchors []co
 	}
 	return changes.TransformAnchors(anchors)
 }
+
+// TransformRanges applies the retained map between two revisions to a batch
+// of format-neutral anchored ranges. Input order and endpoint affinities are
+// preserved, and validation is atomic.
+func (s *Session) TransformRanges(fromRevision, toRevision uint64, values []coordinate.AnchoredRange) ([]coordinate.AnchoredRange, error) {
+	s.mu.RLock()
+	if len(values) > s.config.Limits.MaxAnchorBatch {
+		s.mu.RUnlock()
+		return nil, ErrLimitExceeded
+	}
+	history := s.changeHistory.clone()
+	s.mu.RUnlock()
+	changes, err := history.between(fromRevision, toRevision)
+	if err != nil {
+		return nil, err
+	}
+	if changes.Len() > 0 && len(values) > maximumAnchorTransformSteps/2/changes.Len() {
+		return nil, ErrLimitExceeded
+	}
+	return changes.TransformRanges(values)
+}

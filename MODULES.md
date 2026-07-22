@@ -200,7 +200,15 @@ unique `.docengine-undo-*.store`, so concurrent Sessions may share a directory.
 Close removes its undo file. Owned directories are removed only after `Lstat`
 confirms a directory, `ReadDir` confirms it is empty, and all owned handles have
 retired. Dirty journals and unknown entries are never recursively removed.
-Crash-orphan reclamation remains a later lifecycle task.
+
+Owned Session directories also contain `.docengine-session-v1`. Its file lock
+is held for the Session lifetime. Automatic startup cleanup scans only old
+directories, while `ReclaimStaleSessionDirectories` accepts an explicit cutoff;
+both require a valid marker, an acquirable lock, and exclusively recognized
+regular undo entries. Active locks, symlinks, malformed markers, and unknown
+files are preserved. Cleanup failures elsewhere in the shared root do not block
+a new Session, while an active owner of the exact requested directory returns
+`ErrSessionInUse`.
 
 ### Transactions and history
 
@@ -234,13 +242,24 @@ recovery, each non-empty Apply/Undo/Redo commit, and final close are published;
 failed and no-op transactions publish nothing. Change events contain the same
 immutable `ChangeMap` returned by the transaction.
 
+An actual save attempt additionally publishes start, bounded byte progress,
+and saved or failed events correlated by `PersistenceProgress.OperationID`.
+The committed flag separates errors before atomic replacement from permanent
+post-commit rebinding faults. A committed POSIX `DurabilityError` is carried by
+`EventSaved`, not misreported as an uncommitted failure. Background and final
+recovery-WAL Sync failures publish one transition event, repeated failures are
+coalesced, and the first successful Sync or clean save publishes restoration.
+`Metadata.RecoveryDurabilityUncertain` makes the current state reconstructible
+even if the transition event was dropped. Final Sync failure is included in
+the shared `Close` result.
+
 The final close event survives subscriber overflow. Its channel is then closed.
 The first `Session.Close` retires resources, while all concurrent Close callers
 wait on one barrier and return the same joined cleanup result. Explicit
 subscription close is idempotent and races safely with publication and Session
 close.
 
-### Retained changes and batch anchors
+### Retained changes, ranges, and annotations
 
 Session retains a dedicated bounded ring of committed Apply/Undo/Redo
 ChangeMaps. The default is 256 transaction maps and the hard maximum is 4,096;
@@ -256,10 +275,29 @@ reverse query. A revision older than the ring returns
 requested and retained windows. Stats and retained maps remain available after
 Session close.
 
-`TransformAnchors` preserves input order and validates the entire input before
-returning output. Session applies both a configured Anchor-count limit and a
-fixed checked work budget, and releases its lock before the pure transformation
-loop. Invalid input and budget failures return no partial result.
+`TransformAnchors` and `TransformRanges` preserve input order and validate the
+entire input before returning output. Session applies both a configured count
+limit and a fixed checked work budget, and releases its lock before the pure
+transformation loop. Invalid input, inverted endpoint affinity, and budget
+failures return no partial result. `coordinate.Annotation[T]` associates an
+opaque host payload with an anchored range; the core copies but never
+interprets that value.
+
+### First-generation compaction
+
+`store.Tree.Compact` coalesces only logical neighbors backed by contiguous
+bytes in the same Source. It does not read source bytes, mutate existing roots,
+or invalidate immutable Snapshots. The undo store compactor copies unique live
+references to a replacement temporary store, switches only after all copies
+succeed, remaps both history stacks, and reports retired-file cleanup errors
+without losing the valid replacement mapping.
+
+`Session.Compact` always runs Piece and undo compaction. Journal compaction is
+selected explicitly with `CompactOptions.CheckpointJournal`: the Session saves
+the selected revision, installs a new Source generation, and retires the old
+append-only WAL after Snapshot leases release. Docengine never rewrites an
+uncommitted WAL in place because a collapsed batch could not preserve both
+revision boundaries and crash atomicity.
 
 ### Snapshot generations
 
@@ -290,9 +328,10 @@ the cause. This prevents continued mutation on a partially rebound generation.
 
 The core intentionally retains generic text policy—UTF-8, BOM, newline
 metadata, revisions, ranges, and byte-oriented search foundations—but no format
-semantics. Crash-orphan reclamation, compaction, generic retained intervals,
-persistence/progress event kinds, virtualization, and search indexing still
-require later work. See [develop.md](develop.md).
+semantics. The remaining higher layers are Page/Fragment virtualization,
+persistent search, multi-source composition, automatic cache/index ownership,
+file-watcher integration, and production observability. See
+[develop.md](develop.md).
 
 ## Verification
 
@@ -302,7 +341,10 @@ identity boundaries, every recovery batch truncation, transaction rollback,
 concurrent save/rebase, post-commit fault behavior, snapshot lifetime, integer
 overflow, randomized reference models, race runs, and fifteen fuzz targets.
 Event-specific tests exercise resumable history, exact overflow accounting,
-concurrent publish/unsubscribe, final-event delivery, and the close barrier.
+save progress and failure phase, WAL Sync failure/restoration, concurrent
+publish/unsubscribe, final-event delivery, and the close barrier. Lifecycle and
+compaction tests cover marker locks, conservative orphan reclamation, cleanup
+faults, live undo remapping, journal checkpoints, and Snapshot preservation.
 Incremental-index tests compare every byte, rune, and line coordinate with a
 fresh full build across randomized sequential UTF-8 edits.
 Change-history state-machine fuzzing covers bounded eviction, unavailable batch
@@ -313,8 +355,8 @@ on a native Linux temporary directory: every package reported 100% statement
 coverage, three shuffled race runs passed, and all three fuzz targets ran for
 at least 30 seconds on each platform.
 
-The v0.4 coordinate, lifecycle, and event foundations were checked on native
-Windows and in a WSL native-Linux directory. All five packages retained 100%
-statement coverage, three shuffled race runs passed, and the nine affected
-Session, event, and coordinate fuzz targets passed 10-second runs on both
+The completed v0.4 release suite was checked on native Windows and in a WSL
+native-Linux directory. All five packages retained 100% statement coverage,
+three shuffled race runs passed, and the nine affected Session, event,
+change-history, and coordinate fuzz targets passed 10-second runs on both
 platforms.

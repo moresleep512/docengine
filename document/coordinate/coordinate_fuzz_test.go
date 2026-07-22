@@ -110,6 +110,30 @@ func FuzzChangeMapBoundsAndComposition(f *testing.F) {
 				t.Fatalf("batch anchor %d = %+v, want %+v", index, batch[index], want)
 			}
 		}
+		ranges := make([]AnchoredRange, 0, length+1)
+		annotations := make([]Annotation[int64], 0, length+1)
+		for offset := int64(0); offset <= length; offset++ {
+			value := AnchoredRange{
+				Start: Anchor{Offset: 0, Affinity: AffinityBefore},
+				End:   Anchor{Offset: offset, Affinity: AffinityAfter},
+			}
+			ranges = append(ranges, value)
+			annotations = append(annotations, Annotation[int64]{Range: value, Value: offset})
+		}
+		mappedRanges, err := change.TransformRanges(ranges)
+		if err != nil || len(mappedRanges) != len(ranges) {
+			t.Fatalf("TransformRanges = (%d,%v), want %d", len(mappedRanges), err, len(ranges))
+		}
+		mappedAnnotations, err := TransformAnnotations(change, annotations)
+		if err != nil || len(mappedAnnotations) != len(annotations) {
+			t.Fatalf("TransformAnnotations = (%d,%v), want %d", len(mappedAnnotations), err, len(annotations))
+		}
+		for index := range ranges {
+			want, _ := change.TransformRange(ranges[index])
+			if mappedRanges[index] != want || mappedAnnotations[index].Range != want || mappedAnnotations[index].Value != annotations[index].Value {
+				t.Fatalf("range %d = (%+v,%+v), want %+v", index, mappedRanges[index], mappedAnnotations[index], want)
+			}
+		}
 		inverse := change.Invert()
 		composed, err := change.Compose(inverse)
 		if err != nil || composed.BeforeLength() != length || composed.AfterLength() != length {

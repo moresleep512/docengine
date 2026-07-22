@@ -52,6 +52,13 @@ type Tree struct {
 	rng     uint64
 }
 
+// CompactResult reports structural Piece Tree compaction. Byte content and
+// existing immutable Snapshots are unchanged.
+type CompactResult struct {
+	BeforePieces int64
+	AfterPieces  int64
+}
+
 func New(base io.ReaderAt, length int64) (*Tree, error) {
 	return NewWithBasePiece(base, Piece{Source: SourceBase, Length: length})
 }
@@ -110,6 +117,41 @@ func (t *Tree) Snapshot() Snapshot {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return Snapshot{root: t.root, sources: cloneSources(t.sources)}
+}
+
+// Compact coalesces logically adjacent pieces that reference contiguous bytes
+// from the same source. It never reads or rewrites source content and therefore
+// remains bounded by the number of pieces rather than document size.
+func (t *Tree) Compact() CompactResult {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	result := CompactResult{BeforePieces: nodePieceCount(t.root)}
+	if result.BeforePieces < 2 {
+		result.AfterPieces = result.BeforePieces
+		return result
+	}
+	pieces := make([]Piece, 0, result.BeforePieces)
+	_ = walk(t.root, func(piece Piece) error {
+		last := len(pieces) - 1
+		if last >= 0 && pieces[last].Source == piece.Source && pieces[last].Offset+pieces[last].Length == piece.Offset {
+			pieces[last].Length += piece.Length
+			if pieces[last].NewlinesKnown && piece.NewlinesKnown {
+				pieces[last].Newlines += piece.Newlines
+			} else {
+				pieces[last].Newlines, pieces[last].NewlinesKnown = 0, false
+			}
+			return nil
+		}
+		pieces = append(pieces, piece)
+		return nil
+	})
+	var root *node
+	for _, piece := range pieces {
+		root = merge(root, t.makeNode(piece, nil, nil))
+	}
+	t.root = root
+	result.AfterPieces = int64(len(pieces))
+	return result
 }
 
 func (t *Tree) Restore(snapshot Snapshot) {

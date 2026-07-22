@@ -180,6 +180,18 @@ func TestSessionChangeHistoryAndBatchAnchors(t *testing.T) {
 	if got, err := session.TransformAnchors(0, 4, anchors); !errors.Is(err, ErrChangeHistoryExpired) || got != nil {
 		t.Fatalf("expired anchor transform = (%+v, %v)", got, err)
 	}
+	ranges := []coordinate.AnchoredRange{{Start: anchors[0], End: anchors[1]}}
+	mappedRanges, err := session.TransformRanges(2, 4, ranges)
+	wantRanges, _ := want.TransformRanges(ranges)
+	if err != nil || len(mappedRanges) != 1 || mappedRanges[0] != wantRanges[0] {
+		t.Fatalf("Session ranges = (%+v, %v), want %+v", mappedRanges, err, wantRanges)
+	}
+	if got, err := session.TransformRanges(2, 4, make([]coordinate.AnchoredRange, 4)); !errors.Is(err, ErrLimitExceeded) || got != nil {
+		t.Fatalf("range limit = (%+v, %v)", got, err)
+	}
+	if got, err := session.TransformRanges(0, 4, ranges); !errors.Is(err, ErrChangeHistoryExpired) || got != nil {
+		t.Fatalf("expired range transform = (%+v, %v)", got, err)
+	}
 	if err := previousIndex.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -197,6 +209,16 @@ func TestSessionChangeHistoryAndBatchAnchors(t *testing.T) {
 	}
 	if got, err := session.TransformAnchors(100, 101, tooMuchWork); !errors.Is(err, ErrLimitExceeded) || got != nil {
 		t.Fatalf("anchor work limit = (%d, %v)", len(got), err)
+	}
+	tooManyRanges := make([]coordinate.AnchoredRange, maximumAnchorTransformSteps/2/len(largeEdits)+1)
+	for index := range tooManyRanges {
+		tooManyRanges[index] = coordinate.AnchoredRange{
+			Start: coordinate.Anchor{Affinity: coordinate.AffinityBefore},
+			End:   coordinate.Anchor{Affinity: coordinate.AffinityAfter},
+		}
+	}
+	if got, err := session.TransformRanges(100, 101, tooManyRanges); !errors.Is(err, ErrLimitExceeded) || got != nil {
+		t.Fatalf("range work limit = (%d, %v)", len(got), err)
 	}
 	if err := session.Close(); err != nil {
 		t.Fatal(err)

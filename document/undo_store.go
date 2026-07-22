@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -21,6 +22,7 @@ type undoStore struct {
 	size   int64
 	quota  int64
 	remove func(string) error
+	create func(string, string) (*os.File, error)
 }
 
 type undoStoreOperations struct {
@@ -48,7 +50,7 @@ func openUndoStoreWith(sessionDir string, quota int64, operations undoStoreOpera
 	if err != nil {
 		return nil, err
 	}
-	return &undoStore{file: file, path: file.Name(), quota: quota, remove: operations.remove}, nil
+	return &undoStore{file: file, path: file.Name(), quota: quota, remove: operations.remove, create: operations.createTemp}, nil
 }
 
 func (s *undoStore) append(value []byte) (textRef, error) {
@@ -106,6 +108,79 @@ func (s *undoStore) reset() error {
 	}
 	s.size = 0
 	return nil
+}
+
+// rewrite compacts the store to the unique live references supplied by the
+// caller. A non-nil mapping always describes the active replacement store,
+// even when removing the retired temporary file reports an error.
+func (s *undoStore) rewrite(refs []textRef) (map[textRef]textRef, error) {
+	if s == nil {
+		return map[textRef]textRef{}, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.file == nil {
+		return nil, ErrClosed
+	}
+	unique := make([]textRef, 0, len(refs))
+	seen := make(map[textRef]struct{}, len(refs))
+	for _, ref := range refs {
+		if ref.length == 0 {
+			continue
+		}
+		if ref.offset < 0 || ref.length < 0 || ref.offset > s.size || ref.length > s.size-ref.offset {
+			return nil, io.ErrUnexpectedEOF
+		}
+		if _, ok := seen[ref]; !ok {
+			seen[ref] = struct{}{}
+			unique = append(unique, ref)
+		}
+	}
+	if len(unique) == 0 {
+		if err := s.file.Truncate(0); err != nil {
+			return nil, err
+		}
+		s.size = 0
+		return map[textRef]textRef{}, nil
+	}
+	file, err := s.create(filepath.Dir(s.path), ".docengine-undo-*.store")
+	if err != nil {
+		return nil, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = file.Close()
+			_ = s.remove(file.Name())
+		}
+	}()
+	mapping := make(map[textRef]textRef, len(unique))
+	var size int64
+	for _, ref := range unique {
+		if _, err := io.CopyN(file, io.NewSectionReader(s.file, ref.offset, ref.length), ref.length); err != nil {
+			return nil, err
+		}
+		mapping[ref] = textRef{offset: size, length: ref.length}
+		size += ref.length
+	}
+	oldFile, oldPath := s.file, s.path
+	s.file, s.path, s.size = file, file.Name(), size
+	committed = true
+	closeErr := oldFile.Close()
+	removeErr := s.remove(oldPath)
+	if errors.Is(removeErr, os.ErrNotExist) {
+		removeErr = nil
+	}
+	return mapping, errors.Join(closeErr, removeErr)
+}
+
+func (s *undoStore) bytes() int64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.size
 }
 
 func (s *undoStore) close() error {

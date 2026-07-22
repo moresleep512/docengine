@@ -31,6 +31,13 @@ type AnchoredRange struct {
 	End   Anchor
 }
 
+// Annotation attaches an opaque host value to a format-neutral anchored
+// range. The coordinate package never interprets Value.
+type Annotation[T any] struct {
+	Range AnchoredRange
+	Value T
+}
+
 // Edit uses coordinates in the document state produced by all preceding edits
 // in the same ChangeMap.
 type Edit struct {
@@ -130,6 +137,58 @@ func (m ChangeMap) TransformRange(value AnchoredRange) (AnchoredRange, error) {
 		return AnchoredRange{}, ErrInvertedRange
 	}
 	return AnchoredRange{Start: start, End: end}, nil
+}
+
+// TransformRanges applies this map to a range batch while preserving input
+// order. Validation is atomic: invalid input or an inverted transformed range
+// returns no partial result.
+func (m ChangeMap) TransformRanges(values []AnchoredRange) ([]AnchoredRange, error) {
+	if values == nil {
+		return nil, nil
+	}
+	for _, value := range values {
+		if value.Start.Offset > value.End.Offset {
+			return nil, ErrInvalidRange
+		}
+		for _, anchor := range [...]Anchor{value.Start, value.End} {
+			if anchor.Affinity != AffinityBefore && anchor.Affinity != AffinityAfter {
+				return nil, ErrInvalidAffinity
+			}
+			if anchor.Offset < 0 || anchor.Offset > m.beforeLength {
+				return nil, ErrInvalidOffset
+			}
+		}
+	}
+	result := make([]AnchoredRange, len(values))
+	for index := range result {
+		transformed, err := m.TransformRange(values[index])
+		if err != nil {
+			return nil, err
+		}
+		result[index] = transformed
+	}
+	return result, nil
+}
+
+// TransformAnnotations applies this map to opaque host annotations without
+// interpreting or copying their values beyond normal Go assignment.
+func TransformAnnotations[T any](m ChangeMap, values []Annotation[T]) ([]Annotation[T], error) {
+	if values == nil {
+		return nil, nil
+	}
+	ranges := make([]AnchoredRange, len(values))
+	for index := range values {
+		ranges[index] = values[index].Range
+	}
+	transformed, err := m.TransformRanges(ranges)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]Annotation[T], len(values))
+	for index := range values {
+		result[index] = Annotation[T]{Range: transformed[index], Value: values[index].Value}
+	}
+	return result, nil
 }
 
 func (m ChangeMap) Compose(next ChangeMap) (ChangeMap, error) {

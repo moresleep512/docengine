@@ -33,11 +33,16 @@ It currently provides:
 - sequential ChangeMaps and affinity-aware Anchors returned by edits,
   undo, and redo;
 - bounded Session-managed ChangeMap history, forward/reverse revision queries,
-  lineage-checked index refresh, and atomic batch Anchor transforms;
+  lineage-checked index refresh, and atomic batch Anchor/range transforms with
+  opaque generic annotations;
 - bounded, resumable Session event streams with precise slow-consumer loss
-  reporting and a concurrent close barrier;
+  reporting, save progress, recovery-WAL durability transitions, and a
+  concurrent close barrier;
 - resolved Session resource limits, journal sync cadence, and explicit shared
-  or owned runtime-directory policies.
+  or owned runtime-directory policies;
+- lock-protected reclamation of stale owned Session directories;
+- safe first-generation Piece/undo compaction and explicit save-checkpoint
+  journal rebasing.
 
 It does not yet provide full-text search, Page/Fragment virtualization,
 multi-source composition, collaboration, remote storage, UI, or a stable 1.0
@@ -103,16 +108,21 @@ journal sync interval. Explicit directories are shared by default; an omitted
 Session directory is unique and owned. Undo files use collision-free temporary
 names and are removed on close. Owned directories are removed only when they
 are actual empty directories, while dirty recovery journals and unknown host
-files are preserved. `Session.Config` reports the resolved policy.
+files are preserved. Owned Session directories carry a locked v1 marker;
+automatic and explicit `ReclaimStaleSessionDirectories` cleanup removes only
+unlocked, valid Docengine artifacts and never recursively deletes unknown
+content. `Session.Config` reports the resolved policy.
 
 `Session.Subscribe` atomically joins retained history to live events. Each
 subscriber has a bounded queue and never blocks a transaction; when its queue
 overflows, the newest event replaces stale pending events and reports the exact
 omitted count in `Dropped`. `AfterSequence` resumes a consumer when history is
 still available and also reports any history gap. Open, recovery, committed
-Apply/Undo/Redo changes, and close are currently published. Concurrent `Close`
-callers wait for the same resource-retirement barrier and receive the same
-result.
+Apply/Undo/Redo changes, save start/progress/completion/failure, recovery-WAL
+Sync failure/restoration, and close are published. Progress events correlate
+through `PersistenceProgress.OperationID`; post-commit failure is distinguishable
+from pre-commit failure. Concurrent `Close` callers wait for the same
+resource-retirement barrier and receive the same result.
 
 `document/coordinate` builds an immutable index for one Snapshot revision.
 Checkpoints are placed only at UTF-8 boundaries, so byte/line/rune queries read
@@ -134,8 +144,16 @@ caller Options. `Session.RefreshCoordinateIndex` verifies that lineage, obtains
 the retained map chain atomically with the current Snapshot, and rejects expired
 history rather than silently rebuilding from an unrelated prefix.
 `ChangesBetween` supports forward and reverse observable revision boundaries;
-atomic-batch interior revisions are rejected. `TransformAnchors` applies that
-map to a bounded batch without returning partial output.
+atomic-batch interior revisions are rejected. `TransformAnchors` and
+`TransformRanges` apply that map to bounded batches without returning partial
+output. `coordinate.Annotation[T]` carries an opaque host value whose meaning
+is never interpreted by the core.
+
+`Session.Compact` coalesces only contiguous same-source Pieces and rewrites the
+undo store with live references. `CompactOptions.CheckpointJournal` explicitly
+persists a selected revision before rebasing the append-only journal; an
+uncommitted WAL is never rewritten in place because doing so would break crash
+atomicity or revision identity. Existing immutable Snapshots remain readable.
 
 See [MODULES.md](MODULES.md) for implementation invariants and file-format
 details.
@@ -173,21 +191,22 @@ Tests cover malformed and byte-truncated batches, state publication rollback,
 same-size/same-mtime external modification, full-file and boundary-split UTF-8,
 symlink retargeting, concurrent edit/save/recovery, platform durability faults,
 the post-commit read-only state, configured resource limits, concurrent shared
-runtime directories, and owned-directory cleanup.
-Event tests additionally cover exact loss accounting, replay cursors, a final
-close event under queue overflow, concurrent publish/unsubscribe, and multiple
-callers waiting on one close barrier.
+runtime directories, marker-lock orphan reclamation, conservative cleanup,
+live undo remapping, and Snapshot-safe Piece compaction. Event tests additionally
+cover exact loss accounting, replay cursors, save progress and failure phase,
+journal Sync failure/restoration, a final close event under queue overflow,
+concurrent publish/unsubscribe, and multiple callers waiting on one close barrier.
 
 The v0.3.0 release suite was run on native Windows and Debian under WSL 2 using
 a native Linux temporary directory. On both platforms every package reached
 100% statement coverage, `-race -shuffle=on -count=3` passed, and three core
 fuzz targets ran for at least 30 seconds without a failing implementation input.
 
-The current v0.4 coordinate, lifecycle, and event foundations were verified on
-native Windows and in a WSL native-Linux directory: all five packages remained
-at 100% statement coverage, three shuffled race runs passed, and all nine
-affected Session, event, and coordinate fuzz targets passed 10-second runs on
-both platforms.
+The completed v0.4 release suite was run on native Windows and in a WSL
+native-Linux directory: all five packages remained at 100% statement coverage,
+three shuffled race runs passed, and all nine affected Session, event,
+change-history, and coordinate fuzz targets passed 10-second runs on both
+platforms.
 
 Run the normal checks:
 
@@ -224,8 +243,9 @@ Windows race builds require a GCC-compatible MinGW-w64 toolchain; MSVC-target
 
 ## Current limitations
 
-- Process crashes can leave orphaned ephemeral Session directories; they are
-  collision-safe but automatic stale-process reclamation is not implemented.
+- Stale Session reclamation deliberately recognizes only valid Docengine
+  marker/undo entries. Unknown files, malformed markers, symlinks, and live
+  locks are preserved for safety.
 - A post-replacement rebind failure deliberately stops mutation; an explicit
   reopen is required.
 - External-change checking still has the unavoidable final hash-to-replace
@@ -234,18 +254,19 @@ Windows race builds require a GCC-compatible MinGW-w64 toolchain; MSVC-target
   expired revision requires a full rebuild. Incremental indexes conservatively
   rescan from the earliest affected checkpoint; automatic cache ownership and
   proven suffix reuse are not implemented.
-- Save, fault, external change, and background-progress event kinds are not yet
-  published.
-- Piece/journal/undo compaction, search indexing, virtualization, and
-  composition are not implemented.
+- File-watcher candidates and future indexing/virtualization progress events
+  are not implemented; save and recovery-WAL persistence transitions are.
+- Journal compaction requires an explicit save checkpoint. Search indexing,
+  Page/Fragment virtualization, index compaction, and composition are not
+  implemented.
 - The API and on-disk formats remain unstable until 1.0.
 
 ## Next work
 
-The next v0.4 work is stale-session reclamation, the remaining
-persistence/progress event kinds, generic retained interval/annotation
-transforms, and the first compaction policy.
-Format-neutral logical Page/Fragment virtualization then builds on these
-foundations, followed by persistent search and multi-source composition. The
+With the v0.4 Session and coordinate foundation complete, v0.5 starts the
+format-neutral logical Page/Fragment virtualization layer: bounded Page reads,
+Measure indexing, overscan, continuation pages, generation publication, and
+strict cache/task budgets. Persistent search and multi-source composition then
+build on those foundations. The
 decision-complete target architecture, readiness assessment, edge cases, and
 v0.4–v1.0 milestones are in [develop.md](develop.md).

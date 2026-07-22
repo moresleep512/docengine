@@ -60,7 +60,11 @@ type Metadata struct {
 	HasBOM              bool
 	EOL                 EOLStyle
 	DurabilityUncertain bool
-	PersistenceFaulted  bool
+	// RecoveryDurabilityUncertain reports a failed Sync of the recovery WAL.
+	// The logical document remains readable and editable, but the newest edits
+	// may not survive sudden power loss until a later Sync or save succeeds.
+	RecoveryDurabilityUncertain bool
+	PersistenceFaulted          bool
 }
 
 type RecoveryOpenError struct {
@@ -121,6 +125,7 @@ type sessionOperations struct {
 	stat          func(string) (os.FileInfo, error)
 	openRecovery  func(string, recovery.Fingerprint) (*recovery.Journal, recovery.ReplayResult, error)
 	readRecovery  func(*recovery.Journal, []byte, int64) (int, error)
+	syncRecovery  func(*recovery.Journal) error
 	newTree       func(io.ReaderAt, store.Piece) (*store.Tree, error)
 	cloneTree     func(*store.Tree) (*store.Tree, error)
 	atomicChecked func(string, os.FileMode, []byte, func(io.Writer) (int64, error), func() error) (int64, error)
@@ -136,7 +141,8 @@ var systemSessionOperations = sessionOperations{
 	readRecovery: func(journal *recovery.Journal, buffer []byte, offset int64) (int, error) {
 		return journal.ReadAt(buffer, offset)
 	},
-	newTree: store.NewWithBasePiece,
+	syncRecovery: func(journal *recovery.Journal) error { return journal.Sync() },
+	newTree:      store.NewWithBasePiece,
 	cloneTree: func(source *store.Tree) (*store.Tree, error) {
 		return cloneDocumentTree(source), nil
 	},
@@ -165,6 +171,7 @@ type Session struct {
 	undo                []historyEntry
 	redo                []historyEntry
 	undoStore           *undoStore
+	sessionMarker       *sessionMarker
 	undoEpoch           uint64
 	pending             []pendingOperation
 	dirty               bool
@@ -188,6 +195,8 @@ type Session struct {
 	coordinateLineage   *coordinate.Lineage
 	closeDone           chan struct{}
 	closeErr            error
+	nextPersistenceID   uint64
+	journalSyncErr      error
 }
 
 func Open(path string, options OpenOptions) (*Session, error) {
@@ -243,15 +252,23 @@ func openSessionContext(ctx context.Context, path string, options OpenOptions, o
 		_ = base.Close()
 		return nil, fmt.Errorf("document: scan base: %w", err)
 	}
+	var marker *sessionMarker
+	if config.SessionDirOwnership == DirectoryOwned {
+		marker, err = openOwnedSessionMarker(config.SessionDir)
+		if err != nil {
+			_ = base.Close()
+			return nil, err
+		}
+	}
 	undo, err := openUndoStore(config.SessionDir, config.Limits.UndoBytes)
 	if err != nil {
 		_ = base.Close()
-		return nil, errors.Join(err, cleanupOwnedDirectories(config, false))
+		return nil, errors.Join(err, marker.close(), cleanupOwnedDirectories(config, false))
 	}
 	fingerprint := recovery.FingerprintFor(resolved, scan.size, scan.contentHash)
 	journal, replay, err := openMatchingJournalWith(config.RecoveryDir, fingerprint, operations.openRecovery)
 	if err != nil {
-		return nil, errors.Join(err, undo.close(), base.Close(), cleanupOwnedDirectories(config, true))
+		return nil, errors.Join(err, undo.close(), marker.close(), base.Close(), cleanupOwnedDirectories(config, true))
 	}
 	tree, err := operations.newTree(base, store.Piece{Source: store.SourceBase, Offset: scan.baseOffset, Length: scan.size - scan.baseOffset, Newlines: scan.newlines, NewlinesKnown: true})
 	if err != nil {
@@ -259,7 +276,7 @@ func openSessionContext(ctx context.Context, path string, options OpenOptions, o
 		if journal != nil {
 			closeErr = journal.Close()
 		}
-		return nil, errors.Join(err, closeErr, undo.close(), base.Close(), cleanupOwnedDirectories(config, true))
+		return nil, errors.Join(err, closeErr, undo.close(), marker.close(), base.Close(), cleanupOwnedDirectories(config, true))
 	}
 	if journal != nil {
 		tree.SetSource(store.SourceJournal, journal)
@@ -270,18 +287,18 @@ func openSessionContext(ctx context.Context, path string, options OpenOptions, o
 	}
 	session := &Session{
 		path: absolute, resolvedPath: resolved, mode: info.Mode(), base: base, journal: journal, generation: generation, tree: tree,
-		undoStore: undo, hasBOM: scan.hasBOM, eol: scan.eol, recoveryDir: config.RecoveryDir,
+		undoStore: undo, sessionMarker: marker, hasBOM: scan.hasBOM, eol: scan.eol, recoveryDir: config.RecoveryDir,
 		sessionDir: config.SessionDir, config: config, fingerprint: fingerprint, diskIdentity: identityFor(info, scan.contentHash),
 		stopSync: make(chan struct{}), syncDone: make(chan struct{}), operations: operations,
 		events: newEventHub(config.Limits.EventHistory), coordinateLineage: coordinate.NewLineage(), closeDone: make(chan struct{}),
 	}
 	if journal != nil {
 		if err := session.replay(replay); err != nil {
-			return nil, errors.Join(err, generation.retireAndWait(false), undo.close(), cleanupOwnedDirectories(config, true))
+			return nil, errors.Join(err, generation.retireAndWait(false), undo.close(), marker.close(), cleanupOwnedDirectories(config, true))
 		}
 		if replay.Truncated {
 			if err := journal.RepairTail(replay.ValidBytes); err != nil {
-				return nil, errors.Join(err, generation.retireAndWait(false), undo.close(), cleanupOwnedDirectories(config, true))
+				return nil, errors.Join(err, generation.retireAndWait(false), undo.close(), marker.close(), cleanupOwnedDirectories(config, true))
 			}
 		}
 	}
@@ -444,8 +461,26 @@ func (s *Session) publishEventLocked(kind EventKind, origin ChangeOrigin, change
 	})
 }
 
+func (s *Session) recordJournalSyncResultLocked(journal *recovery.Journal, syncErr error) {
+	if journal != s.journal {
+		return
+	}
+	if syncErr != nil {
+		firstFailure := s.journalSyncErr == nil
+		s.journalSyncErr = syncErr
+		if firstFailure {
+			s.publishEventLocked(EventJournalSyncFailed, ChangeOriginNone, coordinate.ChangeMap{}, syncErr)
+		}
+		return
+	}
+	if s.journalSyncErr != nil {
+		s.journalSyncErr = nil
+		s.publishEventLocked(EventJournalSyncRestored, ChangeOriginNone, coordinate.ChangeMap{}, nil)
+	}
+}
+
 func (s *Session) metadataLocked() Metadata {
-	return Metadata{Path: s.path, ResolvedPath: s.resolvedPath, Name: filepath.Base(s.path), ByteLength: s.tree.Len(), Revision: s.revision, CommittedRevision: s.committedRevision, Dirty: s.dirty, Recovered: s.recovered, HasBOM: s.hasBOM, EOL: s.eol, DurabilityUncertain: s.durabilityUncertain, PersistenceFaulted: s.fault != nil}
+	return Metadata{Path: s.path, ResolvedPath: s.resolvedPath, Name: filepath.Base(s.path), ByteLength: s.tree.Len(), Revision: s.revision, CommittedRevision: s.committedRevision, Dirty: s.dirty, Recovered: s.recovered, HasBOM: s.hasBOM, EOL: s.eol, DurabilityUncertain: s.durabilityUncertain, RecoveryDurabilityUncertain: s.journalSyncErr != nil, PersistenceFaulted: s.fault != nil}
 }
 
 // Fault returns the cause that placed this Session into its permanent
@@ -830,9 +865,22 @@ func (s *Session) Save() (Metadata, error) { return s.CommitAtLeast(0) }
 // CommitAtLeast atomically persists a snapshot whose revision is at least the
 // requested revision. New edits continue in the current generation while the
 // snapshot is streamed.
-func (s *Session) CommitAtLeast(expectedRevision uint64) (Metadata, error) {
+func (s *Session) CommitAtLeast(expectedRevision uint64) (result Metadata, resultErr error) {
 	s.saveMu.Lock()
 	defer s.saveMu.Unlock()
+	var persistence PersistenceProgress
+	var persistenceMetadata Metadata
+	persistenceStarted, persistenceFinished := false, false
+	defer func() {
+		if !persistenceStarted || persistenceFinished || resultErr == nil {
+			return
+		}
+		s.mu.RLock()
+		metadata := s.metadataLocked()
+		persistence.Committed = s.committedRevision >= persistence.TargetRevision
+		s.mu.RUnlock()
+		s.publishPersistenceEvent(EventSaveFailed, metadata, persistence, resultErr)
+	}()
 
 	s.mu.Lock()
 	if s.closed {
@@ -851,6 +899,8 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (Metadata, error) {
 	if !s.dirty || expectedRevision <= s.committedRevision && expectedRevision != 0 {
 		if s.durabilityUncertain {
 			path := s.resolvedPath
+			persistence, persistenceMetadata = s.beginPersistenceLocked(s.committedRevision, s.diskIdentity.size)
+			persistenceStarted = true
 			s.mu.Unlock()
 			if err := s.operations.syncParent(path); err != nil {
 				s.mu.RLock()
@@ -861,6 +911,9 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (Metadata, error) {
 			s.mu.Lock()
 			s.durabilityUncertain = false
 			metadata := s.metadataLocked()
+			persistence.CompletedBytes, persistence.Committed = persistence.TotalBytes, true
+			s.publishPersistenceEvent(EventSaved, metadata, persistence, nil)
+			persistenceFinished = true
 			s.mu.Unlock()
 			return metadata, nil
 		}
@@ -875,6 +928,13 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (Metadata, error) {
 	if s.hasBOM {
 		prefix = []byte{0xef, 0xbb, 0xbf}
 	}
+	if lease.Len() > math.MaxInt64-int64(len(prefix)) {
+		_ = lease.Close()
+		s.mu.Unlock()
+		return Metadata{}, store.ErrLengthOverflow
+	}
+	persistence, persistenceMetadata = s.beginPersistenceLocked(targetRevision, lease.Len()+int64(len(prefix)))
+	persistenceStarted = true
 	s.mu.Unlock()
 	defer lease.Close()
 	if s.commitHook != nil {
@@ -910,7 +970,15 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (Metadata, error) {
 	hasher := sha256.New()
 	_, _ = hasher.Write(prefix)
 	writeContent := func(writer io.Writer) (int64, error) {
-		return lease.WriteTo(io.MultiWriter(writer, hasher))
+		progressWriter := newSaveProgressWriter(writer, int64(len(prefix)), persistence.TotalBytes, func(completed int64) {
+			persistence.CompletedBytes = completed
+			s.publishPersistenceEvent(EventSaveProgress, persistenceMetadata, persistence, nil)
+		})
+		written, writeErr := lease.WriteTo(io.MultiWriter(progressWriter, hasher))
+		if writeErr == nil {
+			progressWriter.finish()
+		}
+		return written, writeErr
 	}
 	total, atomicErr := s.operations.atomicChecked(path, mode, prefix, writeContent, checkIdentity)
 	var durabilityErr *save.DurabilityError
@@ -1029,9 +1097,14 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (Metadata, error) {
 	s.dirty = s.revision > s.committedRevision
 	if !s.dirty {
 		s.recovered = false
+		s.recordJournalSyncResultLocked(s.journal, nil)
 	}
 	oldGeneration.retire(true)
-	return s.metadataLocked(), atomicErr
+	metadata := s.metadataLocked()
+	persistence.CompletedBytes, persistence.Committed = persistence.TotalBytes, true
+	s.publishPersistenceEvent(EventSaved, metadata, persistence, atomicErr)
+	persistenceFinished = true
+	return metadata, atomicErr
 }
 
 func (s *Session) Close() error {
@@ -1051,12 +1124,15 @@ func (s *Session) Close() error {
 	<-s.syncDone
 	s.mu.Lock()
 	dirty, generation := s.dirty, s.generation
+	var syncErr error
 	if s.journal != nil {
-		_ = s.journal.Sync()
+		syncErr = s.operations.syncRecovery(s.journal)
+		s.recordJournalSyncResultLocked(s.journal, syncErr)
 	}
 	s.mu.Unlock()
-	err := generation.retireAndWait(!dirty)
+	err := errors.Join(syncErr, generation.retireAndWait(!dirty))
 	err = errors.Join(err, s.undoStore.close())
+	err = errors.Join(err, s.sessionMarker.close())
 	err = errors.Join(err, cleanupOwnedDirectories(s.config, !dirty))
 	s.mu.Lock()
 	s.publishEventLocked(EventClosed, ChangeOriginNone, coordinate.ChangeMap{}, err)
@@ -1080,7 +1156,10 @@ func (s *Session) syncLoop() {
 			journal := s.journal
 			s.mu.RUnlock()
 			if journal != nil {
-				_ = journal.Sync()
+				syncErr := s.operations.syncRecovery(journal)
+				s.mu.Lock()
+				s.recordJournalSyncResultLocked(journal, syncErr)
+				s.mu.Unlock()
 			}
 		case <-s.stopSync:
 			return

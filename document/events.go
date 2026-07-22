@@ -38,6 +38,24 @@ const (
 	EventChanged
 	// EventClosed is the last event and precedes subscription channel closure.
 	EventClosed
+	// EventSaveStarted begins a persistence attempt that will perform I/O.
+	EventSaveStarted
+	// EventSaveProgress reports monotonically increasing bytes written for one
+	// persistence attempt.
+	EventSaveProgress
+	// EventSaved reports a committed persistence attempt. Cause may contain a
+	// DurabilityError when replacement succeeded but directory sync did not.
+	EventSaved
+	// EventSaveFailed reports an attempt that did not complete normally.
+	// Persistence.Committed distinguishes pre-commit failure from a permanent
+	// post-commit Session fault.
+	EventSaveFailed
+	// EventJournalSyncFailed reports the transition from a healthy recovery WAL
+	// to a failed background or close-time Sync.
+	EventJournalSyncFailed
+	// EventJournalSyncRestored reports the first successful Sync or clean save
+	// checkpoint after EventJournalSyncFailed.
+	EventJournalSyncRestored
 )
 
 // ChangeOrigin identifies the operation that produced an EventChanged map.
@@ -59,13 +77,25 @@ const (
 // delivery. Consumers that observe a drop must rebuild derived state from the
 // event Metadata and a matching Snapshot instead of applying Changes blindly.
 type SessionEvent struct {
-	Sequence uint64
-	Dropped  uint64
-	Kind     EventKind
-	Origin   ChangeOrigin
-	Metadata Metadata
-	Changes  coordinate.ChangeMap
-	Cause    error
+	Sequence    uint64
+	Dropped     uint64
+	Kind        EventKind
+	Origin      ChangeOrigin
+	Metadata    Metadata
+	Changes     coordinate.ChangeMap
+	Persistence PersistenceProgress
+	Cause       error
+}
+
+// PersistenceProgress correlates save events. CompletedBytes is monotonic for
+// an Operation and never exceeds TotalBytes. TargetRevision is the immutable
+// Snapshot selected when the attempt began.
+type PersistenceProgress struct {
+	OperationID    uint64
+	TargetRevision uint64
+	CompletedBytes int64
+	TotalBytes     int64
+	Committed      bool
 }
 
 // SubscribeOptions controls replay and buffering for a Session subscription.

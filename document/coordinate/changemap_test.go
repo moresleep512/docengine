@@ -156,6 +156,59 @@ func TestChangeMapTransformsAnchorBatchAtomically(t *testing.T) {
 	}
 }
 
+func TestChangeMapTransformsRangesAndOpaqueAnnotationsAtomically(t *testing.T) {
+	change, err := NewChangeMap(1, 2, 5, []Edit{{Start: 2, NewLength: 3}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ranges := []AnchoredRange{
+		{Start: Anchor{Offset: 0, Affinity: AffinityBefore}, End: Anchor{Offset: 2, Affinity: AffinityAfter}},
+		{Start: Anchor{Offset: 5, Affinity: AffinityBefore}, End: Anchor{Offset: 5, Affinity: AffinityAfter}},
+	}
+	transformed, err := change.TransformRanges(ranges)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transformed[0].Start.Offset != 0 || transformed[0].End.Offset != 5 || transformed[1].Start.Offset != 8 || transformed[1].End.Offset != 8 {
+		t.Fatalf("ranges = %+v", transformed)
+	}
+	if ranges[0].End.Offset != 2 {
+		t.Fatal("TransformRanges modified its input")
+	}
+	annotations := []Annotation[map[string]int]{
+		{Range: ranges[0], Value: map[string]int{"opaque": 7}},
+		{Range: ranges[1], Value: map[string]int{"opaque": 9}},
+	}
+	mapped, err := TransformAnnotations(change, annotations)
+	if err != nil || mapped[0].Value["opaque"] != 7 || mapped[1].Range != transformed[1] {
+		t.Fatalf("annotations = (%+v, %v)", mapped, err)
+	}
+	if empty, err := change.TransformRanges(nil); err != nil || empty != nil {
+		t.Fatalf("nil ranges = (%+v, %v)", empty, err)
+	}
+	if empty, err := TransformAnnotations[string](change, nil); err != nil || empty != nil {
+		t.Fatalf("nil annotations = (%+v, %v)", empty, err)
+	}
+
+	invalid := []struct {
+		value AnchoredRange
+		err   error
+	}{
+		{AnchoredRange{Start: Anchor{Offset: 3, Affinity: AffinityBefore}, End: Anchor{Offset: 2, Affinity: AffinityAfter}}, ErrInvalidRange},
+		{AnchoredRange{Start: Anchor{Offset: 0}, End: Anchor{Offset: 1, Affinity: AffinityAfter}}, ErrInvalidAffinity},
+		{AnchoredRange{Start: Anchor{Offset: 0, Affinity: AffinityBefore}, End: Anchor{Offset: 6, Affinity: AffinityAfter}}, ErrInvalidOffset},
+		{AnchoredRange{Start: Anchor{Offset: 2, Affinity: AffinityAfter}, End: Anchor{Offset: 2, Affinity: AffinityBefore}}, ErrInvertedRange},
+	}
+	for _, test := range invalid {
+		if got, err := change.TransformRanges([]AnchoredRange{ranges[0], test.value}); got != nil || !errors.Is(err, test.err) {
+			t.Fatalf("invalid range %+v = (%+v, %v)", test.value, got, err)
+		}
+		if got, err := TransformAnnotations(change, []Annotation[int]{{Range: test.value, Value: 1}}); got != nil || !errors.Is(err, test.err) {
+			t.Fatalf("invalid annotation %+v = (%+v, %v)", test.value, got, err)
+		}
+	}
+}
+
 func TestChangeMapValidationAndCompositionErrors(t *testing.T) {
 	invalid := []struct {
 		beforeRevision uint64
