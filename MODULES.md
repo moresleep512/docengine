@@ -289,13 +289,16 @@ target. A symlink later redirected elsewhere does not change the save target.
 
 `OpenOptions` resolves into an immutable `SessionConfig`. The configurable
 limits are maximum operations per batch, bytes per insertion, undo-store bytes,
-recovery-journal bytes, retained Session events, retained ChangeMaps, Anchors
-per transform batch, host-owned Snapshot leases, and journal sync interval. The
-default hard journal limit is 4 GiB and the default cross-generation lease
-limit is 1,024. `AutoCheckpointJournalBytes` is separate and zero by default
-because enabling it authorizes background saves; a nonzero threshold cannot
-exceed the hard limit. Negative values and limits beyond the v2 journal or
-in-memory envelopes are rejected before the base file is opened.
+recovery-journal bytes, retained Session events, concurrent subscriptions,
+retained ChangeMaps, Anchors per transform batch, host-owned Snapshot leases,
+and journal sync interval. The default subscription limit is 128 with a hard
+maximum of 4,096; it bounds aggregate queues independently of the 4,096-event
+per-subscription buffer maximum. The default hard journal limit is 4 GiB and
+the default cross-generation lease limit is 1,024.
+`AutoCheckpointJournalBytes` is separate and zero by default because enabling
+it authorizes background saves; a nonzero threshold cannot exceed the hard
+limit. Negative values and limits beyond the v2 journal or in-memory envelopes
+are rejected before the base file is opened.
 
 Explicit RecoveryDir and SessionDir paths are shared unless marked owned. An
 omitted RecoveryDir uses the shared process-temporary recovery namespace; an
@@ -348,6 +351,14 @@ recovery, each non-empty Apply/Undo/Redo commit, and final close are published;
 failed and no-op transactions publish nothing. Change events contain the same
 immutable `ChangeMap` returned by the transaction.
 
+The Session also caps total live subscriptions. `EventStats` atomically reports
+the current sequence, retained entries and configured history, live and
+maximum subscriptions, physically discarded queued deliveries, history-gap
+events, closure, and the theoretical uint64 sequence-exhaustion state. Loss
+counters saturate instead of wrapping. Subscription IDs skip zero and live
+collisions when their counter wraps. If the event sequence itself is exhausted,
+the hub closes every subscription rather than reuse a causal identifier.
+
 An actual save attempt additionally publishes start, bounded byte progress,
 and saved or failed events correlated by `PersistenceProgress.OperationID`.
 The committed flag separates errors before atomic replacement from permanent
@@ -358,6 +369,13 @@ coalesced, and the first successful Sync or clean save publishes restoration.
 `Metadata.RecoveryDurabilityUncertain` makes the current state reconstructible
 even if the transition event was dropped. Final Sync failure is included in
 the shared `Close` result.
+
+Compaction publishes start, bounded progress, completed, or failed events
+correlated by `CompactionProgress.OperationID`. Its exact total is the sum of
+unique live undo references, and copies are reported every 4 MiB. The
+`Committed` bit separates a discarded candidate from a valid replacement whose
+retired-file cleanup failed. New event kinds were appended after the existing
+journal-sync kinds so their numeric values did not change.
 
 The final close event survives subscriber overflow. Its channel is then closed.
 The first `Session.Close` retires resources, while all concurrent Close callers
@@ -416,10 +434,19 @@ interprets that value.
 
 `store.Tree.Compact` coalesces only logical neighbors backed by contiguous
 bytes in the same Source. It does not read source bytes, mutate existing roots,
-or invalidate immutable Snapshots. The undo store compactor copies unique live
-references to a replacement temporary store, switches only after all copies
-succeed, remaps both history stacks, and reports retired-file cleanup errors
-without losing the valid replacement mapping.
+or invalidate immutable Snapshots. The undo store compactor validates and
+deduplicates every reference, checks exact live-byte addition for overflow,
+then copies into a replacement temporary store with a 64 KiB buffer and Context
+check before every chunk. Cancellation or any malformed read/write result
+closes and removes the candidate while preserving the active store.
+
+Only a fully copied candidate is installed. Session then remaps both history
+stacks and performs the infallible structural Piece compaction. Therefore every
+error before the store switch leaves the store, history, and tree unchanged.
+Close/remove failure after the switch returns a non-nil error together with
+`CompactionResult.Committed=true`; the valid replacement mapping and undo/redo
+remain authoritative. `UndoBytesBefore` and `UndoBytesAfter`, Piece counts, and
+the operation ID make this boundary observable without reading store files.
 
 `Session.Compact` always runs Piece and undo compaction. Journal compaction is
 selected explicitly with `CompactOptions.CheckpointJournal`: the Session saves
@@ -565,3 +592,14 @@ A 4 MiB middle edit rebuilt with prefix/suffix reuse in roughly 0.39–0.47 ms
 on Windows and 0.323–0.339 ms on Linux, versus 27–29 ms and 20.6–21.9 ms for
 full builds. A 256-map linear composition allocated once on both platforms;
 the pairwise comparison allocated 256 times.
+
+For v0.5.6, native Windows and Debian under WSL 2 retained 100% statement
+coverage in all six packages. Linux passed three complete shuffled race runs.
+The new Event/Compaction/undo paths passed 100 normal and ten race-enabled
+repetitions on both platforms. The complete Windows race run still reproduces
+the known journal-sync event timeout and open-handle cleanup failure reserved
+for the final v0.5.x fix; it is not attributed to this module. Event and
+undo-rewrite state-machine fuzzers ran for 30 seconds per platform. Event
+publication remained allocation-free with zero and 128 backlogged subscribers;
+4 MiB live undo rewrite sustained about 1.20 GiB/s on Windows and
+1.13–1.23 GiB/s on Linux in the committed benchmark.

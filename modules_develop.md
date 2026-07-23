@@ -1,6 +1,6 @@
 # Docengine 模块开发历程与设计决策
 
-本文记录 Docengine 从 TypeMD 后端抽离，到 v0.5.5 为止的实际开发顺序、模块形成过程、
+本文记录 Docengine 从 TypeMD 后端抽离，到 v0.5.6 为止的实际开发顺序、模块形成过程、
 关键取舍、测试方法和问题复盘。它回答的不是“现在有哪些 API”，而是“代码为什么最终
 长成现在这样”。
 
@@ -688,6 +688,72 @@ coverage，并通过全仓三轮 shuffle race；三个 coordinate fuzz 每端各
 同样为零分配；4 MiB 中部编辑增量重建约 0.323–0.339 ms，全量约 20.6–21.9 ms；
 256-map `ComposeAll` 约 3.6–4.1 µs、1 alloc，逐段组合约 0.34–0.36 ms、256 alloc。
 
+### 7.11 v0.5.6：局部有界不等于系统有界，压缩失败也必须说明是否已经提交
+
+事件流在 v0.4 已经做到“每个订阅队列有界”，但继续横向审计后发现，调用方可以不断
+创建订阅。单个队列最多 4,096 个事件并不能限制所有队列的总内存；这和只限制单次插入、
+却不限制 journal 总增长是同一种错误。另一个缺口在压缩：旧实现虽然用候选文件重写
+undo store，但 `Session.Compact` 在持锁期间没有把 Context 取消贯穿复制过程，而且先后
+步骤的提交边界没有公开表达。若 Piece 结构已经压缩而 undo 候选随后失败，调用方只能
+看到一个 error，却无法判断结构维护是否部分发生。
+
+事件侧没有选择“全局按字节精确计量每个 channel”。Go channel 的槽位之外还包含字符串、
+ChangeMap 和 Metadata 引用，假装一个精确字节数反而会给出错误承诺。最终使用两级明确
+上限：单订阅 `Buffer` 仍有 4,096 硬上限，Session 新增默认 128、最大 4,096 的
+`MaxSubscriptions`。这样最坏队列槽位数是可计算的，默认也不会因为遗忘 `Close` 无限
+增长。`EventStats` 同时报告历史占用、存活订阅、物理丢弃的待投递事件和历史缺口。
+这里区分“队列里真正被替换的 delivery”与“从续接游标到最早历史之间的 gap”，否则
+一个数字无法解释损失发生在哪一层。
+
+长期运行还要求计数器不能静默回绕。丢弃计数和历史缺口使用饱和加法；订阅 ID 回绕时
+跳过零和仍存活的 ID；事件 sequence 若真的达到 `uint64` 上限，hub 会关闭全部订阅并在
+Stats 标记耗尽，而不是复用一个已经代表过旧事件的因果 ID。压缩事件种类被追加在已有
+`EventJournalSyncRestored` 之后，没有插入枚举中部，以免改变既有事件数值并把当前已知
+Windows journal-sync 测试问题扩大成协议变化。
+
+压缩侧把提交顺序固定为：
+
+1. 校验并去重所有存活 undo 引用，检查累计字节是否溢出；
+2. 以 64 KiB 固定缓冲复制到同目录候选文件，每块前检查 Context；
+3. 完整复制且最后一次取消检查通过后，切换活动 undo store；
+4. 用确定映射同时更新 undo/redo 两栈；
+5. 最后执行不会读取 Source、不会失败的 Piece 结构合并。
+
+这个顺序使“候选提交前”成为真正的零影响边界：取消、创建失败、读写错误和非法引用都
+不会改变活动 store、history 或 Tree。候选切换之后，旧文件 Close/Remove 仍可能失败；
+这时新 store 和映射已经是权威状态，所以 `CompactionResult.Committed` 与失败事件必须
+为 true。把这种错误伪装成未执行，会诱使宿主重试并错误理解操作结果。journal
+checkpoint 仍位于压缩之前，使用原有 Save 提交语义；压缩自身不尝试原地改写未提交
+WAL。
+
+进度总量取“去重后的存活 undo 字节”，而不是旧 store 文件大小。事件以 operation ID
+关联，开始事件给出精确 total，复制每跨 4 MiB 发布一次进度，最终事件给出 Piece
+before/after 与 committed。没有把复制移到完全无锁后台：history 引用与活动 store
+必须属于同一个 Session revision 状态，先引入后台两阶段协议会扩大当前阶段范围。
+当前实现选择持有 Session 写边界，但 64 KiB 取消粒度和 4 MiB 观测粒度分别约束停止
+延迟与事件频率；后续若基准证明锁时长不可接受，再以明确 generation/CAS 协议演进。
+
+测试专门覆盖了覆盖率数字之外的提交语义：
+
+- 候选创建失败、复制中取消和最终切换前取消都验证旧路径、字节、历史和 Piece 数不变，
+  且 Undo 继续正确；
+- 旧文件清理失败验证 result 与事件都为 committed，Undo 使用新映射继续正确；
+- 内部复制器依赖收窄为 `ReadAt`/`Write` 最小接口，注入真实 `os.File` 不会产生的负
+  计数、超长计数、零进展、短写和错误组合，防御分支因此不是不可验证的死代码；
+- 事件测试覆盖订阅精确饱和、释放后再订阅、ID/sequence 边界、统计与 Session Close；
+- 事件 state-machine fuzz 在随机发布、续接、溢出、消费、退订和关闭后持续核对序列及
+  Stats；新的 undo fuzz 用磁盘 store 与内存引用模型比较成功重写和不同取消点，保证
+  不暴露半个候选。
+
+Windows 与 WSL 2 Debian 两端六包都保持 100% statement coverage；新增路径在两端通过
+100 轮普通重复和 10 轮 race 重复，两项 fuzz 每端各运行 30 秒。Linux 全仓三轮
+shuffle race 无排除通过。Windows 全仓 race 再次确定性地暴露了已经登记的
+journal-sync 事件超时与未关闭句柄清理失败；按路线图它不混入本次压缩改动，而留到所有
+v0.5.x 模块结束后单独修复和发布。基准显示零订阅发布约 29 ns，128 个积压订阅约
+12.5–13.2 µs，二者均零分配；4 MiB 存活 undo 重写在 Windows 约 3.43–3.51 ms、
+Linux 约 3.41–3.72 ms。数字不作为跨机器承诺，但订阅总量硬上限、发布零分配和复制
+字节吞吐现在有了可重复基线。
+
 ## 8. 贯穿所有阶段的设计理念
 
 ### 8.1 格式中立不是口号，而是依赖约束
@@ -738,13 +804,13 @@ Tree 不关闭 Source；generation 管理 base/journal；Session 管理 generati
 
 ## 9. 到这里为止，以及为什么下一步不是继续堆编辑 API
 
-截至 v0.5.5，Docengine 已经有 Piece Tree、不可变 Snapshot、原子事务、recovery v2、
+截至 v0.5.6，Docengine 已经有 Piece Tree、不可变 Snapshot、原子事务、recovery v2、
 跨平台保存、显式故障状态、坐标/ChangeMap、事件、资源策略、压缩，以及格式中立的
 Page/Fragment/Measure 虚拟化。
 
 下一阶段仍按 `develop.md` 横向补齐，不进入 v0.6：
 
-- 事件/压缩和 Virtual 的刷新、进度、长期性能及组合生命周期死角；
+- Virtual 的刷新、进度、身份、长期性能及组合生命周期死角；
 - 所有现有模块完成后，最后单独修复 Windows journal durability CI 问题。
 
 搜索和 Composition 继续保持未实现，直到当前 revision、Snapshot、Source 所有权、

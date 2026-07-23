@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -12,7 +13,7 @@ import (
 )
 
 func TestEventHubHistoryReplayOverflowAndResume(t *testing.T) {
-	hub := newEventHub(3)
+	hub := newEventHub(3, 8)
 	for revision := uint64(1); revision <= 5; revision++ {
 		hub.publish(SessionEvent{Kind: EventChanged, Metadata: Metadata{Revision: revision}})
 	}
@@ -67,7 +68,7 @@ func TestEventHubHistoryReplayOverflowAndResume(t *testing.T) {
 }
 
 func TestEventHubValidationAndClose(t *testing.T) {
-	hub := newEventHub(1)
+	hub := newEventHub(1, 8)
 	for _, options := range []SubscribeOptions{
 		{Buffer: -1},
 		{Buffer: MaximumSubscriptionBuffer + 1},
@@ -96,6 +97,151 @@ func TestEventHubValidationAndClose(t *testing.T) {
 	}
 	if err := subscription.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestEventKindsRemainAppendOnly(t *testing.T) {
+	kinds := []EventKind{
+		EventOpened,
+		EventRecovered,
+		EventChanged,
+		EventClosed,
+		EventSaveStarted,
+		EventSaveProgress,
+		EventSaved,
+		EventSaveFailed,
+		EventJournalSyncFailed,
+		EventJournalSyncRestored,
+		EventCompactionStarted,
+		EventCompactionProgress,
+		EventCompacted,
+		EventCompactionFailed,
+	}
+	for index, kind := range kinds {
+		if want := EventKind(index + 1); kind != want {
+			t.Fatalf("event kind %d = %d, want %d", index, kind, want)
+		}
+	}
+}
+
+func TestEventHubBudgetsStatisticsAndCounterBoundaries(t *testing.T) {
+	hub := newEventHub(2, 2)
+	for revision := uint64(1); revision <= 3; revision++ {
+		hub.publish(SessionEvent{Kind: EventChanged, Metadata: Metadata{Revision: revision}})
+	}
+	first, err := hub.subscribe(SubscribeOptions{Buffer: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := hub.subscribe(SubscribeOptions{Buffer: 1, FutureOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hub.subscribe(SubscribeOptions{}); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("subscription budget = %v", err)
+	}
+	replayed := receiveEvent(t, first.Events())
+	if replayed.Sequence != 3 || replayed.Dropped != 2 {
+		t.Fatalf("bounded replay = %+v", replayed)
+	}
+	stats := hub.stats()
+	if stats.Sequence != 3 || stats.HistoryEntries != 2 || stats.MaximumHistory != 2 ||
+		stats.Subscriptions != 2 || stats.MaximumSubscriptions != 2 ||
+		stats.DiscardedDeliveries != 1 || stats.HistoryGapEvents != 1 ||
+		stats.SequenceExhausted || stats.Closed {
+		t.Fatalf("event stats = %+v", stats)
+	}
+
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	hub.nextID = math.MaxUint64
+	replacement, err := hub.subscribe(SubscribeOptions{Buffer: 1, FutureOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacement.id == 0 || replacement.id == second.id {
+		t.Fatalf("wrapped subscription id = %d, existing = %d", replacement.id, second.id)
+	}
+	if saturatingAdd(math.MaxUint64-1, 2) != math.MaxUint64 ||
+		saturatingAdd(7, 5) != 12 {
+		t.Fatal("saturatingAdd did not preserve counter bounds")
+	}
+	if err := errors.Join(second.Close(), replacement.Close()); err != nil {
+		t.Fatal(err)
+	}
+
+	exhausted := newEventHub(1, 1)
+	watcher, err := exhausted.subscribe(SubscribeOptions{Buffer: 1, FutureOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exhausted.sequence = math.MaxUint64
+	exhausted.publish(SessionEvent{Kind: EventChanged})
+	if _, ok := <-watcher.Events(); ok {
+		t.Fatal("sequence exhaustion left subscription open")
+	}
+	stats = exhausted.stats()
+	if stats.Sequence != math.MaxUint64 || !stats.SequenceExhausted || !stats.Closed ||
+		stats.Subscriptions != 0 {
+		t.Fatalf("exhausted stats = %+v", stats)
+	}
+	if _, err := exhausted.subscribe(SubscribeOptions{}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("subscribe after sequence exhaustion = %v", err)
+	}
+}
+
+func TestSessionEventStatsSubscriptionLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "doc")
+	if err := os.WriteFile(path, []byte("a"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, err := Open(path, OpenOptions{
+		SessionDir: filepath.Join(dir, "session"),
+		Limits: SessionLimits{
+			EventHistory:     3,
+			MaxSubscriptions: 2,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := session.Subscribe(SubscribeOptions{FutureOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := session.Subscribe(SubscribeOptions{FutureOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Subscribe(SubscribeOptions{}); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("Session subscription budget = %v", err)
+	}
+	stats := session.EventStats()
+	if stats.Sequence != 1 || stats.HistoryEntries != 1 || stats.MaximumHistory != 3 ||
+		stats.Subscriptions != 2 || stats.MaximumSubscriptions != 2 || stats.Closed {
+		t.Fatalf("live Session event stats = %+v", stats)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if stats = session.EventStats(); stats.Subscriptions != 1 {
+		t.Fatalf("stats after unsubscribe = %+v", stats)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if stats = session.EventStats(); !stats.Closed || stats.Subscriptions != 0 ||
+		stats.Sequence != 2 {
+		t.Fatalf("closed Session event stats = %+v", stats)
+	}
+	if _, ok := <-second.Events(); !ok {
+		// EventClosed is retained in the subscriber buffer before closure.
+		t.Fatal("subscriber closed before EventClosed delivery")
+	}
+	if _, ok := <-second.Events(); ok {
+		t.Fatal("subscriber remains open after EventClosed")
 	}
 }
 
@@ -292,7 +438,7 @@ func TestEventHubConcurrentPublishAndClose(t *testing.T) {
 		eventsPerWorker = 250
 		subscriberCount = 12
 	)
-	hub := newEventHub(8)
+	hub := newEventHub(8, subscriberCount)
 	subscriptions := make([]*Subscription, subscriberCount)
 	for index := range subscriptions {
 		var err error

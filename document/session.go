@@ -235,6 +235,7 @@ type Session struct {
 	closeErr                   error
 	closeCompleted             bool
 	nextPersistenceID          uint64
+	nextCompactionID           uint64
 	journalSyncErr             error
 	journalBytes               int64
 	nextJournalCheckpoint      int64
@@ -341,7 +342,7 @@ func openSessionContext(ctx context.Context, path string, options OpenOptions, o
 		undoStore: undo, sessionMarker: marker, hasBOM: scan.hasBOM, eol: scan.eol, recoveryDir: config.RecoveryDir,
 		sessionDir: config.SessionDir, config: config, fingerprint: fingerprint, diskIdentity: identityFor(info, scan.contentHash),
 		stopSync: make(chan struct{}), syncDone: make(chan struct{}), checkpointRequest: make(chan uint64, 1), operations: operations,
-		events: newEventHub(config.Limits.EventHistory), coordinateLineage: coordinate.NewLineage(), closeDone: make(chan struct{}),
+		events: newEventHub(config.Limits.EventHistory, config.Limits.MaxSubscriptions), coordinateLineage: coordinate.NewLineage(), closeDone: make(chan struct{}),
 		saveGate: saveGate, lifecycleContext: lifecycleContext, cancelLifecycle: cancelLifecycle,
 	}
 	if journal != nil {
@@ -564,6 +565,12 @@ func (s *Session) Subscribe(options SubscribeOptions) (*Subscription, error) {
 		return nil, ErrClosed
 	}
 	return s.events.subscribe(options)
+}
+
+// EventStats returns event-history, subscription-budget, and delivery-loss
+// statistics. It remains available after Close.
+func (s *Session) EventStats() EventStats {
+	return s.events.stats()
 }
 
 func (s *Session) publishEventLocked(kind EventKind, origin ChangeOrigin, changes coordinate.ChangeMap, cause error) {

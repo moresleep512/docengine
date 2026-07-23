@@ -1,14 +1,18 @@
 package document
 
 import (
+	"context"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
 )
 
 var errUndoQuota = errors.New("document: undo store quota exceeded")
+
+const undoRewriteBufferBytes = 64 << 10
 
 type textRef struct {
 	offset int64
@@ -114,7 +118,20 @@ func (s *undoStore) reset() error {
 // caller. A non-nil mapping always describes the active replacement store,
 // even when removing the retired temporary file reports an error.
 func (s *undoStore) rewrite(refs []textRef) (map[textRef]textRef, error) {
+	return s.rewriteContext(context.Background(), refs, nil)
+}
+
+func (s *undoStore) rewriteContext(ctx context.Context, refs []textRef, report func(int64, int64)) (map[textRef]textRef, error) {
+	if ctx == nil {
+		return nil, ErrInvalidContext
+	}
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
 	if s == nil {
+		if report != nil {
+			report(0, 0)
+		}
 		return map[textRef]textRef{}, nil
 	}
 	s.mu.Lock()
@@ -124,7 +141,11 @@ func (s *undoStore) rewrite(refs []textRef) (map[textRef]textRef, error) {
 	}
 	unique := make([]textRef, 0, len(refs))
 	seen := make(map[textRef]struct{}, len(refs))
+	var liveBytes int64
 	for _, ref := range refs {
+		if err := contextError(ctx); err != nil {
+			return nil, err
+		}
 		if ref.length == 0 {
 			continue
 		}
@@ -132,11 +153,21 @@ func (s *undoStore) rewrite(refs []textRef) (map[textRef]textRef, error) {
 			return nil, io.ErrUnexpectedEOF
 		}
 		if _, ok := seen[ref]; !ok {
+			if ref.length > math.MaxInt64-liveBytes {
+				return nil, ErrLimitExceeded
+			}
 			seen[ref] = struct{}{}
 			unique = append(unique, ref)
+			liveBytes += ref.length
 		}
 	}
+	if report != nil {
+		report(0, liveBytes)
+	}
 	if len(unique) == 0 {
+		if err := contextError(ctx); err != nil {
+			return nil, err
+		}
 		if err := s.file.Truncate(0); err != nil {
 			return nil, err
 		}
@@ -156,12 +187,20 @@ func (s *undoStore) rewrite(refs []textRef) (map[textRef]textRef, error) {
 	}()
 	mapping := make(map[textRef]textRef, len(unique))
 	var size int64
+	buffer := make([]byte, undoRewriteBufferBytes)
 	for _, ref := range unique {
-		if _, err := io.CopyN(file, io.NewSectionReader(s.file, ref.offset, ref.length), ref.length); err != nil {
+		if err := copyUndoReference(ctx, file, s.file, ref, buffer, func(copied int64) {
+			if report != nil {
+				report(size+copied, liveBytes)
+			}
+		}); err != nil {
 			return nil, err
 		}
 		mapping[ref] = textRef{offset: size, length: ref.length}
 		size += ref.length
+	}
+	if err := contextError(ctx); err != nil {
+		return nil, err
 	}
 	oldFile, oldPath := s.file, s.path
 	s.file, s.path, s.size = file, file.Name(), size
@@ -172,6 +211,46 @@ func (s *undoStore) rewrite(refs []textRef) (map[textRef]textRef, error) {
 		removeErr = nil
 	}
 	return mapping, errors.Join(closeErr, removeErr)
+}
+
+type undoReferenceReader interface {
+	ReadAt([]byte, int64) (int, error)
+}
+
+type undoReferenceWriter interface {
+	Write([]byte) (int, error)
+}
+
+func copyUndoReference(ctx context.Context, destination undoReferenceWriter, source undoReferenceReader, ref textRef, buffer []byte, report func(int64)) error {
+	var copied int64
+	for copied < ref.length {
+		if err := contextError(ctx); err != nil {
+			return err
+		}
+		want := min(int64(len(buffer)), ref.length-copied)
+		n, readErr := source.ReadAt(buffer[:int(want)], ref.offset+copied)
+		if n < 0 || int64(n) > want {
+			return io.ErrUnexpectedEOF
+		}
+		if n > 0 {
+			written, writeErr := destination.Write(buffer[:n])
+			copied += int64(written)
+			report(copied)
+			if writeErr != nil {
+				return writeErr
+			}
+			if written != n {
+				return io.ErrShortWrite
+			}
+		}
+		if readErr != nil && !(errors.Is(readErr, io.EOF) && copied == ref.length) {
+			return readErr
+		}
+		if n == 0 && copied < ref.length {
+			return io.ErrUnexpectedEOF
+		}
+	}
+	return nil
 }
 
 func (s *undoStore) bytes() int64 {

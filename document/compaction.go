@@ -17,11 +17,13 @@ type CompactOptions struct {
 // CompactionResult describes structural reclamation without changing the
 // document revision or content.
 type CompactionResult struct {
+	OperationID         uint64
 	Metadata            Metadata
 	Pieces              store.CompactResult
 	UndoBytesBefore     int64
 	UndoBytesAfter      int64
 	JournalCheckpointed bool
+	Committed           bool
 }
 
 // Compact coalesces adjacent Piece Tree fragments and rewrites the undo store
@@ -70,17 +72,80 @@ func (s *Session) Compact(ctx context.Context, options CompactOptions) (Compacti
 	if err := contextError(operationContext); err != nil {
 		return result, err
 	}
-	result.Pieces = s.tree.Compact()
+	s.nextCompactionID++
+	if s.nextCompactionID == 0 {
+		s.nextCompactionID++
+	}
+	result.OperationID = s.nextCompactionID
 	result.UndoBytesBefore = s.undoStore.bytes()
 	refs := collectHistoryRefs(s.undo, s.redo)
-	mapping, err := s.undoStore.rewrite(refs)
+	progress := compactionEventProgress{
+		session: s,
+		value: CompactionProgress{
+			OperationID: result.OperationID, PiecesBefore: s.tree.PieceCount(),
+			JournalCheckpointed: result.JournalCheckpointed,
+		},
+	}
+	mapping, err := s.undoStore.rewriteContext(operationContext, refs, progress.report)
 	if mapping != nil {
 		remapHistoryRefs(s.undo, mapping)
 		remapHistoryRefs(s.redo, mapping)
+		result.Pieces = s.tree.Compact()
+		result.Committed = true
 	}
 	result.UndoBytesAfter = s.undoStore.bytes()
 	result.Metadata = s.metadataLocked()
+	progress.finish(result, err)
 	return result, err
+}
+
+type compactionEventProgress struct {
+	session *Session
+	value   CompactionProgress
+	started bool
+	last    int64
+	next    int64
+}
+
+func (p *compactionEventProgress) report(completed, total int64) {
+	if !p.started {
+		p.started = true
+		p.value.TotalBytes = total
+		p.last = -1
+		p.next = min(compactionProgressQuantum, total)
+		p.publish(EventCompactionStarted, nil)
+	}
+	p.value.CompletedBytes = completed
+	if total == 0 || completed < p.next || completed == p.last {
+		return
+	}
+	p.publish(EventCompactionProgress, nil)
+	p.last = completed
+	p.next = min(completed+compactionProgressQuantum, total)
+}
+
+func (p *compactionEventProgress) finish(result CompactionResult, err error) {
+	if !p.started {
+		return
+	}
+	if result.Committed {
+		p.value.CompletedBytes = p.value.TotalBytes
+		p.value.PiecesAfter = result.Pieces.AfterPieces
+	} else {
+		p.value.PiecesAfter = p.value.PiecesBefore
+	}
+	p.value.Committed = result.Committed
+	kind := EventCompacted
+	if err != nil {
+		kind = EventCompactionFailed
+	}
+	p.publish(kind, err)
+}
+
+func (p *compactionEventProgress) publish(kind EventKind, cause error) {
+	p.session.events.publish(SessionEvent{
+		Kind: kind, Metadata: p.session.metadataLocked(), Compaction: p.value, Cause: cause,
+	})
 }
 
 func collectHistoryRefs(groups ...[]historyEntry) []textRef {

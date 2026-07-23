@@ -20,7 +20,7 @@ func FuzzEventHubStateMachine(f *testing.F) {
 			historyLimit = int(input[0]%8) + 1
 			input = input[1:]
 		}
-		hub := newEventHub(historyLimit)
+		hub := newEventHub(historyLimit, 16)
 		sequence := uint64(0)
 		type trackedSubscription struct {
 			subscription *Subscription
@@ -28,6 +28,21 @@ func FuzzEventHubStateMachine(f *testing.F) {
 			closed       bool
 		}
 		subscriptions := make([]trackedSubscription, 0, 16)
+		checkStats := func() {
+			live := 0
+			for index := range subscriptions {
+				if !subscriptions[index].closed {
+					live++
+				}
+			}
+			stats := hub.stats()
+			if stats.Sequence != sequence || stats.HistoryEntries < 0 ||
+				stats.HistoryEntries > historyLimit || stats.MaximumHistory != historyLimit ||
+				stats.Subscriptions != live || stats.Subscriptions > stats.MaximumSubscriptions ||
+				stats.MaximumSubscriptions != 16 || stats.SequenceExhausted || stats.Closed {
+				t.Fatalf("event stats = %+v, sequence=%d live=%d", stats, sequence, live)
+			}
+		}
 
 		publish := func() {
 			sequence++
@@ -108,6 +123,7 @@ func FuzzEventHubStateMachine(f *testing.F) {
 					}
 				}
 			}
+			checkStats()
 		}
 
 		publish()
@@ -119,6 +135,11 @@ func FuzzEventHubStateMachine(f *testing.F) {
 			if err := subscriptions[index].subscription.Close(); err != nil {
 				t.Fatal(err)
 			}
+		}
+		stats := hub.stats()
+		if !stats.Closed || stats.SequenceExhausted || stats.Sequence != sequence ||
+			stats.Subscriptions != 0 || stats.HistoryEntries > historyLimit {
+			t.Fatalf("closed event stats = %+v", stats)
 		}
 	})
 }

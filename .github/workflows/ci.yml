@@ -81,6 +81,7 @@ jobs:
       - run: go test ./document -run=^$ -fuzz=FuzzSessionLifecycleBudgets -fuzztime=10s
       - run: go test ./document -run=^$ -fuzz=FuzzUTF8ReplacementBoundaries -fuzztime=10s
       - run: go test ./document -run=^$ -fuzz=FuzzEventHubStateMachine -fuzztime=10s
+      - run: go test ./document -run=^$ -fuzz=FuzzUndoStoreRewriteAtomicity -fuzztime=10s
       - run: go test ./document -run=^$ -fuzz=FuzzChangeHistoryStateMachine -fuzztime=10s
       - run: go test ./document -run=^$ -fuzz=FuzzVirtualPagerSessionLifecycle -fuzztime=10s
       - run: go test ./document/coordinate -run=^$ -fuzz=FuzzIndexMatchesUTF8Reference -fuzztime=10s

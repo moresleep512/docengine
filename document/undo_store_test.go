@@ -1,8 +1,11 @@
 package document
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -214,4 +217,207 @@ func TestUndoStoreRewriteLiveReferencesAndFailures(t *testing.T) {
 	if err := store.close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestUndoStoreRewriteCancellationPreservesActiveStore(t *testing.T) {
+	dir := t.TempDir()
+	store, err := openUndoStore(dir, DefaultUndoBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.close()
+	payload := bytes.Repeat([]byte("x"), 2*undoRewriteBufferBytes+17)
+	ref, err := store.append(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforePath, beforeSize := store.path, store.bytes()
+	ctx, cancel := context.WithCancel(context.Background())
+	var last, total int64
+	mapping, err := store.rewriteContext(ctx, []textRef{ref}, func(completed, reportedTotal int64) {
+		if completed < last || reportedTotal != int64(len(payload)) {
+			t.Fatalf("rewrite progress = (%d/%d) after %d", completed, reportedTotal, last)
+		}
+		last, total = completed, reportedTotal
+		if completed >= undoRewriteBufferBytes {
+			cancel()
+		}
+	})
+	if !errors.Is(err, context.Canceled) || mapping != nil {
+		t.Fatalf("canceled rewrite = (%+v, %v)", mapping, err)
+	}
+	if total != int64(len(payload)) || last != undoRewriteBufferBytes {
+		t.Fatalf("canceled progress = %d/%d", last, total)
+	}
+	if store.path != beforePath || store.bytes() != beforeSize {
+		t.Fatalf("active store changed: path=%q size=%d", store.path, store.bytes())
+	}
+	if got, err := store.read(ref); err != nil || !bytes.Equal([]byte(got), payload) {
+		t.Fatalf("active content after cancellation = (%d bytes, %v)", len(got), err)
+	}
+	files, err := filepath.Glob(filepath.Join(dir, ".docengine-undo-*.store"))
+	if err != nil || len(files) != 1 || files[0] != beforePath {
+		t.Fatalf("candidate cleanup = (%v, %v), active=%q", files, err, beforePath)
+	}
+}
+
+func TestUndoStoreRewriteContextAndSizeBoundaries(t *testing.T) {
+	var nilStore *undoStore
+	reported := false
+	if mapping, err := nilStore.rewriteContext(context.Background(), nil, func(completed, total int64) {
+		reported = completed == 0 && total == 0
+	}); err != nil || len(mapping) != 0 || !reported {
+		t.Fatalf("nil store rewrite = (%+v, %v), reported=%v", mapping, err, reported)
+	}
+	if _, err := nilStore.rewriteContext(nil, nil, nil); !errors.Is(err, ErrInvalidContext) {
+		t.Fatalf("nil context = %v", err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := nilStore.rewriteContext(canceled, nil, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-canceled context = %v", err)
+	}
+
+	store, err := openUndoStore(t.TempDir(), DefaultUndoBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.close()
+	validationCanceled := &cancelAfterErrChecksContext{Context: context.Background(), failAt: 3}
+	if _, err := store.rewriteContext(validationCanceled, []textRef{{}}, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("validation cancellation = %v", err)
+	}
+	emptyCanceled := &cancelAfterErrChecksContext{Context: context.Background(), failAt: 3}
+	if _, err := store.rewriteContext(emptyCanceled, nil, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("empty-store cancellation = %v", err)
+	}
+	ref, err := store.append([]byte("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforePath := store.path
+	finalContext, cancelFinal := context.WithCancel(context.Background())
+	mapping, err := store.rewriteContext(finalContext, []textRef{ref}, func(completed, total int64) {
+		if completed == total && total > 0 {
+			cancelFinal()
+		}
+	})
+	if mapping != nil || !errors.Is(err, context.Canceled) || store.path != beforePath {
+		t.Fatalf("final-check cancellation = (%+v, %v), path=%q", mapping, err, store.path)
+	}
+	store.size = math.MaxInt64
+	refs := []textRef{
+		{offset: 0, length: math.MaxInt64},
+		{offset: 1, length: math.MaxInt64 - 1},
+	}
+	if mapping, err := store.rewriteContext(context.Background(), refs, nil); mapping != nil ||
+		!errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("live-byte overflow = (%+v, %v)", mapping, err)
+	}
+}
+
+func TestCopyUndoReferenceDefendsBrokenIOContracts(t *testing.T) {
+	sentinel := errors.New("copy I/O")
+	fullWriter := undoWriteFunc(func(value []byte) (int, error) { return len(value), nil })
+	fullReader := undoReadAtFunc(func(value []byte, _ int64) (int, error) {
+		copy(value, "x")
+		return len(value), nil
+	})
+	cases := []struct {
+		name        string
+		reader      undoReferenceReader
+		writer      undoReferenceWriter
+		want        error
+		wantReports int
+	}{
+		{
+			name: "negative read count",
+			reader: undoReadAtFunc(func([]byte, int64) (int, error) {
+				return -1, nil
+			}),
+			writer: fullWriter, want: io.ErrUnexpectedEOF,
+		},
+		{
+			name: "oversized read count",
+			reader: undoReadAtFunc(func(value []byte, _ int64) (int, error) {
+				return len(value) + 1, nil
+			}),
+			writer: fullWriter, want: io.ErrUnexpectedEOF,
+		},
+		{
+			name:   "write error",
+			reader: fullReader,
+			writer: undoWriteFunc(func([]byte) (int, error) {
+				return 0, sentinel
+			}),
+			want: sentinel, wantReports: 1,
+		},
+		{
+			name:   "short write without error",
+			reader: fullReader,
+			writer: undoWriteFunc(func([]byte) (int, error) {
+				return 0, nil
+			}),
+			want: io.ErrShortWrite, wantReports: 1,
+		},
+		{
+			name: "read error",
+			reader: undoReadAtFunc(func([]byte, int64) (int, error) {
+				return 0, sentinel
+			}),
+			writer: fullWriter, want: sentinel,
+		},
+		{
+			name: "zero progress",
+			reader: undoReadAtFunc(func([]byte, int64) (int, error) {
+				return 0, nil
+			}),
+			writer: fullWriter, want: io.ErrUnexpectedEOF,
+		},
+		{
+			name: "terminal EOF with full read",
+			reader: undoReadAtFunc(func(value []byte, _ int64) (int, error) {
+				copy(value, "x")
+				return len(value), io.EOF
+			}),
+			writer: fullWriter, wantReports: 1,
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			reports := 0
+			err := copyUndoReference(context.Background(), test.writer, test.reader, textRef{length: 1}, make([]byte, 1), func(int64) {
+				reports++
+			})
+			if !errors.Is(err, test.want) || reports != test.wantReports {
+				t.Fatalf("copy error/reports = (%v, %d), want (%v, %d)", err, reports, test.want, test.wantReports)
+			}
+		})
+	}
+}
+
+type cancelAfterErrChecksContext struct {
+	context.Context
+	checks int
+	failAt int
+}
+
+func (c *cancelAfterErrChecksContext) Err() error {
+	c.checks++
+	if c.checks >= c.failAt {
+		return context.Canceled
+	}
+	return nil
+}
+
+type undoReadAtFunc func([]byte, int64) (int, error)
+
+func (f undoReadAtFunc) ReadAt(value []byte, offset int64) (int, error) {
+	return f(value, offset)
+}
+
+type undoWriteFunc func([]byte) (int, error)
+
+func (f undoWriteFunc) Write(value []byte) (int, error) {
+	return f(value)
 }

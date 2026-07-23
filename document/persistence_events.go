@@ -3,6 +3,7 @@ package document
 import "io"
 
 const saveProgressQuantum = int64(4 << 20)
+const compactionProgressQuantum = int64(4 << 20)
 
 func (s *Session) beginPersistenceLocked(targetRevision uint64, totalBytes int64) (PersistenceProgress, Metadata) {
 	s.nextPersistenceID++

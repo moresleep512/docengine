@@ -36,9 +36,10 @@ It currently provides:
 - bounded Session-managed ChangeMap history, linear chain composition,
   forward/reverse revision queries, lineage-checked index refresh, and
   cancellable atomic batch Anchor/range transforms with opaque annotations;
-- bounded, resumable Session event streams with precise slow-consumer loss
-  reporting, save progress, recovery-WAL durability transitions, and a
-  concurrent close barrier;
+- bounded, resumable Session event streams with a total subscription budget,
+  atomic statistics, precise slow-consumer loss reporting, save/compaction
+  progress, recovery-WAL durability transitions, and a concurrent close
+  barrier;
 - resolved Session resource limits, journal sync cadence, and explicit shared
   or owned runtime-directory policies;
 - one cross-generation budget for host-owned Snapshot, coordinate Index, and
@@ -133,8 +134,9 @@ but permanently non-mutating fault state instead of continuing unsafely.
 
 `OpenOptions` resolves zero-valued limits to documented defaults: 256
 operations per batch, 1 MiB per insertion, 256 MiB of undo storage, 256 retained
-events, 256 retained ChangeMaps, 65,536 Anchors per batch, a 4 GiB recovery
-journal hard limit, and a one-second journal sync interval. Automatic journal
+events, 128 concurrent event subscriptions, 256 retained ChangeMaps, 65,536
+Anchors per batch, a 4 GiB recovery journal hard limit, and a one-second journal
+sync interval. Automatic journal
 checkpointing is disabled unless `AutoCheckpointJournalBytes` is set; enabling
 it explicitly authorizes background saves once physical journal growth crosses
 the threshold. Failed automatic checkpoints back off by another threshold.
@@ -156,11 +158,14 @@ content. `Session.Config` reports the resolved policy.
 subscriber has a bounded queue and never blocks a transaction; when its queue
 overflows, the newest event replaces stale pending events and reports the exact
 omitted count in `Dropped`. `AfterSequence` resumes a consumer when history is
-still available and also reports any history gap. Open, recovery, committed
-Apply/Undo/Redo changes, save start/progress/completion/failure, recovery-WAL
-Sync failure/restoration, and close are published. Progress events correlate
-through `PersistenceProgress.OperationID`; post-commit failure is distinguishable
-from pre-commit failure. Concurrent `Close` callers wait for the same
+still available and also reports any history gap. The Session-wide subscriber
+count is bounded independently of queue size; `EventStats` reports retained
+history, live subscriptions, discarded deliveries, history gaps, closure, and
+counter exhaustion. Open, recovery, committed Apply/Undo/Redo changes,
+save/compaction start/progress/completion/failure, recovery-WAL Sync
+failure/restoration, and close are published. Progress events correlate through
+operation IDs and distinguish pre-commit failure from committed cleanup or
+durability failure. Concurrent `Close` callers wait for the same
 resource-retirement barrier and receive the same result.
 
 `document/coordinate` builds an immutable index for one Snapshot revision.
@@ -209,10 +214,16 @@ continuation Pages without guessing how their Measure is distributed.
 `Session.VirtualPager` owns its Snapshot lease until `Close`.
 
 `Session.Compact` coalesces only contiguous same-source Pieces and rewrites the
-undo store with live references. `CompactOptions.CheckpointJournal` explicitly
-persists a selected revision before rebasing the append-only journal; an
-uncommitted WAL is never rewritten in place because doing so would break crash
-atomicity or revision identity. Existing immutable Snapshots remain readable.
+undo store with live references. It validates and copies into a candidate store
+with 64 KiB cancellation checkpoints, then atomically switches the store,
+remaps history, and performs the infallible structural Piece compaction.
+Pre-commit failure leaves the active store, history, and tree unchanged. A
+retired-file cleanup error is explicitly reported as committed.
+`CompactOptions.CheckpointJournal` persists a selected revision before rebasing
+the append-only journal; an uncommitted WAL is never rewritten in place because
+doing so would break crash atomicity or revision identity. Compaction events
+share `CompactionProgress.OperationID`, report exact unique live bytes, and use
+a 4 MiB progress quantum. Existing immutable Snapshots remain readable.
 
 See [MODULES.md](MODULES.md) for implementation invariants and file-format
 details.
@@ -322,6 +333,18 @@ Windows and 0.323–0.339 ms on Linux, versus 27–29 ms and 20.6–21.9 ms for 
 full build. A 256-map `ComposeAll` used one allocation versus 256 for pairwise
 composition.
 
+The v0.5.6 Event/Compaction suite retained 100% statement coverage in all six
+packages on native Windows and Debian under WSL 2. The complete Linux
+repository passed three shuffled race runs. On Windows, the new
+event/compaction/undo paths passed 100 normal repetitions and ten race-enabled
+repetitions; the complete race run still reproduces the separately tracked
+journal-sync event timeout and open-handle cleanup failure that is intentionally
+deferred until all v0.5.x modules close. Event and undo-rewrite state-machine
+fuzzers each ran for 30 seconds per platform. Publishing with zero or 128
+backlogged subscribers remained allocation-free at roughly 29 ns and
+12.5–13.2 µs; rewriting 4 MiB of live undo data measured roughly 3.43–3.51 ms
+on Windows and 3.41–3.72 ms on Linux.
+
 Run the normal checks:
 
 ```bash
@@ -350,6 +373,7 @@ go test ./document -run=^$ -fuzz=FuzzSessionJournalQuotaIsAtomic -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzSessionLifecycleBudgets -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzUTF8ReplacementBoundaries -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzEventHubStateMachine -fuzztime=30s
+go test ./document -run=^$ -fuzz=FuzzUndoStoreRewriteAtomicity -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzChangeHistoryStateMachine -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzVirtualPagerSessionLifecycle -fuzztime=30s
 go test ./document/coordinate -run=^$ -fuzz=FuzzIndexMatchesUTF8Reference -fuzztime=30s
@@ -377,8 +401,8 @@ Windows race builds require a GCC-compatible MinGW-w64 toolchain; MSVC-target
   expired revision requires a full rebuild. Suffix reuse requires the new
   Source to be the exact ChangeMap result. Coordinate cache budgets cover
   resident windows, not a concurrent miss's transient read buffer.
-- File-watcher candidates and future indexing/virtualization progress events
-  are not implemented; save and recovery-WAL persistence transitions are.
+- File-watcher candidates and Virtual refresh/progress events are not
+  implemented; save, compaction, and recovery-WAL transitions are.
 - Journal compaction requires an explicit save checkpoint. Search indexing,
   search-index compaction, and composition are not implemented.
 - Fragment metadata and logical Page tables are bounded by configured page,
@@ -390,8 +414,8 @@ Windows race builds require a GCC-compatible MinGW-w64 toolchain; MSVC-target
 
 ## Next work
 
-The v0.5.x maintenance line next closes event/compaction and Virtual
-refresh/progress/performance gaps. After every existing module is closed, the
-known Windows journal-durability CI race is fixed and released separately.
-Only then does v0.6 start format-neutral search. The target architecture and
-remaining milestones are in [develop.md](develop.md).
+The v0.5.x maintenance line next closes Virtual refresh, progress, identity,
+and performance gaps. After every existing module is closed, the known Windows
+journal-durability CI race is fixed and released separately. Only then does
+v0.6 start format-neutral search. The target architecture and remaining
+milestones are in [develop.md](develop.md).

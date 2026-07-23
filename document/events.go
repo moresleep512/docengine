@@ -2,6 +2,7 @@ package document
 
 import (
 	"errors"
+	"math"
 	"sync"
 
 	"github.com/moresleep512/docengine/document/coordinate"
@@ -56,6 +57,16 @@ const (
 	// EventJournalSyncRestored reports the first successful Sync or clean save
 	// checkpoint after EventJournalSyncFailed.
 	EventJournalSyncRestored
+	// EventCompactionStarted begins structural and undo-store reclamation.
+	EventCompactionStarted
+	// EventCompactionProgress reports monotonically increasing live undo bytes
+	// copied into the candidate replacement store.
+	EventCompactionProgress
+	// EventCompacted reports a successfully committed compaction attempt.
+	EventCompacted
+	// EventCompactionFailed reports a compaction error. Compaction.Committed
+	// distinguishes a discarded candidate from committed cleanup failure.
+	EventCompactionFailed
 )
 
 // ChangeOrigin identifies the operation that produced an EventChanged map.
@@ -84,6 +95,7 @@ type SessionEvent struct {
 	Metadata    Metadata
 	Changes     coordinate.ChangeMap
 	Persistence PersistenceProgress
+	Compaction  CompactionProgress
 	Cause       error
 }
 
@@ -96,6 +108,33 @@ type PersistenceProgress struct {
 	CompletedBytes int64
 	TotalBytes     int64
 	Committed      bool
+}
+
+// CompactionProgress correlates compaction events. TotalBytes is the exact
+// unique live undo payload selected by the attempt. CompletedBytes is
+// monotonic and never exceeds it.
+type CompactionProgress struct {
+	OperationID         uint64
+	CompletedBytes      int64
+	TotalBytes          int64
+	PiecesBefore        int64
+	PiecesAfter         int64
+	JournalCheckpointed bool
+	Committed           bool
+}
+
+// EventStats is an atomic view of retained history, live subscriptions, and
+// subscriber-specific delivery loss. It remains available after Session close.
+type EventStats struct {
+	Sequence             uint64
+	HistoryEntries       int
+	MaximumHistory       int
+	Subscriptions        int
+	MaximumSubscriptions int
+	DiscardedDeliveries  uint64
+	HistoryGapEvents     uint64
+	SequenceExhausted    bool
+	Closed               bool
 }
 
 // SubscribeOptions controls replay and buffering for a Session subscription.
@@ -132,18 +171,25 @@ type subscriptionState struct {
 }
 
 type eventHub struct {
-	mu           sync.Mutex
-	closed       bool
-	sequence     uint64
-	nextID       uint64
-	history      []SessionEvent
-	historyStart int
-	historyCount int
-	subscribers  map[uint64]*subscriptionState
+	mu             sync.Mutex
+	closed         bool
+	sequence       uint64
+	nextID         uint64
+	history        []SessionEvent
+	historyStart   int
+	historyCount   int
+	subscribers    map[uint64]*subscriptionState
+	maxSubscribers int
+	discarded      uint64
+	historyGaps    uint64
+	exhausted      bool
 }
 
-func newEventHub(historyLimit int) *eventHub {
-	return &eventHub{history: make([]SessionEvent, historyLimit), subscribers: make(map[uint64]*subscriptionState)}
+func newEventHub(historyLimit, maxSubscribers int) *eventHub {
+	return &eventHub{
+		history: make([]SessionEvent, historyLimit), subscribers: make(map[uint64]*subscriptionState),
+		maxSubscribers: maxSubscribers,
+	}
 }
 
 func (h *eventHub) publish(event SessionEvent) {
@@ -152,12 +198,21 @@ func (h *eventHub) publish(event SessionEvent) {
 	if h.closed {
 		return
 	}
+	if h.sequence == math.MaxUint64 {
+		h.exhausted = true
+		h.closed = true
+		for id, subscriber := range h.subscribers {
+			delete(h.subscribers, id)
+			close(subscriber.events)
+		}
+		return
+	}
 	h.sequence++
 	event.Sequence = h.sequence
 	event.Dropped = 0
 	h.appendHistory(event)
 	for _, subscriber := range h.subscribers {
-		offerEvent(subscriber, event)
+		h.discarded = saturatingAdd(h.discarded, offerEvent(subscriber, event))
 	}
 }
 
@@ -188,47 +243,76 @@ func (h *eventHub) subscribe(options SubscribeOptions) (*Subscription, error) {
 	if options.AfterSequence > h.sequence {
 		return nil, ErrEventSequence
 	}
+	if len(h.subscribers) >= h.maxSubscribers {
+		return nil, ErrLimitExceeded
+	}
 	after := options.AfterSequence
 	if options.FutureOnly {
 		after = h.sequence
 	}
-	h.nextID++
 	state := &subscriptionState{events: make(chan SessionEvent, buffer)}
 	if h.historyCount > 0 && after < h.sequence {
 		earliest := h.sequence - uint64(h.historyCount) + 1
 		if after < earliest-1 {
 			state.pendingDropped = earliest - after - 1
+			h.historyGaps = saturatingAdd(h.historyGaps, state.pendingDropped)
 		}
 		for index := 0; index < h.historyCount; index++ {
 			event := h.history[(h.historyStart+index)%len(h.history)]
 			if event.Sequence > after {
-				offerEvent(state, event)
+				h.discarded = saturatingAdd(h.discarded, offerEvent(state, event))
 			}
 		}
 	}
-	h.subscribers[h.nextID] = state
-	return &Subscription{hub: h, id: h.nextID, events: state.events}, nil
+	id := h.nextSubscriptionID()
+	h.subscribers[id] = state
+	return &Subscription{hub: h, id: id, events: state.events}, nil
 }
 
-func offerEvent(subscriber *subscriptionState, event SessionEvent) {
+func offerEvent(subscriber *subscriptionState, event SessionEvent) uint64 {
 	event.Dropped = subscriber.pendingDropped
 	select {
 	case subscriber.events <- event:
 		subscriber.pendingDropped = 0
-		return
+		return 0
 	default:
 	}
 	dropped := subscriber.pendingDropped
+	var discarded uint64
 	for {
 		select {
 		case previous := <-subscriber.events:
-			dropped += previous.Dropped + 1
+			dropped = saturatingAdd(dropped, saturatingAdd(previous.Dropped, 1))
+			discarded++
 		default:
 			event.Dropped = dropped
 			subscriber.events <- event
 			subscriber.pendingDropped = 0
-			return
+			return discarded
 		}
+	}
+}
+
+func (h *eventHub) nextSubscriptionID() uint64 {
+	for {
+		h.nextID++
+		if h.nextID == 0 {
+			h.nextID++
+		}
+		if _, exists := h.subscribers[h.nextID]; !exists {
+			return h.nextID
+		}
+	}
+}
+
+func (h *eventHub) stats() EventStats {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return EventStats{
+		Sequence: h.sequence, HistoryEntries: h.historyCount, MaximumHistory: len(h.history),
+		Subscriptions: len(h.subscribers), MaximumSubscriptions: h.maxSubscribers,
+		DiscardedDeliveries: h.discarded, HistoryGapEvents: h.historyGaps,
+		SequenceExhausted: h.exhausted, Closed: h.closed,
 	}
 }
 
@@ -252,4 +336,11 @@ func (h *eventHub) close() {
 		delete(h.subscribers, id)
 		close(subscriber.events)
 	}
+}
+
+func saturatingAdd(value, increment uint64) uint64 {
+	if increment > math.MaxUint64-value {
+		return math.MaxUint64
+	}
+	return value + increment
 }
