@@ -214,21 +214,44 @@ existing newline metadata without inventing visual-layout semantics.
 Snapshot lease, so an index remains readable across later edits or saves and
 releases the retired generation on `Close`. Build and query paths are
 Context-aware, validate source length/read consistency, reject non-boundary or
-overflowing coordinates, and never cache complete document content.
+overflowing coordinates, and never retain an unbounded whole-document cache. Each Index
+owns a byte-bounded LRU of immutable query windows. `CacheBytes` defaults to
+1 MiB, is capped at 256 MiB, and conflicts with `DisableCache`; a window larger
+than the budget is read but not retained. Stats expose resident bytes, entries,
+hits, and misses. `Close` clears the cache before releasing the owned Source.
+Concurrent misses may hold transient read buffers outside the resident budget,
+but every published entry is evicted under the exact byte limit.
 
 `ChangeMap` is an immutable sequence of edits expressed in the coordinate
 space produced by each preceding edit. It carries before/after revisions and
 lengths, transforms Anchors with explicit before/after affinity, transforms
 ranges, composes adjacent maps, and can be inverted for history traversal.
+One map is capped at `MaximumEdits` (1,048,576), while one bulk transform is
+capped at `MaximumTransformSteps` (16,777,216 edit-by-anchor operations).
+Context variants poll cancellation between bounded units and preserve atomic
+failure. `ComposeAll` first validates the complete revision/length chain, then
+allocates and copies edits once. Session change-history queries use it instead
+of repeatedly copying an ever-growing prefix.
 `ApplyBatch`, `Undo`, and `Redo` return the committed map in `ApplyResult`;
 no-op batches return an identity map.
 
 `Rebuild` creates a new immutable Index from a previous Index, a new Source,
 and the exact ChangeMap chain between them. It verifies before/after revision
-and length, finds the minimum start across sequential edits, copies checkpoints
-only through the last checkpoint at or before that stable prefix, and scans the
-new Source from there. It never shifts an old suffix whose rune, line, or column
-state cannot be proved. The old and new Index own independent Source lifetimes.
+and length, finds the minimum start across sequential edits, and copies
+checkpoints through the last stable prefix checkpoint. It also tracks the
+untouched suffix through every sequential edit. When an old checkpoint exists
+before EOF in that suffix, Rebuild scans the new Source only to its mapped byte
+offset, uses the observed new rune/line/column state as a seam, and translates
+all later checkpoint states. Checkpoints on the seam's original line adjust
+their column by the observed column delta; checkpoints after a newline keep
+their old column and shift line/rune totals. This is a proof from the exact
+ChangeMap-result contract, not a byte-content heuristic. A mismatched new
+Source is invalid input, and a seam inside a UTF-8 rune is rejected.
+
+If no suffix checkpoint can avoid decoding (including an EOF-only candidate),
+Rebuild scans to EOF and reports zero suffix reuse. Prefix and suffix reuse are
+reported separately, and inherited cache policy starts empty for the new
+revision. The old and new Index own independent Source lifetimes.
 `RebuildOwned` and `Session.RebuildCoordinateIndex` preserve the same lease and
 failure-cleanup guarantees as full construction. Stats expose reuse and scan
 extent so hosts can choose when a full rebuild is cheaper.
@@ -532,3 +555,13 @@ passed 100 repeated runs; the detailed lifecycle/pre-commit matrix passed 30.
 Snapshot lease acquisition measured roughly 447–467 ns on Windows and
 347–353 ns on Linux at 368 B/four allocations, while the 4 MiB Session save
 benchmark measured roughly 49–50 ms and 10–11 ms respectively.
+
+For v0.5.5, both platforms retained six-package 100% statement coverage and
+passed three full shuffled race runs. The three coordinate fuzzers ran for
+30 seconds each per platform; cache, suffix translation, cancellation, and
+the exact 1,048,576-edit history boundary passed 100 normal and ten
+race-enabled repetitions. Cached query windows retained zero allocations.
+A 4 MiB middle edit rebuilt with prefix/suffix reuse in roughly 0.39–0.47 ms
+on Windows and 0.323–0.339 ms on Linux, versus 27–29 ms and 20.6–21.9 ms for
+full builds. A 256-map linear composition allocated once on both platforms;
+the pairwise comparison allocated 256 times.

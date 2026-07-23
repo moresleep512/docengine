@@ -29,13 +29,13 @@ It currently provides:
 - POSIX parent-directory synchronization and Windows `ReplaceFileW` with
   write-through replacement plus bounded transient-error retry;
 - symlink-target pinning and explicit post-commit fault handling;
-- revision-bound byte/line/rune coordinate indexes with bounded reads and
-  conservative ChangeMap-driven checkpoint-prefix reuse;
+- revision-bound byte/line/rune coordinate indexes with bounded LRU query
+  caching and proven ChangeMap-driven checkpoint prefix/suffix reuse;
 - sequential ChangeMaps and affinity-aware Anchors returned by edits,
   undo, and redo;
-- bounded Session-managed ChangeMap history, forward/reverse revision queries,
-  lineage-checked index refresh, and atomic batch Anchor/range transforms with
-  opaque generic annotations;
+- bounded Session-managed ChangeMap history, linear chain composition,
+  forward/reverse revision queries, lineage-checked index refresh, and
+  cancellable atomic batch Anchor/range transforms with opaque annotations;
 - bounded, resumable Session event streams with precise slow-consumer loss
   reporting, save progress, recovery-WAL durability transitions, and a
   concurrent close barrier;
@@ -165,18 +165,24 @@ resource-retirement barrier and receive the same result.
 
 `document/coordinate` builds an immutable index for one Snapshot revision.
 Checkpoints are placed only at UTF-8 boundaries, so byte/line/rune queries read
-at most one bounded checkpoint window. `ChangeMap` transforms Anchors and
-ranges across the sequential replacements in one committed edit, including
-explicit before/after insertion affinity. A Session coordinate index owns its
-Snapshot lease until `Close`.
+at most one bounded checkpoint window. Each Index owns a byte-bounded LRU of
+those immutable windows: the default is 1 MiB, the hard maximum is 256 MiB,
+and caching can be disabled. Stats report resident bytes, entries, hits, and
+misses. `ChangeMap` transforms Anchors and ranges across the sequential
+replacements in one committed edit, including explicit before/after insertion
+affinity. A Session coordinate index owns its Snapshot lease until `Close`.
 
 `coordinate.Rebuild` and `RebuildOwned` accept the exact ChangeMap chain from a
 previous Index to a new immutable Source. They validate both revisions and
-lengths, inherit the checkpoint interval, reuse only the prefix ending at or
-before every sequential edit, and rescan the remaining new content. This avoids
-unsafe suffix shifting when line/column state cannot be proved unchanged.
-`Session.RebuildCoordinateIndex` supplies the current Snapshot lease; Stats
-reports reused checkpoints and scanned bytes.
+lengths and inherit checkpoint/cache policy. They retain the prefix ending
+before every edit, derive the untouched old/new suffix boundary from the
+sequential map, scan only to the first useful old suffix checkpoint, then
+translate the remaining byte/rune/line/column states from the newly scanned
+seam. EOF alone is not reported as useful suffix reuse. This proof relies on
+the API contract that the new Source is exactly the result described by the
+ChangeMap; a mismatched Source is invalid input, not a reason to guess.
+`Session.RebuildCoordinateIndex` supplies the current Snapshot lease. Stats
+separate prefix/suffix checkpoint reuse and actual decoded bytes.
 
 Session-created indexes carry an opaque lineage that cannot be replaced through
 caller Options. `Session.RefreshCoordinateIndex` verifies that lineage, obtains
@@ -185,8 +191,12 @@ history rather than silently rebuilding from an unrelated prefix.
 `ChangesBetween` supports forward and reverse observable revision boundaries;
 atomic-batch interior revisions are rejected. `TransformAnchors` and
 `TransformRanges` apply that map to bounded batches without returning partial
-output. `coordinate.Annotation[T]` carries an opaque host value whose meaning
-is never interpreted by the core.
+output; their Context variants allow cancellation during work. One map or
+composed history is capped at 1,048,576 edits, and one batch transform at
+16,777,216 edit-by-anchor steps. `ComposeAll` validates a chain and copies its
+edits once, avoiding quadratic retained-history composition.
+`coordinate.Annotation[T]` carries an opaque host value whose meaning is never
+interpreted by the core.
 
 `document/virtual` builds a deterministic logical Page table for one immutable
 UTF-8 Source revision. Page boundaries prefer LF after a target size and are
@@ -301,6 +311,17 @@ measured about 447–467 ns on Windows and 347–353 ns on Linux (368 B and four
 allocations); the 4 MiB Session save benchmark measured about 49–50 ms and
 10–11 ms respectively.
 
+The v0.5.5 Coordinate/ChangeMap suite passed the same native Windows and WSL
+Linux matrix: all six packages remained at 100% statement coverage, the full
+repository passed three shuffled race runs, and all three coordinate fuzzers
+ran for 30 seconds per platform. Cache/suffix/cancellation/maximum-history
+boundaries passed 100 normal and ten race-enabled repetitions. A cached
+64 KiB-window query retained zero allocations versus one roughly 72 KiB
+allocation when disabled. A 4 MiB middle edit rebuilt in about 0.39–0.47 ms on
+Windows and 0.323–0.339 ms on Linux, versus 27–29 ms and 20.6–21.9 ms for a
+full build. A 256-map `ComposeAll` used one allocation versus 256 for pairwise
+composition.
+
 Run the normal checks:
 
 ```bash
@@ -353,9 +374,9 @@ Windows race builds require a GCC-compatible MinGW-w64 toolchain; MSVC-target
 - External-change checking still has the unavoidable final hash-to-replace
   race unless a host provides stronger file locking.
 - Session-managed ChangeMap history is bounded by retained transactions; an
-  expired revision requires a full rebuild. Incremental indexes conservatively
-  rescan from the earliest affected checkpoint; automatic cache ownership and
-  proven suffix reuse are not implemented.
+  expired revision requires a full rebuild. Suffix reuse requires the new
+  Source to be the exact ChangeMap result. Coordinate cache budgets cover
+  resident windows, not a concurrent miss's transient read buffer.
 - File-watcher candidates and future indexing/virtualization progress events
   are not implemented; save and recovery-WAL persistence transitions are.
 - Journal compaction requires an explicit save checkpoint. Search indexing,
@@ -369,9 +390,8 @@ Windows race builds require a GCC-compatible MinGW-w64 toolchain; MSVC-target
 
 ## Next work
 
-With v0.5 virtualization complete, v0.6 starts format-neutral search: a bounded
-streaming literal/regex correctness baseline followed by a contentless trigram
-index, atomic index generations, incremental dirty-region updates,
-cancellation, and candidate verification against the exact Snapshot.
-Multi-source composition follows after search. The target architecture and
+The v0.5.x maintenance line next closes event/compaction and Virtual
+refresh/progress/performance gaps. After every existing module is closed, the
+known Windows journal-durability CI race is fixed and released separately.
+Only then does v0.6 start format-neutral search. The target architecture and
 remaining milestones are in [develop.md](develop.md).

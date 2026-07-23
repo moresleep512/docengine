@@ -11,6 +11,36 @@ import (
 	"github.com/moresleep512/docengine/document/coordinate"
 )
 
+func TestChangeHistoryComposesExactMaximumEditPressureLinearly(t *testing.T) {
+	history := newChangeHistory(MaximumChangeHistory, 0, 1)
+	revision := uint64(0)
+	for entry := 0; entry < MaximumChangeHistory; entry++ {
+		edits := make([]coordinate.Edit, DefaultMaxBatchOperations)
+		change, err := coordinate.NewChangeMap(
+			revision,
+			revision+DefaultMaxBatchOperations,
+			1,
+			edits,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		history.append(change)
+		revision += DefaultMaxBatchOperations
+	}
+	composed, err := history.between(0, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if composed.Len() != coordinate.MaximumEdits ||
+		composed.BeforeRevision() != 0 || composed.AfterRevision() != revision ||
+		composed.BeforeLength() != 1 || composed.AfterLength() != 1 {
+		t.Fatalf("maximum history composition = revisions %d -> %d, length %d -> %d, edits %d",
+			composed.BeforeRevision(), composed.AfterRevision(),
+			composed.BeforeLength(), composed.AfterLength(), composed.Len())
+	}
+}
+
 func TestChangeHistoryForwardReverseExpiryAndBoundaries(t *testing.T) {
 	history := newChangeHistory(3, 0, 10)
 	first := mustChangeMap(t, 0, 2, 10, []coordinate.Edit{{Start: 2, OldLength: 3, NewLength: 1}})

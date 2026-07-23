@@ -3,6 +3,7 @@
 package coordinate
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"io"
@@ -15,6 +16,8 @@ import (
 const (
 	DefaultCheckpointBytes int64 = 64 << 10
 	MaximumCheckpointBytes int64 = 64 << 20
+	DefaultCacheBytes      int64 = 1 << 20
+	MaximumCacheBytes      int64 = 256 << 20
 	buildReadBufferSize          = 64 << 10
 )
 
@@ -54,19 +57,32 @@ type Lineage struct{ marker byte }
 func NewLineage() *Lineage { return &Lineage{} }
 
 type Options struct {
+	// CheckpointBytes bounds the bytes decoded by one coordinate query.
 	CheckpointBytes int64
-	Lineage         *Lineage
+	// CacheBytes bounds resident immutable query windows.
+	CacheBytes int64
+	// DisableCache requires CacheBytes to remain zero.
+	DisableCache bool
+	// Lineage is an opaque identity inherited by incremental rebuilds.
+	Lineage *Lineage
 }
 
 type Stats struct {
-	Revision          uint64
-	ByteLength        int64
-	RuneCount         int64
-	LineCount         int64
-	CheckpointCount   int
-	CheckpointBytes   int64
-	ReusedCheckpoints int
-	ScannedBytes      int64
+	Revision                uint64
+	ByteLength              int64
+	RuneCount               int64
+	LineCount               int64
+	CheckpointCount         int
+	CheckpointBytes         int64
+	ReusedCheckpoints       int
+	ReusedPrefixCheckpoints int
+	ReusedSuffixCheckpoints int
+	ScannedBytes            int64
+	CacheBytes              int64
+	CacheEntries            int
+	MaximumCacheBytes       int64
+	CacheHits               uint64
+	CacheMisses             uint64
 }
 
 // Position uses zero-based coordinates. Column counts Unicode code points
@@ -86,6 +102,11 @@ type checkpoint struct {
 	column     int64
 }
 
+type cacheEntry struct {
+	start int64
+	data  []byte
+}
+
 type Index struct {
 	mu              sync.RWMutex
 	source          Source
@@ -98,8 +119,18 @@ type Index struct {
 	checkpointBytes int64
 	checkpoints     []checkpoint
 	reused          int
+	reusedPrefix    int
+	reusedSuffix    int
 	scannedBytes    int64
 	lineage         *Lineage
+
+	cacheMu       sync.Mutex
+	cacheList     *list.List
+	cache         map[int64]*list.Element
+	cacheBytes    int64
+	maxCacheBytes int64
+	cacheHits     uint64
+	cacheMisses   uint64
 }
 
 func Build(ctx context.Context, source Source, revision uint64, options Options) (*Index, error) {
@@ -149,11 +180,8 @@ func build(ctx context.Context, source Source, revision uint64, options Options,
 	if length < 0 {
 		return nil, ErrInvalidSource
 	}
-	checkpointBytes := options.CheckpointBytes
-	if checkpointBytes == 0 {
-		checkpointBytes = DefaultCheckpointBytes
-	}
-	if checkpointBytes < 0 || checkpointBytes > MaximumCheckpointBytes {
+	checkpointBytes, cacheBytes, err := resolveOptions(options)
+	if err != nil {
 		return nil, ErrInvalidOptions
 	}
 	index := &Index{
@@ -164,6 +192,9 @@ func build(ctx context.Context, source Source, revision uint64, options Options,
 		checkpointBytes: checkpointBytes,
 		checkpoints:     []checkpoint{{}},
 		lineage:         options.Lineage,
+		cacheList:       list.New(),
+		cache:           make(map[int64]*list.Element),
+		maxCacheBytes:   cacheBytes,
 	}
 	if err := index.scan(ctx); err != nil {
 		return nil, err
@@ -185,41 +216,75 @@ func rebuild(ctx context.Context, source Source, previous *Index, changes Change
 	if length < 0 {
 		return nil, ErrInvalidSource
 	}
-	checkpointBytes, scanStart, checkpoints, err := incrementalSeed(previous, changes, length)
+	plan, err := incrementalSeed(previous, changes, length)
 	if err != nil {
 		return nil, err
 	}
 	index := &Index{
 		source: source, release: release, revision: changes.afterRevision,
-		byteLength: length, checkpointBytes: checkpointBytes, checkpoints: checkpoints,
-		reused: len(checkpoints), lineage: previousLineage(previous),
+		byteLength: length, checkpointBytes: plan.checkpointBytes, checkpoints: plan.prefix,
+		reused: plan.reusedPrefix, reusedPrefix: plan.reusedPrefix,
+		lineage: plan.lineage, cacheList: list.New(), cache: make(map[int64]*list.Element),
+		maxCacheBytes: plan.cacheBytes,
 	}
-	if err := index.scanFrom(ctx, checkpoints[len(checkpoints)-1], scanStart); err != nil {
+	state, err := index.scanSegment(ctx, plan.prefix[len(plan.prefix)-1], plan.scanStart, plan.scanEnd)
+	if err != nil {
 		return nil, err
 	}
+	if len(plan.suffix) == 0 {
+		index.finishScan(state, plan.scanStart)
+		return index, nil
+	}
+	index.appendTranslatedSuffix(state, plan.suffix)
+	index.scannedBytes = plan.scanEnd - plan.scanStart
 	return index, nil
 }
 
-func previousLineage(previous *Index) *Lineage {
-	previous.mu.RLock()
-	defer previous.mu.RUnlock()
-	return previous.lineage
+func resolveOptions(options Options) (int64, int64, error) {
+	checkpointBytes := options.CheckpointBytes
+	if checkpointBytes == 0 {
+		checkpointBytes = DefaultCheckpointBytes
+	}
+	cacheBytes := options.CacheBytes
+	if options.DisableCache {
+		if cacheBytes != 0 {
+			return 0, 0, ErrInvalidOptions
+		}
+	} else if cacheBytes == 0 {
+		cacheBytes = DefaultCacheBytes
+	}
+	if checkpointBytes < 0 || checkpointBytes > MaximumCheckpointBytes ||
+		cacheBytes < 0 || cacheBytes > MaximumCacheBytes {
+		return 0, 0, ErrInvalidOptions
+	}
+	return checkpointBytes, cacheBytes, nil
 }
 
-func incrementalSeed(previous *Index, changes ChangeMap, afterLength int64) (int64, int64, []checkpoint, error) {
+type incrementalPlan struct {
+	checkpointBytes int64
+	cacheBytes      int64
+	scanStart       int64
+	scanEnd         int64
+	prefix          []checkpoint
+	suffix          []checkpoint
+	reusedPrefix    int
+	lineage         *Lineage
+}
+
+func incrementalSeed(previous *Index, changes ChangeMap, afterLength int64) (incrementalPlan, error) {
 	previous.mu.RLock()
 	defer previous.mu.RUnlock()
 	if previous.closed {
-		return 0, 0, nil, ErrClosed
+		return incrementalPlan{}, ErrClosed
 	}
 	if previous.revision != changes.beforeRevision {
-		return 0, 0, nil, ErrRevisionMismatch
+		return incrementalPlan{}, ErrRevisionMismatch
 	}
 	if previous.byteLength != changes.beforeLength || afterLength != changes.afterLength {
-		return 0, 0, nil, ErrLengthMismatch
+		return incrementalPlan{}, ErrLengthMismatch
 	}
 	if previous.checkpointBytes <= 0 || previous.checkpointBytes > MaximumCheckpointBytes || len(previous.checkpoints) == 0 || previous.checkpoints[0] != (checkpoint{}) {
-		return 0, 0, nil, ErrInvalidIndex
+		return incrementalPlan{}, ErrInvalidIndex
 	}
 	stablePrefix := changes.beforeLength
 	for _, edit := range changes.edits {
@@ -231,33 +296,66 @@ func incrementalSeed(previous *Index, changes ChangeMap, afterLength int64) (int
 		return previous.checkpoints[index].byteOffset > stablePrefix
 	}) - 1
 	if last < 0 {
-		return 0, 0, nil, ErrInvalidIndex
+		return incrementalPlan{}, ErrInvalidIndex
 	}
 	checkpoints := append([]checkpoint(nil), previous.checkpoints[:last+1]...)
 	scanStart := checkpoints[len(checkpoints)-1].byteOffset
 	if scanStart < 0 || scanStart > stablePrefix || scanStart > afterLength {
-		return 0, 0, nil, ErrInvalidIndex
+		return incrementalPlan{}, ErrInvalidIndex
 	}
-	return previous.checkpointBytes, scanStart, checkpoints, nil
+	plan := incrementalPlan{
+		checkpointBytes: previous.checkpointBytes,
+		cacheBytes:      previous.maxCacheBytes,
+		scanStart:       scanStart,
+		scanEnd:         afterLength,
+		prefix:          checkpoints,
+		reusedPrefix:    len(checkpoints),
+		lineage:         previous.lineage,
+	}
+	if len(changes.edits) == 0 {
+		plan.scanEnd = scanStart
+		plan.suffix = append([]checkpoint(nil), previous.checkpoints[last+1:]...)
+		return plan, nil
+	}
+	oldSuffix, newSuffix, ok := changes.stableSuffix()
+	if !ok {
+		return incrementalPlan{}, ErrInvalidIndex
+	}
+	suffixIndex := sort.Search(len(previous.checkpoints), func(index int) bool {
+		return previous.checkpoints[index].byteOffset >= oldSuffix
+	})
+	if suffixIndex >= len(previous.checkpoints)-1 {
+		return plan, nil
+	}
+	oldSeam := previous.checkpoints[suffixIndex].byteOffset
+	newSeam := newSuffix + oldSeam - oldSuffix
+	plan.scanEnd = newSeam
+	plan.suffix = append([]checkpoint(nil), previous.checkpoints[suffixIndex:]...)
+	return plan, nil
 }
 
 func (i *Index) scan(ctx context.Context) error {
-	return i.scanFrom(ctx, checkpoint{}, 0)
+	state, err := i.scanSegment(ctx, checkpoint{}, 0, i.byteLength)
+	if err != nil {
+		return err
+	}
+	i.finishScan(state, 0)
+	return nil
 }
 
-func (i *Index) scanFrom(ctx context.Context, state checkpoint, scanStart int64) error {
+func (i *Index) scanSegment(ctx context.Context, state checkpoint, scanStart, scanEnd int64) (checkpoint, error) {
 	buffer := make([]byte, buildReadBufferSize)
 	pending := make([]byte, 0, utf8.UTFMax-1)
 	readOffset := scanStart
 	nextCheckpoint := nextCheckpointAfter(scanStart, i.checkpointBytes)
-	for readOffset < i.byteLength {
+	for readOffset < scanEnd {
 		if err := ctx.Err(); err != nil {
-			return err
+			return checkpoint{}, err
 		}
-		want := min(int64(len(buffer)), i.byteLength-readOffset)
+		want := min(int64(len(buffer)), scanEnd-readOffset)
 		n, readErr := i.source.ReadAt(buffer[:int(want)], readOffset)
 		if n < 0 || int64(n) > want {
-			return ErrSourceInconsistent
+			return checkpoint{}, ErrSourceInconsistent
 		}
 		data := make([]byte, 0, len(pending)+n)
 		data = append(data, pending...)
@@ -267,7 +365,7 @@ func (i *Index) scanFrom(ctx context.Context, state checkpoint, scanStart int64)
 		cursor := 0
 		for cursor < len(data) {
 			if err := ctx.Err(); err != nil {
-				return err
+				return checkpoint{}, err
 			}
 			if !utf8.FullRune(data[cursor:]) {
 				pending = append(pending, data[cursor:]...)
@@ -275,7 +373,7 @@ func (i *Index) scanFrom(ctx context.Context, state checkpoint, scanStart int64)
 			}
 			r, size := utf8.DecodeRune(data[cursor:])
 			if r == utf8.RuneError && size == 1 {
-				return ErrInvalidUTF8
+				return checkpoint{}, ErrInvalidUTF8
 			}
 			absolute := base + int64(cursor)
 			if absolute >= nextCheckpoint {
@@ -293,19 +391,27 @@ func (i *Index) scanFrom(ctx context.Context, state checkpoint, scanStart int64)
 			cursor += size
 		}
 		readOffset += int64(n)
-		if readErr != nil && !(errors.Is(readErr, io.EOF) && readOffset == i.byteLength) {
-			return readErr
+		if readErr != nil && !(errors.Is(readErr, io.EOF) && readOffset == scanEnd && scanEnd == i.byteLength) {
+			return checkpoint{}, readErr
 		}
-		if n == 0 && readOffset < i.byteLength {
-			return io.ErrUnexpectedEOF
+		if n == 0 && readOffset < scanEnd {
+			return checkpoint{}, io.ErrUnexpectedEOF
 		}
 	}
 	if len(pending) != 0 {
-		return ErrInvalidUTF8
+		if scanEnd == i.byteLength {
+			return checkpoint{}, ErrInvalidUTF8
+		}
+		return checkpoint{}, ErrSourceInconsistent
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return checkpoint{}, err
 	}
+	state.byteOffset = scanEnd
+	return state, nil
+}
+
+func (i *Index) finishScan(state checkpoint, scanStart int64) {
 	state.byteOffset = i.byteLength
 	if last := i.checkpoints[len(i.checkpoints)-1]; last.byteOffset != state.byteOffset {
 		i.checkpoints = append(i.checkpoints, state)
@@ -315,16 +421,50 @@ func (i *Index) scanFrom(ctx context.Context, state checkpoint, scanStart int64)
 	i.runeCount = state.runeOffset
 	i.lineCount = state.line + 1
 	i.scannedBytes = i.byteLength - scanStart
-	return nil
+}
+
+func (i *Index) appendTranslatedSuffix(newSeam checkpoint, suffix []checkpoint) {
+	oldSeam := suffix[0]
+	reusedSuffix := len(suffix)
+	for index, old := range suffix {
+		translated := checkpoint{
+			byteOffset: newSeam.byteOffset + old.byteOffset - oldSeam.byteOffset,
+			runeOffset: newSeam.runeOffset + old.runeOffset - oldSeam.runeOffset,
+			line:       newSeam.line + old.line - oldSeam.line,
+			column:     old.column,
+		}
+		if old.line == oldSeam.line {
+			translated.column = newSeam.column + old.column - oldSeam.column
+		}
+		if last := i.checkpoints[len(i.checkpoints)-1]; last.byteOffset == translated.byteOffset {
+			i.checkpoints[len(i.checkpoints)-1] = translated
+			if index == 0 {
+				reusedSuffix--
+			}
+		} else {
+			i.checkpoints = append(i.checkpoints, translated)
+		}
+		if index == len(suffix)-1 {
+			i.runeCount = translated.runeOffset
+			i.lineCount = translated.line + 1
+		}
+	}
+	i.reusedSuffix = reusedSuffix
+	i.reused = i.reusedPrefix + reusedSuffix
 }
 
 func (i *Index) Stats() Stats {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
+	i.cacheMu.Lock()
+	defer i.cacheMu.Unlock()
 	return Stats{
 		Revision: i.revision, ByteLength: i.byteLength, RuneCount: i.runeCount,
 		LineCount: i.lineCount, CheckpointCount: len(i.checkpoints), CheckpointBytes: i.checkpointBytes,
-		ReusedCheckpoints: i.reused, ScannedBytes: i.scannedBytes,
+		ReusedCheckpoints: i.reused, ReusedPrefixCheckpoints: i.reusedPrefix,
+		ReusedSuffixCheckpoints: i.reusedSuffix, ScannedBytes: i.scannedBytes,
+		CacheBytes: i.cacheBytes, CacheEntries: len(i.cache), MaximumCacheBytes: i.maxCacheBytes,
+		CacheHits: i.cacheHits, CacheMisses: i.cacheMisses,
 	}
 }
 
@@ -490,6 +630,11 @@ func (i *Index) Close() error {
 		return nil
 	}
 	i.closed = true
+	i.cacheMu.Lock()
+	i.cache = nil
+	i.cacheList.Init()
+	i.cacheBytes = 0
+	i.cacheMu.Unlock()
 	if i.release == nil {
 		return nil
 	}
@@ -501,6 +646,9 @@ func (i *Index) Close() error {
 func (i *Index) readWindow(ctx context.Context, start int64) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if data, ok := i.cachedWindow(start); ok {
+		return data, nil
 	}
 	window := i.checkpointBytes + utf8.UTFMax
 	end := i.byteLength
@@ -525,6 +673,7 @@ func (i *Index) readWindow(ctx context.Context, start int64) ([]byte, error) {
 			return nil, io.ErrUnexpectedEOF
 		}
 	}
+	i.storeWindow(start, data)
 	return data, nil
 }
 

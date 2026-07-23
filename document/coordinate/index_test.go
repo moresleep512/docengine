@@ -341,6 +341,7 @@ type testSource struct {
 	baseOffset      int64
 	maximumPerRead  int
 	afterRead       func()
+	readCalls       int
 }
 
 func (s *testSource) Len() int64 {
@@ -353,6 +354,7 @@ func (s *testSource) Len() int64 {
 func (s *testSource) ReadAt(p []byte, off int64) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.readCalls++
 	if len(p) > s.maximumRead {
 		s.maximumRead = len(p)
 	}
@@ -370,6 +372,12 @@ func (s *testSource) ReadAt(p []byte, off int64) (int, error) {
 		s.afterRead()
 	}
 	return n + s.countAdjustment, err
+}
+
+func (s *testSource) readCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readCalls
 }
 
 func (s *testSource) Close() error {

@@ -1,8 +1,16 @@
 package coordinate
 
 import (
+	"context"
 	"errors"
 	"math"
+)
+
+const (
+	// MaximumEdits bounds one immutable ChangeMap, including a composed map.
+	MaximumEdits = 1 << 20
+	// MaximumTransformSteps bounds edit-by-anchor work in one batch call.
+	MaximumTransformSteps = 16 << 20
 )
 
 var (
@@ -12,6 +20,7 @@ var (
 	ErrInvertedRange    = errors.New("coordinate: transformed range is inverted")
 	ErrRevisionMismatch = errors.New("coordinate: revision mismatch")
 	ErrLengthMismatch   = errors.New("coordinate: document length mismatch")
+	ErrTooComplex       = errors.New("coordinate: complexity limit exceeded")
 )
 
 type Affinity uint8
@@ -62,6 +71,9 @@ func NewChangeMap(beforeRevision, afterRevision uint64, beforeLength int64, edit
 	if beforeLength < 0 || len(edits) == 0 && beforeRevision != afterRevision {
 		return ChangeMap{}, ErrInvalidChange
 	}
+	if len(edits) > MaximumEdits {
+		return ChangeMap{}, ErrTooComplex
+	}
 	length := beforeLength
 	copyOfEdits := append([]Edit(nil), edits...)
 	for _, edit := range copyOfEdits {
@@ -104,6 +116,25 @@ func (m ChangeMap) Transform(anchor Anchor) (Anchor, error) {
 // TransformAnchors applies this map to an anchor batch while preserving input
 // order. Validation is atomic: an invalid anchor returns no partial result.
 func (m ChangeMap) TransformAnchors(anchors []Anchor) ([]Anchor, error) {
+	return m.transformAnchors(nil, anchors)
+}
+
+// TransformAnchorsContext is TransformAnchors with cancellation between
+// bounded units of edit-by-anchor work.
+func (m ChangeMap) TransformAnchorsContext(ctx context.Context, anchors []Anchor) ([]Anchor, error) {
+	if ctx == nil {
+		return nil, ErrInvalidContext
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return m.transformAnchors(ctx, anchors)
+}
+
+func (m ChangeMap) transformAnchors(ctx context.Context, anchors []Anchor) ([]Anchor, error) {
+	if transformTooComplex(len(m.edits), len(anchors), 1) {
+		return nil, ErrTooComplex
+	}
 	result := append([]Anchor(nil), anchors...)
 	for _, anchor := range result {
 		if anchor.Affinity != AffinityBefore && anchor.Affinity != AffinityAfter {
@@ -114,7 +145,17 @@ func (m ChangeMap) TransformAnchors(anchors []Anchor) ([]Anchor, error) {
 		}
 	}
 	for _, edit := range m.edits {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		for index := range result {
+			if ctx != nil && index&1023 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
 			result[index].Offset = transformOffset(result[index].Offset, result[index].Affinity, edit)
 		}
 	}
@@ -143,29 +184,53 @@ func (m ChangeMap) TransformRange(value AnchoredRange) (AnchoredRange, error) {
 // order. Validation is atomic: invalid input or an inverted transformed range
 // returns no partial result.
 func (m ChangeMap) TransformRanges(values []AnchoredRange) ([]AnchoredRange, error) {
+	return m.transformRanges(nil, values)
+}
+
+// TransformRangesContext is TransformRanges with cancellation and the same
+// all-or-nothing validation contract.
+func (m ChangeMap) TransformRangesContext(ctx context.Context, values []AnchoredRange) ([]AnchoredRange, error) {
+	if ctx == nil {
+		return nil, ErrInvalidContext
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return m.transformRanges(ctx, values)
+}
+
+func (m ChangeMap) transformRanges(ctx context.Context, values []AnchoredRange) ([]AnchoredRange, error) {
 	if values == nil {
 		return nil, nil
 	}
+	if transformTooComplex(len(m.edits), len(values), 2) {
+		return nil, ErrTooComplex
+	}
+	anchors := make([]Anchor, 0, len(values)*2)
 	for _, value := range values {
 		if value.Start.Offset > value.End.Offset {
 			return nil, ErrInvalidRange
 		}
-		for _, anchor := range [...]Anchor{value.Start, value.End} {
-			if anchor.Affinity != AffinityBefore && anchor.Affinity != AffinityAfter {
-				return nil, ErrInvalidAffinity
-			}
-			if anchor.Offset < 0 || anchor.Offset > m.beforeLength {
-				return nil, ErrInvalidOffset
-			}
-		}
+		anchors = append(anchors, value.Start, value.End)
+	}
+	var (
+		transformed []Anchor
+		err         error
+	)
+	if ctx == nil {
+		transformed, err = m.TransformAnchors(anchors)
+	} else {
+		transformed, err = m.TransformAnchorsContext(ctx, anchors)
+	}
+	if err != nil {
+		return nil, err
 	}
 	result := make([]AnchoredRange, len(values))
 	for index := range result {
-		transformed, err := m.TransformRange(values[index])
-		if err != nil {
-			return nil, err
+		result[index] = AnchoredRange{Start: transformed[index*2], End: transformed[index*2+1]}
+		if result[index].Start.Offset > result[index].End.Offset {
+			return nil, ErrInvertedRange
 		}
-		result[index] = transformed
 	}
 	return result, nil
 }
@@ -173,6 +238,22 @@ func (m ChangeMap) TransformRanges(values []AnchoredRange) ([]AnchoredRange, err
 // TransformAnnotations applies this map to opaque host annotations without
 // interpreting or copying their values beyond normal Go assignment.
 func TransformAnnotations[T any](m ChangeMap, values []Annotation[T]) ([]Annotation[T], error) {
+	return transformAnnotations(nil, m, values)
+}
+
+// TransformAnnotationsContext transforms opaque annotations with bounded,
+// cancellable ChangeMap work.
+func TransformAnnotationsContext[T any](ctx context.Context, m ChangeMap, values []Annotation[T]) ([]Annotation[T], error) {
+	if ctx == nil {
+		return nil, ErrInvalidContext
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return transformAnnotations(ctx, m, values)
+}
+
+func transformAnnotations[T any](ctx context.Context, m ChangeMap, values []Annotation[T]) ([]Annotation[T], error) {
 	if values == nil {
 		return nil, nil
 	}
@@ -180,7 +261,15 @@ func TransformAnnotations[T any](m ChangeMap, values []Annotation[T]) ([]Annotat
 	for index := range values {
 		ranges[index] = values[index].Range
 	}
-	transformed, err := m.TransformRanges(ranges)
+	var (
+		transformed []AnchoredRange
+		err         error
+	)
+	if ctx == nil {
+		transformed, err = m.TransformRanges(ranges)
+	} else {
+		transformed, err = m.TransformRangesContext(ctx, ranges)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -192,18 +281,36 @@ func TransformAnnotations[T any](m ChangeMap, values []Annotation[T]) ([]Annotat
 }
 
 func (m ChangeMap) Compose(next ChangeMap) (ChangeMap, error) {
-	if m.afterRevision != next.beforeRevision {
-		return ChangeMap{}, ErrRevisionMismatch
+	return m.ComposeAll(next)
+}
+
+// ComposeAll composes an adjacent chain with one validation pass and one edit
+// allocation. It avoids the quadratic copying caused by repeatedly composing
+// a long retained history.
+func (m ChangeMap) ComposeAll(next ...ChangeMap) (ChangeMap, error) {
+	total := len(m.edits)
+	previousRevision, previousLength := m.afterRevision, m.afterLength
+	for _, change := range next {
+		if previousRevision != change.beforeRevision {
+			return ChangeMap{}, ErrRevisionMismatch
+		}
+		if previousLength != change.beforeLength {
+			return ChangeMap{}, ErrLengthMismatch
+		}
+		if len(change.edits) > MaximumEdits-total {
+			return ChangeMap{}, ErrTooComplex
+		}
+		total += len(change.edits)
+		previousRevision, previousLength = change.afterRevision, change.afterLength
 	}
-	if m.afterLength != next.beforeLength {
-		return ChangeMap{}, ErrLengthMismatch
-	}
-	edits := make([]Edit, 0, len(m.edits)+len(next.edits))
+	edits := make([]Edit, 0, total)
 	edits = append(edits, m.edits...)
-	edits = append(edits, next.edits...)
+	for _, change := range next {
+		edits = append(edits, change.edits...)
+	}
 	return ChangeMap{
-		beforeRevision: m.beforeRevision, afterRevision: next.afterRevision,
-		beforeLength: m.beforeLength, afterLength: next.afterLength, edits: edits,
+		beforeRevision: m.beforeRevision, afterRevision: previousRevision,
+		beforeLength: m.beforeLength, afterLength: previousLength, edits: edits,
 	}, nil
 }
 
@@ -217,6 +324,41 @@ func (m ChangeMap) Invert() ChangeMap {
 		beforeRevision: m.afterRevision, afterRevision: m.beforeRevision,
 		beforeLength: m.afterLength, afterLength: m.beforeLength, edits: edits,
 	}
+}
+
+// stableSuffix returns corresponding boundaries after which the final
+// document is guaranteed to contain the untouched suffix of the original
+// document. The guarantee follows from the sequential edit contract; no
+// content interpretation is involved.
+func (m ChangeMap) stableSuffix() (int64, int64, bool) {
+	oldStart, currentStart := int64(0), int64(0)
+	currentLength := m.beforeLength
+	for _, edit := range m.edits {
+		if edit.Start < 0 || edit.OldLength < 0 || edit.NewLength < 0 ||
+			edit.Start > currentLength || edit.OldLength > currentLength-edit.Start {
+			return 0, 0, false
+		}
+		end := edit.Start + edit.OldLength
+		if end <= currentStart {
+			delta := edit.NewLength - edit.OldLength
+			currentStart += delta
+		} else {
+			if end > currentStart {
+				oldStart += end - currentStart
+			}
+			currentStart = edit.Start + edit.NewLength
+		}
+		remaining := currentLength - edit.OldLength
+		if edit.NewLength > math.MaxInt64-remaining {
+			return 0, 0, false
+		}
+		currentLength = remaining + edit.NewLength
+	}
+	if currentLength != m.afterLength ||
+		m.beforeLength-oldStart != m.afterLength-currentStart {
+		return 0, 0, false
+	}
+	return oldStart, currentStart, true
 }
 
 func transformOffset(offset int64, affinity Affinity, edit Edit) int64 {
@@ -237,4 +379,15 @@ func transformOffset(offset int64, affinity Affinity, edit Edit) int64 {
 		return edit.Start
 	}
 	return offset - edit.OldLength + edit.NewLength
+}
+
+func transformTooComplex(edits, items, factor int) bool {
+	if edits == 0 || items == 0 {
+		return false
+	}
+	if factor > MaximumTransformSteps/edits {
+		return true
+	}
+	perItem := edits * factor
+	return items > MaximumTransformSteps/perItem
 }

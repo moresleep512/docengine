@@ -27,11 +27,11 @@ UTF-8、范围、revision 和不可变 Snapshot；它不能理解 Markdown、JSO
 - POSIX 父目录同步，以及带有界瞬态错误重试的 Windows `ReplaceFileW`
   write-through 替换；
 - 符号链接真实目标固定，以及提交后故障的显式只读状态；
-- 绑定 revision、按 UTF-8 边界建立且查询读取有界的 byte/line/rune 坐标索引，并支持
-  由 ChangeMap 驱动的保守 checkpoint 前缀复用；
+- 绑定 revision、查询读取有界且带有界 LRU 窗口缓存的 byte/line/rune 坐标索引，并支持
+  由 ChangeMap 驱动、可证明安全的 checkpoint 前缀/后缀复用；
 - 编辑、undo、redo 返回顺序 ChangeMap，并支持带前后粘性的 Anchor；
-- Session 托管有界 ChangeMap 历史、正反 revision 查询、带 lineage 校验的索引刷新，
-  以及原子批量 Anchor/范围变换和 opaque 泛型 annotation；
+- Session 托管有界 ChangeMap 历史、线性映射链组合、正反 revision 查询、带 lineage
+  校验的索引刷新，以及可取消的原子批量 Anchor/范围变换和 opaque 泛型 annotation；
 - 有界、可续接的 Session 事件流，精确报告慢消费者丢失量，发布保存进度与恢复 WAL
   耐久性跃迁，并提供并发关闭屏障；
 - Session 资源限制、journal 同步周期以及 shared/owned 运行时目录策略均可配置并可查询；
@@ -130,22 +130,28 @@ Apply/Undo/Redo 变更、保存开始/进度/完成/失败、恢复 WAL Sync 失
 fault。多个并发 `Close` 调用者等待同一个资源退役屏障并得到相同结果。
 
 `document/coordinate` 为一个固定 Snapshot revision 构建不可变索引。checkpoint 只落在
-UTF-8 边界，因此 byte/line/rune 查询最多读取一个有界窗口。`ChangeMap` 按一次提交中
-替换的先后顺序变换 Anchor 和范围，并明确定义插入边界的 before/after 粘性。通过
-Session 创建的坐标索引在 `Close` 前持有对应 Snapshot lease。
+UTF-8 边界，因此 byte/line/rune 查询最多读取一个有界窗口。每个 Index 自有按字节严格
+限制的不可变窗口 LRU：默认 1 MiB、硬上限 256 MiB，也可以关闭；Stats 报告驻留字节、
+条目数和命中/未命中。`ChangeMap` 按一次提交中替换的先后顺序变换 Anchor 和范围，并
+明确定义插入边界的 before/after 粘性。通过 Session 创建的坐标索引在 `Close` 前持有
+对应 Snapshot lease。
 
 `coordinate.Rebuild` 和 `RebuildOwned` 接收从旧 Index 到新不可变 Source 的精确
-ChangeMap 链，验证两端 revision 和长度、继承 checkpoint 间隔，只复用位于所有顺序编辑
-之前的前缀，并重新扫描剩余新内容。无法证明行列状态仍正确的后缀不会被冒险平移。
-`Session.RebuildCoordinateIndex` 提供当前 Snapshot lease；Stats 会报告复用 checkpoint
-数量和实际扫描字节数。
+ChangeMap 链，验证两端 revision 和长度，并继承 checkpoint/cache 策略。它保留所有编辑
+之前的前缀，根据顺序映射推导未触碰旧/新后缀的对应边界，只扫描到第一个真正有收益的旧
+后缀 checkpoint，再以新扫描出的 seam 校准并平移后续 byte/rune/line/column 状态；单独
+一个 EOF 标记不会伪报为后缀复用。证明依赖公开契约：新 Source 必须正是 ChangeMap
+描述的结果；不匹配的 Source 是非法输入，不会靠猜测修正。Stats 分别报告前缀/后缀
+checkpoint 复用量和实际解码字节数。
 
 Session 创建的 Index 带有不可由调用方 Options 替换的 opaque lineage。
 `Session.RefreshCoordinateIndex` 会校验 lineage，并把保留的映射链与当前 Snapshot 原子
 取得；历史已淘汰时明确失败，不会用无关前缀静默重建。`ChangesBetween` 支持真实可观察
 revision 边界间的正向与反向查询，原子批次内部 revision 会被拒绝。`TransformAnchors`
-与 `TransformRanges` 在预算内原子变换 Anchor/范围批次，不返回部分结果；
-`coordinate.Annotation[T]` 只携带内核绝不解释的宿主值。
+与 `TransformRanges` 在预算内原子变换 Anchor/范围批次，不返回部分结果，其 Context
+版本支持处理中取消。单个或组合 ChangeMap 最多 1,048,576 个 edit，一次批量变换最多
+16,777,216 个 edit×anchor 步骤；`ComposeAll` 一次校验、一次复制整条链，避免保留历史
+逐段组合的二次复杂度。`coordinate.Annotation[T]` 只携带内核绝不解释的宿主值。
 
 `document/virtual` 为一个不可变 UTF-8 Source revision 建立确定性的逻辑 Page 表。
 Page 在目标大小后优先选择 LF，并在硬上限前强制落到 UTF-8 边界。Fragment 发布使用
@@ -232,6 +238,13 @@ lifecycle budget、Session state、并发保存、崩溃恢复与 Session/Pager 
 Snapshot lease 获取在 Windows 约 447–467 ns、Linux 约 347–353 ns（368 B、4 alloc），
 4 MiB Session Save 分别约 49–50 ms 与 10–11 ms。
 
+v0.5.5 Coordinate/ChangeMap 套件在同一 Windows 与 WSL 原生 Linux 矩阵通过：六包继续
+保持 100% statement coverage，全仓三轮 shuffle race 通过，三个 coordinate fuzz 在
+每端各运行 30 秒。缓存/后缀/取消/最大历史边界通过 100 轮普通重复与 10 轮 race 重复。
+缓存命中的 64 KiB 窗口查询保持零分配，关闭缓存时每次约分配 72 KiB；4 MiB 文档中部
+编辑的增量重建在 Windows 约 0.39–0.47 ms、Linux 约 0.323–0.339 ms，全量构建分别约
+27–29 ms 与 20.6–21.9 ms。256-map `ComposeAll` 只分配一次，逐段组合为 256 次。
+
 常规检查：
 
 ```bash
@@ -281,7 +294,8 @@ Windows race 构建需要 GCC 兼容的 MinGW-w64，MSVC 目标的 `cl.exe` 或
 - 原子替换后的重绑定失败会主动停止写入，必须显式重新打开；
 - 若宿主不提供更强文件锁，最后一次 hash 到 replace 之间仍存在无法完全消除的竞态；
 - Session 托管的 ChangeMap 历史按事务数有界，revision 已淘汰时必须全量重建；增量索引
-  从最早受影响 checkpoint 保守重扫，自动缓存所有权及可证明的后缀复用尚未实现；
+  的后缀复用要求新 Source 精确对应 ChangeMap。坐标缓存预算只计算驻留窗口，不包含
+  并发 cache miss 正在读取的瞬时缓冲区；
 - 文件 watcher 候选变化和未来索引/虚拟化进度事件尚未实现；保存及恢复 WAL 的持久化
   状态跃迁已经发布；
 - journal 压缩必须显式建立保存检查点；搜索索引、搜索索引压缩和 Composition 尚未实现；
@@ -293,7 +307,7 @@ Windows race 构建需要 GCC 兼容的 MinGW-w64，MSVC 目标的 `cl.exe` 或
 
 ## 下一步
 
-v0.5 虚拟化完成后，v0.6 开始格式中立搜索：先建立有界、可取消的流式 literal/regex
-正确性基准，再实现 contentless trigram 索引、索引 generation 原子发布、增量脏区更新
-以及针对精确 Snapshot 的候选验证。随后再实现多源 Composition。完整完成度评估、
-目标架构和后续路线见 [develop.md](develop.md)。
+v0.5.x 维护线下一步补齐事件/压缩与 Virtual 的刷新、进度和性能边界；所有现有模块
+收口后，再单独修复已知 Windows journal durability CI 竞态并发布一个小版本。之后
+v0.6 才开始格式中立搜索。完整完成度评估、目标架构和后续路线见
+[develop.md](develop.md)。

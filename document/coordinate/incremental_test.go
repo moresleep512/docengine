@@ -35,7 +35,9 @@ func TestRebuildReusesSafePrefixAndMatchesFullBuild(t *testing.T) {
 	defer fresh.Close()
 
 	stats := incremental.Stats()
-	if stats.Revision != 11 || stats.ReusedCheckpoints < 2 || stats.ScannedBytes >= stats.ByteLength || stats.ScannedBytes != stats.ByteLength-18 {
+	if stats.Revision != 11 || stats.ReusedPrefixCheckpoints < 2 ||
+		stats.ReusedSuffixCheckpoints == 0 || stats.ReusedCheckpoints != stats.ReusedPrefixCheckpoints+stats.ReusedSuffixCheckpoints ||
+		stats.ScannedBytes >= stats.ByteLength-18 {
 		t.Fatalf("incremental stats = %+v", stats)
 	}
 	if full := fresh.Stats(); full.ReusedCheckpoints != 0 || full.ScannedBytes != full.ByteLength {
@@ -79,16 +81,134 @@ func TestRebuildUsesEarliestSequentialEditAndUTF8Boundaries(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer fresh.Close()
-	if stats := incremental.Stats(); stats.ReusedCheckpoints != 1 || stats.ScannedBytes != stats.ByteLength {
+	if stats := incremental.Stats(); stats.ReusedPrefixCheckpoints != 1 ||
+		stats.ReusedSuffixCheckpoints != 0 || stats.ScannedBytes != stats.ByteLength {
 		t.Fatalf("earliest edit stats = %+v", stats)
 	}
 	assertIndexesEquivalent(t, after, incremental, fresh)
 }
 
+func TestRebuildTranslatesSuffixRuneLineAndColumnState(t *testing.T) {
+	before := []byte("head\nalpha beta gamma\nsuffix-one\nsuffix-two🙂\n")
+	previous, err := Build(context.Background(), &testSource{body: before}, 20, Options{CheckpointBytes: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer previous.Close()
+
+	insert := []byte("世界\nnew\nlines")
+	edit := Edit{Start: 8, OldLength: 7, NewLength: int64(len(insert))}
+	after := replaceReference(before, edit, insert)
+	changes, err := NewChangeMap(20, 21, int64(len(before)), []Edit{edit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	incremental, err := Rebuild(context.Background(), &testSource{body: after}, previous, changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer incremental.Close()
+	fresh, err := Build(context.Background(), &testSource{body: after}, 21, Options{CheckpointBytes: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+
+	stats := incremental.Stats()
+	if stats.ReusedPrefixCheckpoints == 0 || stats.ReusedSuffixCheckpoints < 2 ||
+		stats.ScannedBytes >= stats.ByteLength/2 {
+		t.Fatalf("suffix translation did not bound decoding: %+v", stats)
+	}
+	assertIndexesEquivalent(t, after, incremental, fresh)
+}
+
+func TestRebuildFallsBackWhenNoSuffixCheckpointCanSaveWork(t *testing.T) {
+	before := []byte("a🙂")
+	previous, err := Build(context.Background(), &testSource{body: before}, 1, Options{CheckpointBytes: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer previous.Close()
+	insert := []byte("xyz")
+	edit := Edit{Start: 1, OldLength: int64(len("🙂")), NewLength: int64(len(insert))}
+	after := replaceReference(before, edit, insert)
+	changes, err := NewChangeMap(1, 2, int64(len(before)), []Edit{edit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebuilt, err := Rebuild(context.Background(), &testSource{body: after}, previous, changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rebuilt.Close()
+	// With only the zero and EOF checkpoints, the changed tail is decoded
+	// rather than reporting the EOF marker as useful suffix reuse.
+	if stats := rebuilt.Stats(); stats.ReusedSuffixCheckpoints != 0 ||
+		stats.ScannedBytes != stats.ByteLength {
+		t.Fatalf("tail fallback stats = %+v", stats)
+	}
+}
+
+func TestRebuildRejectsNonBoundarySuffixSeam(t *testing.T) {
+	before := []byte("aébcdefgh")
+	previous, err := Build(context.Background(), &testSource{body: before}, 1, Options{CheckpointBytes: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer previous.Close()
+	// The map claims a one-byte replacement inside é. The supplied new source
+	// is valid UTF-8, but it is not the exact sequential result described by
+	// the map, so the mapped old checkpoint lands inside a rune.
+	changes, err := NewChangeMap(1, 2, int64(len(before)), []Edit{{Start: 1, OldLength: 1, NewLength: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := []byte("a界bcdef")
+	if int64(len(after)) != changes.AfterLength() {
+		after = append(after, 'x')
+	}
+	if _, err := Rebuild(context.Background(), &testSource{body: after}, previous, changes); !errors.Is(err, ErrSourceInconsistent) && !errors.Is(err, ErrInvalidUTF8) {
+		t.Fatalf("mismatched suffix seam = %v", err)
+	}
+}
+
+func TestRebuildNetNoopDeduplicatesSuffixSeam(t *testing.T) {
+	before := []byte("abcdefgh\nijklmnop")
+	previous, err := Build(context.Background(), &testSource{body: before}, 1, Options{CheckpointBytes: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer previous.Close()
+	changes, err := NewChangeMap(1, 3, int64(len(before)), []Edit{
+		{Start: 4, NewLength: 1},
+		{Start: 4, OldLength: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebuilt, err := Rebuild(context.Background(), &testSource{body: before}, previous, changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rebuilt.Close()
+	stats := rebuilt.Stats()
+	if stats.ScannedBytes != 0 || stats.CheckpointCount != previous.Stats().CheckpointCount ||
+		stats.ReusedCheckpoints != stats.CheckpointCount ||
+		stats.ReusedSuffixCheckpoints == 0 {
+		t.Fatalf("net-noop reuse stats = %+v", stats)
+	}
+	fresh, err := Build(context.Background(), &testSource{body: before}, 3, Options{CheckpointBytes: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	assertIndexesEquivalent(t, before, rebuilt, fresh)
+}
+
 func TestRebuildEOFInsertionAndIdentityReuse(t *testing.T) {
 	before := []byte("abcdef")
 	lineage := NewLineage()
-	previous, err := Build(context.Background(), &testSource{body: before}, 4, Options{CheckpointBytes: 2, Lineage: lineage})
+	previous, err := Build(context.Background(), &testSource{body: before}, 4, Options{CheckpointBytes: 2, CacheBytes: 6, Lineage: lineage})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,6 +229,9 @@ func TestRebuildEOFInsertionAndIdentityReuse(t *testing.T) {
 	defer appended.Close()
 	if stats := appended.Stats(); stats.ScannedBytes != int64(len(insert)) || stats.ReusedCheckpoints != previous.Stats().CheckpointCount {
 		t.Fatalf("EOF insertion stats = %+v", stats)
+	}
+	if stats := appended.Stats(); stats.MaximumCacheBytes != 6 {
+		t.Fatalf("Rebuild did not inherit cache budget: %+v", stats)
 	}
 	if !appended.BelongsTo(lineage) {
 		t.Fatal("Rebuild did not preserve lineage")
@@ -197,6 +320,10 @@ func TestRebuildValidationAndOwnedFailure(t *testing.T) {
 	validPrevious := &Index{revision: 1, byteLength: 3, checkpointBytes: 1, checkpoints: []checkpoint{{}}}
 	if _, err := Rebuild(context.Background(), &testSource{body: []byte("abc")}, validPrevious, invalidChange); !errors.Is(err, ErrInvalidIndex) {
 		t.Fatalf("negative stable prefix = %v", err)
+	}
+	lengthInvalidChange := ChangeMap{beforeRevision: 1, afterRevision: 2, beforeLength: 3, afterLength: 3, edits: []Edit{{NewLength: 1}}}
+	if _, err := Rebuild(context.Background(), &testSource{body: []byte("abc")}, validPrevious, lengthInvalidChange); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("invalid stable suffix = %v", err)
 	}
 
 	old, err := Build(context.Background(), &testSource{body: []byte("a")}, 7, Options{})

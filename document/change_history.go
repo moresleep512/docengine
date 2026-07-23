@@ -16,7 +16,7 @@ var (
 	ErrRevisionUnavailable = errors.New("document: revision is not an available session boundary")
 )
 
-const maximumAnchorTransformSteps = 16 << 20
+const maximumAnchorTransformSteps = coordinate.MaximumTransformSteps
 
 // ChangeHistoryError reports the requested and retained revision windows while
 // preserving ErrChangeHistoryExpired or ErrRevisionUnavailable via Unwrap.
@@ -115,6 +115,7 @@ func (h *changeHistory) between(fromRevision, toRevision uint64) (coordinate.Cha
 	lowLength, _ := h.boundaryLength(low)
 	result, _ := coordinate.Identity(low, lowLength)
 	cursor := low
+	chain := make([]coordinate.ChangeMap, 0, h.count)
 	for index := 0; index < h.count && cursor < high; index++ {
 		change := h.entry(index)
 		if change.AfterRevision() <= cursor {
@@ -123,12 +124,13 @@ func (h *changeHistory) between(fromRevision, toRevision uint64) (coordinate.Cha
 		if change.BeforeRevision() != cursor || change.AfterRevision() > high {
 			return coordinate.ChangeMap{}, h.rangeError(fromRevision, toRevision, ErrRevisionUnavailable)
 		}
-		var err error
-		result, err = result.Compose(change)
-		if err != nil {
-			return coordinate.ChangeMap{}, h.rangeError(fromRevision, toRevision, ErrRevisionUnavailable)
-		}
+		chain = append(chain, change)
 		cursor = change.AfterRevision()
+	}
+	var err error
+	result, err = result.ComposeAll(chain...)
+	if err != nil {
+		return coordinate.ChangeMap{}, h.rangeError(fromRevision, toRevision, ErrRevisionUnavailable)
 	}
 	if reverse {
 		return result.Invert(), nil
