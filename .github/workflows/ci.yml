@@ -69,6 +69,7 @@ jobs:
       - run: go test ./document/store -run=^$ -fuzz=FuzzTreeMatchesReference -fuzztime=10s
       - run: go test ./document/store -run=^$ -fuzz=FuzzTreeConcurrentReadDuringEdits -fuzztime=10s
       - run: go test ./document/store -run=^$ -fuzz=FuzzTreeCompactionPreservesSnapshots -fuzztime=10s
+      - run: go test ./document/store -run=^$ -fuzz=FuzzTreeAutoCompactionMatchesReference -fuzztime=10s
       - run: go test ./recovery -run=^$ -fuzz=FuzzJournalDecoders -fuzztime=10s
       - run: go test ./recovery -run=^$ -fuzz=FuzzJournalStateMachine -fuzztime=10s
       - run: go test ./recovery -run=^$ -fuzz=FuzzJournalBatchOperationsDecode -fuzztime=10s
@@ -79,6 +80,7 @@ jobs:
       - run: go test ./document -run=^$ -fuzz=FuzzUTF8ReplacementBoundaries -fuzztime=10s
       - run: go test ./document -run=^$ -fuzz=FuzzEventHubStateMachine -fuzztime=10s
       - run: go test ./document -run=^$ -fuzz=FuzzChangeHistoryStateMachine -fuzztime=10s
+      - run: go test ./document -run=^$ -fuzz=FuzzVirtualPagerSessionLifecycle -fuzztime=10s
       - run: go test ./document/coordinate -run=^$ -fuzz=FuzzIndexMatchesUTF8Reference -fuzztime=10s
       - run: go test ./document/coordinate -run=^$ -fuzz=FuzzChangeMapBoundsAndComposition -fuzztime=10s
       - run: go test ./document/coordinate -run=^$ -fuzz=FuzzIncrementalIndexMatchesFullBuild -fuzztime=10s

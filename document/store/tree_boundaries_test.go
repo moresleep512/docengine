@@ -309,7 +309,10 @@ func TestLineBreakMetadata(t *testing.T) {
 
 func TestSequentialInsertsRemainBalanced(t *testing.T) {
 	const insertions = 10_000
-	tree := mustNewTree(t, nil)
+	tree, err := NewWithOptions(nil, 0, Options{DisableAutoCompact: true})
+	if err != nil {
+		t.Fatal(err)
+	}
 	tree.SetSource(SourceJournal, bytes.NewReader(bytes.Repeat([]byte{'x'}, insertions)))
 	for position := 0; position < insertions; position++ {
 		if _, _, err := tree.ReplacePiece(int64(position), 0, Piece{Source: SourceJournal, Offset: int64(position), Length: 1}); err != nil {

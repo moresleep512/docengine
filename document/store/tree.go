@@ -11,9 +11,13 @@ import (
 var (
 	ErrInvalidRange   = errors.New("store: invalid range")
 	ErrInvalidPiece   = errors.New("store: invalid piece")
+	ErrInvalidOptions = errors.New("store: invalid options")
 	ErrLengthOverflow = errors.New("store: document length overflow")
 	ErrUnknownSource  = errors.New("store: unknown source")
 )
+
+// DefaultAutoCompactPieces is the zero-value automatic-compaction trigger.
+const DefaultAutoCompactPieces int64 = 4096
 
 type SourceID uint8
 
@@ -45,11 +49,22 @@ type Snapshot struct {
 	sources map[SourceID]io.ReaderAt
 }
 
+// Options controls structural maintenance. A zero value selects bounded
+// defaults. DisableAutoCompact leaves compaction entirely under the caller's
+// control.
+type Options struct {
+	AutoCompactPieces  int64
+	DisableAutoCompact bool
+}
+
 type Tree struct {
-	mu      sync.RWMutex
-	root    *node
-	sources map[SourceID]io.ReaderAt
-	rng     uint64
+	mu                    sync.RWMutex
+	root                  *node
+	sources               map[SourceID]io.ReaderAt
+	rng                   uint64
+	autoCompactPieces     int64
+	nextAutoCompactPieces int64
+	autoCompactions       uint64
 }
 
 // CompactResult reports structural Piece Tree compaction. Byte content and
@@ -59,14 +74,44 @@ type CompactResult struct {
 	AfterPieces  int64
 }
 
+// Stats is an atomic view of Tree size, cached line metadata, and automatic
+// compaction state.
+type Stats struct {
+	ByteLength            int64
+	PieceCount            int64
+	LineBreaks            int64
+	LineBreaksKnown       bool
+	AutoCompactPieces     int64
+	NextAutoCompactPieces int64
+	AutoCompactions       uint64
+}
+
 func New(base io.ReaderAt, length int64) (*Tree, error) {
-	return NewWithBasePiece(base, Piece{Source: SourceBase, Length: length})
+	return NewWithOptions(base, length, Options{})
+}
+
+// NewWithOptions constructs a Tree whose initial Piece spans length bytes of
+// base and whose structural maintenance follows options.
+func NewWithOptions(base io.ReaderAt, length int64, options Options) (*Tree, error) {
+	return NewWithBasePieceOptions(base, Piece{Source: SourceBase, Length: length}, options)
 }
 
 func NewWithBasePiece(base io.ReaderAt, piece Piece) (*Tree, error) {
+	return NewWithBasePieceOptions(base, piece, Options{})
+}
+
+// NewWithBasePieceOptions is NewWithBasePiece with explicit structural
+// maintenance options.
+func NewWithBasePieceOptions(base io.ReaderAt, piece Piece, options Options) (*Tree, error) {
+	autoCompactPieces, err := resolveOptions(options)
+	if err != nil {
+		return nil, err
+	}
 	t := &Tree{
-		sources: map[SourceID]io.ReaderAt{SourceBase: base},
-		rng:     0x9e3779b97f4a7c15,
+		sources:               map[SourceID]io.ReaderAt{SourceBase: base},
+		rng:                   0x9e3779b97f4a7c15,
+		autoCompactPieces:     autoCompactPieces,
+		nextAutoCompactPieces: autoCompactPieces,
 	}
 	piece.Source = SourceBase
 	piece = normalizePiece(piece)
@@ -80,6 +125,22 @@ func NewWithBasePiece(base io.ReaderAt, piece Piece) (*Tree, error) {
 		t.root = t.makeNode(piece, nil, nil)
 	}
 	return t, nil
+}
+
+func resolveOptions(options Options) (int64, error) {
+	if options.DisableAutoCompact {
+		if options.AutoCompactPieces != 0 {
+			return 0, ErrInvalidOptions
+		}
+		return 0, nil
+	}
+	if options.AutoCompactPieces == 0 {
+		return DefaultAutoCompactPieces, nil
+	}
+	if options.AutoCompactPieces < 2 {
+		return 0, ErrInvalidOptions
+	}
+	return options.AutoCompactPieces, nil
 }
 
 func (t *Tree) SetSource(id SourceID, source io.ReaderAt) {
@@ -113,6 +174,21 @@ func (t *Tree) PieceCount() int64 {
 	return nodePieceCount(t.root)
 }
 
+func (t *Tree) Stats() Stats {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	stats := Stats{
+		ByteLength:            nodeBytes(t.root),
+		PieceCount:            nodePieceCount(t.root),
+		LineBreaks:            nodeNewlines(t.root),
+		LineBreaksKnown:       nodeNewlinesKnown(t.root),
+		AutoCompactPieces:     t.autoCompactPieces,
+		NextAutoCompactPieces: t.nextAutoCompactPieces,
+		AutoCompactions:       t.autoCompactions,
+	}
+	return stats
+}
+
 func (t *Tree) Snapshot() Snapshot {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -125,6 +201,12 @@ func (t *Tree) Snapshot() Snapshot {
 func (t *Tree) Compact() CompactResult {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	result := t.compactLocked()
+	t.scheduleNextAutoCompactLocked(result.AfterPieces)
+	return result
+}
+
+func (t *Tree) compactLocked() CompactResult {
 	result := CompactResult{BeforePieces: nodePieceCount(t.root)}
 	if result.BeforePieces < 2 {
 		result.AfterPieces = result.BeforePieces
@@ -159,6 +241,10 @@ func (t *Tree) Restore(snapshot Snapshot) {
 	defer t.mu.Unlock()
 	t.root = snapshot.root
 	t.sources = cloneSources(snapshot.sources)
+	// Restore remains O(1) and preserves the exact Snapshot root. If the
+	// restored tree is already over threshold, the next real edit performs the
+	// maintenance pass instead of inheriting a stale backoff schedule.
+	t.nextAutoCompactPieces = t.autoCompactPieces
 }
 
 // ReplacePiece replaces a logical byte range and returns immutable snapshots
@@ -192,8 +278,42 @@ func (t *Tree) ReplacePiece(start, deleteLength int64, replacement Piece) (Snaps
 		middle = t.makeNode(replacement, nil, nil)
 	}
 	t.root = merge(merge(left, middle), right)
+	t.maybeAutoCompactLocked()
 	after := Snapshot{root: t.root, sources: cloneSources(t.sources)}
 	return before, after, nil
+}
+
+func (t *Tree) maybeAutoCompactLocked() {
+	if t.autoCompactPieces == 0 {
+		return
+	}
+	pieces := nodePieceCount(t.root)
+	if pieces < t.autoCompactPieces {
+		t.nextAutoCompactPieces = t.autoCompactPieces
+		return
+	}
+	if pieces < t.nextAutoCompactPieces {
+		return
+	}
+	result := t.compactLocked()
+	t.autoCompactions++
+	t.scheduleNextAutoCompactLocked(result.AfterPieces)
+}
+
+func (t *Tree) scheduleNextAutoCompactLocked(pieces int64) {
+	if t.autoCompactPieces == 0 {
+		t.nextAutoCompactPieces = 0
+		return
+	}
+	if pieces < t.autoCompactPieces {
+		t.nextAutoCompactPieces = t.autoCompactPieces
+		return
+	}
+	if pieces > math.MaxInt64-t.autoCompactPieces {
+		t.nextAutoCompactPieces = math.MaxInt64
+		return
+	}
+	t.nextAutoCompactPieces = pieces + t.autoCompactPieces
 }
 
 func validatePiece(piece Piece) error {

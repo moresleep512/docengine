@@ -79,6 +79,16 @@ optional newline totals. `ReplacePiece` splits at byte boundaries and clones
 only changed paths. Earlier roots therefore remain readable and average edit or
 coordinate traversal cost follows tree height rather than document length.
 
+The zero-value `store.Options` enables structural maintenance at
+`DefaultAutoCompactPieces` (4,096 Pieces). Reaching the trigger coalesces only
+logical neighbors backed by contiguous ranges of the same Source. If a pass
+cannot reclaim anything, the next trigger advances by another threshold, so a
+permanently non-coalescible tree does not pay an O(Pieces) scan on every edit.
+Dropping below the base threshold resets the trigger. Hosts can configure or
+disable this policy through `NewWithOptions`/`NewWithBasePieceOptions`.
+`Tree.Stats` atomically reports byte/Piece/line summaries, the effective and
+next thresholds, and the automatic-compaction count.
+
 Important invariants:
 
 - negative or overflowing ranges and missing sources are rejected before root
@@ -87,6 +97,9 @@ Important invariants:
 - `Snapshot` captures both root and Source bindings;
 - split Pieces inherit the original treap priority;
 - callers must keep all referenced Source handles alive for a Snapshot.
+- automatic and manual compaction publish a fresh root only after the complete
+  replacement tree exists; previously issued roots and Source bindings remain
+  unchanged.
 
 `document.sourceGeneration` provides that ownership through `SnapshotLease`.
 The store itself does not close files.
@@ -395,7 +408,7 @@ All six current packages are held at 100% statement coverage. Tests include
 platform-specific replacement and directory-sync faults, complete UTF-8 and
 identity boundaries, every recovery batch truncation, transaction rollback,
 concurrent save/rebase, post-commit fault behavior, snapshot lifetime, integer
-overflow, randomized reference models, race runs, and twenty fuzz targets.
+overflow, randomized reference models, race runs, and twenty-two fuzz targets.
 Event-specific tests exercise resumable history, exact overflow accounting,
 save progress and failure phase, WAL Sync failure/restoration, concurrent
 publish/unsubscribe, final-event delivery, and the close barrier. Lifecycle and
@@ -428,3 +441,9 @@ native Windows and Debian under WSL 2 from a native Linux `/tmp` directory:
 all six packages reached 100% statement coverage, three shuffled race runs
 passed across the repository, and four virtualization fuzz targets plus the
 Session/Pager lifecycle fuzz target passed 10-second runs on both platforms.
+
+For v0.5.2, native Windows and Debian under WSL 2 both retained 100% statement
+coverage in all six packages and passed three shuffled race runs. The four
+Piece Tree fuzz targets ran for 30 seconds each on both systems, the automatic
+compaction boundary suite passed 100 consecutive Windows runs, and all four
+store benchmarks executed on both platforms.

@@ -85,7 +85,11 @@ Future host: desktop / CLI / service / format adapter
 `document/store` is the lowest layer. It represents logical content as Pieces
 referencing external `io.ReaderAt` byte ranges. A persistent randomized treap
 provides structural sharing, average logarithmic edits, bounded range reads,
-and immutable roots.
+and immutable roots. Its zero-value maintenance policy automatically coalesces
+contiguous same-Source Pieces at a 4,096-Piece threshold; an unproductive pass
+backs off by another threshold. `store.Options` can change or disable that
+policy, and `Tree.Stats` exposes the next trigger and completed automatic
+compactions without reading document bytes.
 
 `recovery` stores each logical transaction as one checksummed v2 batch. Its
 96-byte `DOCLOG02` header binds the journal to the normalized resolved path and
@@ -193,10 +197,10 @@ No compatibility promise applies before 1.0.
 ## Testing
 
 The repository requires 100% statement coverage for every current package and
-contains twenty Go fuzz targets:
+contains twenty-two Go fuzz targets:
 
-- Piece Tree reference-model, concurrent snapshot/edit, and compaction/Snapshot
-  preservation fuzzers;
+- Piece Tree reference-model, concurrent snapshot/edit, compaction/Snapshot
+  preservation, and automatic-compaction policy fuzzers;
 - v2 header, operation decoder, replay-resilience, and stateful journal fuzzers;
 - Session state-machine, concurrent save/edit, crash-recovery, and UTF-8 edit
   boundary fuzzers;
@@ -237,6 +241,13 @@ statement coverage, the complete repository passed three shuffled race runs,
 and four virtualization fuzz targets plus the Session/Pager lifecycle fuzz
 target each passed a 10-second run.
 
+The v0.5.2 Piece Tree maintenance suite was run on native Windows and Debian
+under WSL 2 from a native Linux `/tmp` directory. All six packages retained
+100% statement coverage and three shuffled race runs passed. The four Piece
+Tree fuzz targets each ran for 30 seconds on both platforms; automatic
+compaction boundary tests also passed 100 consecutive runs, and the four
+committed store benchmarks executed on both systems.
+
 Run the normal checks:
 
 ```bash
@@ -253,6 +264,7 @@ Run the fuzz targets:
 go test ./document/store -run=^$ -fuzz=FuzzTreeMatchesReference -fuzztime=30s
 go test ./document/store -run=^$ -fuzz=FuzzTreeConcurrentReadDuringEdits -fuzztime=30s
 go test ./document/store -run=^$ -fuzz=FuzzTreeCompactionPreservesSnapshots -fuzztime=30s
+go test ./document/store -run=^$ -fuzz=FuzzTreeAutoCompactionMatchesReference -fuzztime=30s
 go test ./recovery -run=^$ -fuzz=FuzzJournalDecoders -fuzztime=30s
 go test ./recovery -run=^$ -fuzz=FuzzJournalStateMachine -fuzztime=30s
 go test ./recovery -run=^$ -fuzz=FuzzJournalBatchOperationsDecode -fuzztime=30s
@@ -263,6 +275,7 @@ go test ./document -run=^$ -fuzz=FuzzSessionCrashRecovery -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzUTF8ReplacementBoundaries -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzEventHubStateMachine -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzChangeHistoryStateMachine -fuzztime=30s
+go test ./document -run=^$ -fuzz=FuzzVirtualPagerSessionLifecycle -fuzztime=30s
 go test ./document/coordinate -run=^$ -fuzz=FuzzIndexMatchesUTF8Reference -fuzztime=30s
 go test ./document/coordinate -run=^$ -fuzz=FuzzChangeMapBoundsAndComposition -fuzztime=30s
 go test ./document/coordinate -run=^$ -fuzz=FuzzIncrementalIndexMatchesFullBuild -fuzztime=30s

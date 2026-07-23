@@ -496,6 +496,28 @@ fuzz 随机组合 edit、save、undo/redo、compact、创建/查询/关闭多个
 最终在 Windows 与 WSL 2 Debian 原生 Linux `/tmp` 两端完成六包 100% statement
 coverage、全仓三轮 shuffle race，以及五个相关 fuzz target 各 10 秒验证。
 
+### 7.7 v0.5.2：自动维护 Piece Tree，而不是依赖宿主记得压缩
+
+手动 `Session.Compact` 能证明压缩安全，却不能保证长期运行的宿主会在正确时间调用它。
+直接在每次编辑后扫描全树又会把 Piece Tree 的平均对数编辑退化成 O(n)。因此
+`document/store` 增加可配置的 Piece 数阈值：零值在 4,096 Piece 触发，只合并同 Source
+且物理连续的逻辑邻居；若一次扫描没有收益，下次触发点后移一个完整阈值，Piece 数跌回
+基础阈值以下时再复位。宿主可以显式关闭自动策略，但默认 Session 不再无限依赖人工维护。
+
+自动压缩发生在 replacement root 完整构建之后、after Snapshot 发布之前。before
+Snapshot、压缩前已发出的任意 Snapshot 及其 Source map 都保持不变。`Tree.Stats` 把
+正文长度、Piece 数、换行元数据、有效阈值、下次触发点和自动压缩次数放在同一读锁快照
+中，测试和宿主不必组合多个可能跨编辑的查询。
+
+测试覆盖阈值精确触发、第二轮触发、无收益退避、关闭策略、非法配置、阈值饱和、已知/
+未知换行统计，以及多 goroutine Snapshot 读取穿过反复自动压缩。新的 stateful fuzz 为
+每个输入随机选择小阈值，与 byte slice 参考模型逐步比较 before/after/current Snapshot，
+并长期保留旧 root。四类 benchmark 分别固定顺序追加、随机单字节替换、16K 碎片随机
+读取和 16K Piece 压缩，防止以后只凭覆盖率声称 Piece Tree 已经成熟。最终 Windows 与
+WSL 2 Debian 原生 Linux `/tmp` 两端均保持六包 100% statement coverage、通过全仓三轮
+shuffle race，四个 Piece Tree fuzz target 分别运行 30 秒；自动压缩边界连续运行
+100 次，四类 benchmark 也在两端实际执行。
+
 ## 8. 贯穿所有阶段的设计理念
 
 ### 8.1 格式中立不是口号，而是依赖约束
@@ -546,7 +568,7 @@ Tree 不关闭 Source；generation 管理 base/journal；Session 管理 generati
 
 ## 9. 到这里为止，以及为什么下一步不是继续堆编辑 API
 
-截至 v0.5.1，Docengine 已经有 Piece Tree、不可变 Snapshot、原子事务、recovery v2、
+截至 v0.5.2，Docengine 已经有 Piece Tree、不可变 Snapshot、原子事务、recovery v2、
 跨平台保存、显式故障状态、坐标/ChangeMap、事件、资源策略、压缩，以及格式中立的
 Page/Fragment/Measure 虚拟化。
 
