@@ -17,6 +17,12 @@ func (p *Pager) ReadPage(ctx context.Context, key PageKey) (Page, error) {
 	if err != nil {
 		return Page{}, err
 	}
+	if err := ctx.Err(); err != nil {
+		return Page{}, err
+	}
+	if key.identity != p.identity {
+		return Page{}, ErrInvalidRequest
+	}
 	if key.Index < 0 || key.Index >= len(state.pages) {
 		return Page{}, ErrInvalidRequest
 	}

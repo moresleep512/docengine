@@ -229,12 +229,13 @@ three shuffled race runs passed, and all nine affected Session, event,
 change-history, and coordinate fuzz targets passed 10-second runs on both
 platforms.
 
-The v0.5 implementation has been verified on native Windows: all six packages
-report 100% statement coverage, the complete repository passed three shuffled
-race runs, and all four virtualization fuzz targets passed 10-second runs.
-All six Linux test binaries cross-compile successfully. This workstation
-currently has no installed WSL distribution, so native-Linux execution remains
-for Ubuntu CI and is not claimed as a local v0.5 result.
+The initial v0.5.0 implementation was verified on native Windows, and all six
+Linux test binaries cross-compiled successfully. The v0.5.1 correctness suite
+was then run in full on native Windows and Debian under WSL 2 from a native
+Linux `/tmp` directory. On both platforms all six packages reached 100%
+statement coverage, the complete repository passed three shuffled race runs,
+and four virtualization fuzz targets plus the Session/Pager lifecycle fuzz
+target each passed a 10-second run.
 
 Run the normal checks:
 
@@ -293,8 +294,9 @@ Windows race builds require a GCC-compatible MinGW-w64 toolchain; MSVC-target
   search-index compaction, and composition are not implemented.
 - Fragment metadata and logical Page tables are bounded by configured page,
   Fragment, key, task, and cache limits. Cache limits exclude transient copies
-  held by active tasks; peak read memory is additionally bounded by
-  `MaximumTasks × MaximumPageBytes`.
+  held by active tasks; simultaneous in-core Window payloads are bounded by
+  `MaximumTasks × Window.Bytes`. Hosts control how long returned copies remain
+  live and must include those retained results in their own memory budgets.
 - The API and on-disk formats remain unstable until 1.0.
 
 ## Next work

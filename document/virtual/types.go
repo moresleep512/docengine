@@ -128,8 +128,9 @@ type FragmentResult struct {
 }
 
 // FragmentProvider derives format-neutral fragments for one immutable
-// revision. Calls must honor Context cancellation and must not re-enter the
-// Pager that invoked them.
+// revision. Calls must honor Context cancellation. A provider may inspect
+// read-only metadata such as Stats, but it must not synchronously invoke a
+// task-bearing operation or Close on the Pager that invoked it.
 type FragmentProvider interface {
 	Fragments(context.Context, FragmentRequest) (FragmentResult, error)
 }
@@ -142,13 +143,20 @@ const (
 	AffinityAfter
 )
 
-// PageKey identifies one page in one exact revision and Fragment generation.
+type pagerIdentity struct {
+	marker byte
+}
+
+// PageKey identifies one page issued by one exact Pager, revision, and
+// Fragment generation. Its zero value and keys issued by another Pager are
+// invalid.
 type PageKey struct {
 	Revision   uint64
 	Generation uint64
 	Index      int
 	Start      int64
 	End        int64
+	identity   *pagerIdentity
 }
 
 // Page is a bounded content result. MeasureStart/MeasureEnd describe the

@@ -67,7 +67,10 @@ func (p *Pager) readMeta(ctx context.Context, state *pagerState, index int) (Pag
 		p.storeCache(state, key, data)
 	}
 	page := Page{
-		Key:       PageKey{Revision: p.revision, Generation: state.generation, Index: index, Start: meta.start, End: meta.end},
+		Key: PageKey{
+			Revision: p.revision, Generation: state.generation, Index: index,
+			Start: meta.start, End: meta.end, identity: p.identity,
+		},
 		StartLine: meta.startLine, EndLine: meta.endLine,
 		ContinuesFromPrevious: meta.continuesFrom, ContinuesToNext: meta.continuesTo,
 		FragmentIndex: -1, ContinuationIndex: meta.continuation, ContinuationCount: meta.continuations,

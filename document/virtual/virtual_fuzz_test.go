@@ -34,6 +34,7 @@ func FuzzLogicalPagesPreserveUTF8(f *testing.F) {
 			}
 			page, err := pager.ReadPage(context.Background(), PageKey{
 				Revision: 7, Generation: 0, Index: index, Start: meta.start, End: meta.end,
+				identity: pager.identity,
 			})
 			if err != nil {
 				t.Fatal(err)

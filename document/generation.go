@@ -63,21 +63,23 @@ func (g *sourceGeneration) acquire(snapshot store.Snapshot) SnapshotLease {
 
 func (g *sourceGeneration) retire(removeJournal bool) {
 	g.mu.Lock()
-	g.retired = true
 	g.removeJournal = g.removeJournal || removeJournal
-	g.refs-- // release the session owner's reference
+	if !g.retired {
+		g.retired = true
+		g.refs-- // release the session owner's reference
+	}
 	g.closeIfUnusedLocked()
 	g.mu.Unlock()
 }
 
 func (g *sourceGeneration) retireAndWait(removeJournal bool) error {
 	g.mu.Lock()
+	g.removeJournal = g.removeJournal || removeJournal
 	if !g.retired {
 		g.retired = true
-		g.removeJournal = g.removeJournal || removeJournal
 		g.refs--
-		g.closeIfUnusedLocked()
 	}
+	g.closeIfUnusedLocked()
 	for g.refs > 0 {
 		g.cond.Wait()
 	}
@@ -112,10 +114,16 @@ func (g *sourceGeneration) closeIfUnusedLocked() {
 	if g.removeJournal && g.journalPath != "" {
 		if err := os.Remove(g.journalPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			g.closeErr = errors.Join(g.closeErr, err)
+		} else {
+			g.journalPath = ""
 		}
 	}
 	if g.removeJournal && g.journalCleanupDir != "" {
-		g.closeErr = errors.Join(g.closeErr, removeEmptyDirectory(g.journalCleanupDir))
+		if err := removeEmptyDirectory(g.journalCleanupDir); err != nil {
+			g.closeErr = errors.Join(g.closeErr, err)
+		} else {
+			g.journalCleanupDir = ""
+		}
 	}
 	g.cond.Broadcast()
 }

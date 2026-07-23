@@ -64,6 +64,7 @@ type Pager struct {
 	mu        sync.RWMutex
 	source    Source
 	release   func() error
+	identity  *pagerIdentity
 	revision  uint64
 	length    int64
 	options   resolvedOptions
@@ -125,7 +126,8 @@ func build(ctx context.Context, source Source, revision uint64, options Options,
 	initial := append([]pageMeta(nil), logical...)
 	pager := &Pager{
 		source: source, release: release, revision: revision, length: length,
-		options: resolved, logical: logical,
+		identity: &pagerIdentity{},
+		options:  resolved, logical: logical,
 		tasks:     make(chan struct{}, resolved.maximumTasks),
 		cacheList: list.New(), cache: make(map[cacheKey]*list.Element),
 		closeDone: make(chan struct{}),

@@ -1126,6 +1126,11 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (result Metadata, resul
 }
 
 func (s *Session) Close() error {
+	// Save may install a replacement source generation after its immutable
+	// snapshot has been streamed. Serialize Close with that entire operation so
+	// Close always retires the final installed generation exactly once.
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
 	s.mu.Lock()
 	if s.closed {
 		done := s.closeDone

@@ -56,9 +56,17 @@ it by byte or select an explicit continuation.
 Page payloads use a strict byte-capacity LRU. Cache hits and returned values are
 copied so callers cannot mutate cached content. `CacheBytes` covers resident
 LRU payloads; transient active-task copies are bounded separately by
-`MaximumTasks × MaximumPageBytes`. The same task semaphore provides immediate
-`ErrBusy` backpressure. Provider callbacks and owned Source closers must not
-synchronously re-enter the same Pager.
+`MaximumTasks × Window.Bytes`; copies retained by the host after a call returns
+belong to its own memory budget. The same task semaphore provides immediate
+`ErrBusy` backpressure. Provider callbacks may inspect `Stats`, but must not
+synchronously invoke task-bearing operations or `Close` on the same Pager.
+Owned Source closers must not re-enter their Pager.
+
+Every `PageKey` contains an opaque issuing-Pager identity in addition to its
+revision, Fragment generation, index, and byte range. Copying a key preserves
+its capability, while reconstructing one or passing it to a different Pager is
+rejected; equal revision numbers are not treated as proof of equal Source
+identity.
 
 ## `document/store`
 
@@ -414,9 +422,9 @@ three shuffled race runs passed, and the nine affected Session, event,
 change-history, and coordinate fuzz targets passed 10-second runs on both
 platforms.
 
-The v0.5 implementation was checked on native Windows with 100% statement
-coverage in all six packages, three shuffled race runs across the repository,
-and four 10-second virtualization fuzz runs. All six Linux test binaries
-cross-compile. No WSL distribution is currently installed on this workstation,
-so native-Linux v0.5 execution is delegated to Ubuntu CI rather than reported
-as a local result.
+The initial v0.5.0 implementation was checked on native Windows and all six
+Linux test binaries cross-compiled. For v0.5.1, the full suite was run on
+native Windows and Debian under WSL 2 from a native Linux `/tmp` directory:
+all six packages reached 100% statement coverage, three shuffled race runs
+passed across the repository, and four virtualization fuzz targets plus the
+Session/Pager lifecycle fuzz target passed 10-second runs on both platforms.

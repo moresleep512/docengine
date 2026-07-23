@@ -123,7 +123,7 @@ func coreTestKey(pager *Pager, index int) PageKey {
 	meta := pager.state.pages[index]
 	return PageKey{
 		Revision: pager.revision, Generation: pager.state.generation,
-		Index: index, Start: meta.start, End: meta.end,
+		Index: index, Start: meta.start, End: meta.end, identity: pager.identity,
 	}
 }
 

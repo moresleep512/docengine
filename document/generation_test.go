@@ -73,4 +73,41 @@ func TestGenerationReportsJournalRemovalFailure(t *testing.T) {
 	if err := generation.retireAndWait(true); err == nil {
 		t.Fatal("expected non-empty journal-path removal error")
 	}
+
+	cleanupGeneration := newSourceGeneration(nil, nil)
+	cleanupGeneration.journalCleanupDir = string([]byte{0})
+	if err := cleanupGeneration.retireAndWait(true); err == nil {
+		t.Fatal("expected invalid cleanup-directory removal error")
+	}
+}
+
+func TestGenerationRetirementIsIdempotentAndCleanupCanBePromoted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "retired.journal")
+	if err := os.WriteFile(path, []byte("journal"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	generation := newSourceGeneration(nil, nil)
+	generation.journalPath = path
+
+	generation.retire(false)
+	generation.retire(false)
+	generation.mu.Lock()
+	refs, retired := generation.refs, generation.retired
+	generation.mu.Unlock()
+	if refs != 0 || !retired {
+		t.Fatalf("retirement state = refs %d, retired %v", refs, retired)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("non-removing retirement changed journal: %v", err)
+	}
+
+	if err := generation.retireAndWait(true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("promoted cleanup left journal: %v", err)
+	}
+	if err := generation.retireAndWait(true); err != nil {
+		t.Fatalf("repeated promoted retirement: %v", err)
+	}
 }
