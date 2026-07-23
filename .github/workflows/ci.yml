@@ -28,6 +28,12 @@ jobs:
           test -z "$files" || { printf '%s\n' "$files"; exit 1; }
       - run: go vet ./...
       - run: go test ./...
+      - name: Stress Windows journal-sync event ordering
+        if: runner.os == 'Windows'
+        run: >-
+          go test ./document
+          -run='Test(JournalSyncEventsPublishOnlyStateTransitions|SyncLoopPublishesFailureAndRestoration|CloseReturnsFinalJournalSyncFailure|SaveRestoresFailedJournalDurabilityState|BackgroundJournalSyncMayRestoreWhileSaveIsInFlight)$'
+          -shuffle=on -count=50
 
   race:
     runs-on: ubuntu-latest

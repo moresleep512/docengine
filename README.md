@@ -369,6 +369,18 @@ with the observer path adding no allocations. The separately tracked
 intermittent Windows journal-sync event/handle failure remains intentionally
 unfixed in this tag.
 
+The v0.5.8 Windows CI patch makes journal-sync event tests independent of host
+speed. A slow runner may legitimately complete an already captured background
+Sync while Save is in flight, producing `SaveStarted → JournalSyncRestored →
+SaveProgress → Saved`; the old test incorrectly required restoration to come
+from Save itself. Tests that need that narrower claim now use an hour-long
+background interval, while a deterministic blocked-write test covers the valid
+interleaving. Every test registers immediate Session/Subscription cleanup, so
+an assertion cannot leave a Windows undo-store handle open. Both Windows and
+WSL passed three complete normal and race runs, six-package 100% coverage, and
+100 race-enabled repetitions of all five journal-sync tests. CI also runs 50
+Windows-only repetitions.
+
 Run the normal checks:
 
 ```bash
@@ -439,7 +451,6 @@ Windows race builds require a GCC-compatible MinGW-w64 toolchain; MSVC-target
 
 ## Next work
 
-The v0.5.x module maintenance line is complete. The next small release fixes
-the separately tracked Windows journal-durability CI event/handle race. Only
-then does v0.6 start format-neutral search. The target architecture and
-remaining milestones are in [develop.md](develop.md).
+The v0.5.x module maintenance line and its Windows CI cleanup are complete.
+Next, v0.6 starts format-neutral search. The target architecture and remaining
+milestones are in [develop.md](develop.md).

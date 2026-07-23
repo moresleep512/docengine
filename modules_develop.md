@@ -1,6 +1,6 @@
 # Docengine 模块开发历程与设计决策
 
-本文记录 Docengine 从 TypeMD 后端抽离，到 v0.5.7 为止的实际开发顺序、模块形成过程、
+本文记录 Docengine 从 TypeMD 后端抽离，到 v0.5.8 为止的实际开发顺序、模块形成过程、
 关键取舍、测试方法和问题复盘。它回答的不是“现在有哪些 API”，而是“代码为什么最终
 长成现在这样”。
 
@@ -824,6 +824,35 @@ Windows 约 12.5–17.0 µs、Linux 约 21.3–22.5 µs，约 66 KiB/9 alloc；R
 已登记的 Windows journal-sync 事件超时与 undo store 打开句柄失败没有混入本提交，
 按计划留给 v0.5.x 模块收口后的独立补丁版本。
 
+### 7.13 v0.5.8：跨操作事件可以交错，测试不能把调度偶然性写成协议
+
+v0.5.7 发布后，GitHub Actions 的 `windows-test` 间歇性失败在
+`TestSaveRestoresFailedJournalDurabilityState`：测试期待第三个事件是
+`EventSaveProgress`，实际先收到了 `EventJournalSyncRestored`。失败事件携带的
+`CommittedRevision` 仍为 0，证明它不是 Save 完成后发布的恢复，而是后台 sync loop
+已经捕获旧 journal，随后恰好在 Save 写入期间完成同步。两项操作分别保持自身的顺序，
+但共享事件流允许它们合法交错；把全局顺序写死，实际上是在测试 Windows runner 的调度
+速度，而不是 Session 契约。
+
+这里没有通过延长超时或忽略恢复事件来掩盖问题。需要证明“Save 自身会恢复 durability
+状态”的测试把 `JournalSyncInterval` 设为一小时，使后台 ticker 不参与该因果链；另一个
+新增测试则故意阻塞 Save 的正文写入，让已捕获旧 journal 的同步在阻塞窗口内成功，
+确定性验证
+`SaveStarted → JournalSyncRestored → SaveProgress → Saved`。它同时检查恢复事件仍携带
+提交前 revision、最终 Saved 携带提交后 revision，并且不会重复发布恢复或保存完成。
+这种写法把原本依赖窄调度窗口的概率失败，变成可重复的并发协议测试。
+
+审计还发现同组 sync-loop 测试在 Apply 后才订阅事件。5 ms ticker 足够在订阅建立前完成
+失败和恢复，所以它同样依赖机器速度。订阅现在先于 Apply 建立，并明确消费
+`EventChanged` 后再验证失败/恢复转换。所有 Session 与 Subscription 都在取得资源后立刻
+用 `t.Cleanup` 注册释放；即使中途 `Fatal`，Windows 上打开的 undo store 句柄也不会逃出
+测试并阻止 `TempDir` 清理。
+
+修复没有改变公开 API、journal v2 格式或生产事件语义。Windows 与 WSL 原生 Linux 均
+通过全仓三轮普通测试、三轮 race、六包 100% statement coverage；五个相关测试在两端
+各通过 100 轮 race 重复。CI 另外加入 Windows 50 轮定向门禁，让这种跨操作交错与资源
+释放约束持续受检。
+
 ## 8. 贯穿所有阶段的设计理念
 
 ### 8.1 格式中立不是口号，而是依赖约束
@@ -874,14 +903,11 @@ Tree 不关闭 Source；generation 管理 base/journal；Session 管理 generati
 
 ## 9. 到这里为止，以及为什么下一步不是继续堆编辑 API
 
-截至 v0.5.6，Docengine 已经有 Piece Tree、不可变 Snapshot、原子事务、recovery v2、
+截至 v0.5.8，Docengine 已经有 Piece Tree、不可变 Snapshot、原子事务、recovery v2、
 跨平台保存、显式故障状态、坐标/ChangeMap、事件、资源策略、压缩，以及格式中立的
-Page/Fragment/Measure 虚拟化。
+Page/Fragment/Measure 虚拟化；v0.5.x 横向维护和 Windows journal-sync CI 修复也已
+完成。
 
-下一阶段仍按 `develop.md` 横向补齐，不进入 v0.6：
-
-- Virtual 的刷新、进度、身份、长期性能及组合生命周期死角；
-- 所有现有模块完成后，最后单独修复 Windows journal durability CI 问题。
-
-搜索和 Composition 继续保持未实现，直到当前 revision、Snapshot、Source 所有权、
-持久化和故障语义的主要缺口逐包关闭。
+下一阶段进入 v0.6 持久化搜索。搜索和 Composition 仍保持格式中立：前者只返回绑定
+revision 的字节范围，后者只组合不可变 Source/Snapshot，不向内核引入 Markdown、代码
+语法或其他业务格式。

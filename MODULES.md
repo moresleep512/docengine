@@ -640,3 +640,15 @@ Linux at about 66 KiB/nine allocations. Refresh progress measured roughly
 1.9–2.3 µs and 1,288 B/22 allocations, with no allocation difference when an
 Observer is installed. The known intermittent Windows journal-sync
 event/open-handle failure remains isolated for the next patch tag.
+
+For v0.5.8, the Windows journal-sync failure was identified as an
+over-specified event test plus missing failure-path cleanup. A background Sync
+that captured the old journal before Save replaced it may validly clear
+`RecoveryDurabilityUncertain` between any two Save progress events. Tests that
+attribute restoration specifically to Save disable the independent ticker; a
+separate blocked-write test deterministically proves the legal interleaving.
+All journal event tests register cleanup immediately, preventing a failed
+assertion from leaving the undo store open on Windows. Native Windows and WSL
+each passed three complete normal and race runs, six-package 100% statement
+coverage, and 100 race-enabled repetitions of the five affected tests. The
+Windows CI job adds a 50-run stability gate.
