@@ -15,6 +15,7 @@ profile.*
 # Local caches and temporary files
 /.cache/
 /.tmp/
+/.tmp-go-cache/
 *.log
 *.tmp
 

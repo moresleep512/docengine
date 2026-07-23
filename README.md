@@ -43,12 +43,16 @@ It currently provides:
   or owned runtime-directory policies;
 - lock-protected reclamation of stale owned Session directories;
 - safe first-generation Piece/undo compaction and explicit save-checkpoint
-  journal rebasing.
+  journal rebasing;
+- revision-bound UTF-8 logical Page virtualization with hard page/window
+  budgets, bounded LRU caching, and concurrent-task backpressure;
+- atomically published, format-neutral Fragment generations with explicit
+  indexed watermarks, fixed-point Measure indexes, three anchor types,
+  asymmetric overscan, and giant-Fragment continuation Pages.
 
-It does not yet provide full-text search, Page/Fragment virtualization,
-multi-source composition, collaboration, remote storage, UI, or a stable 1.0
-API. Those capabilities and their format-neutral boundaries are specified in
-[develop.md](develop.md).
+It does not yet provide full-text search, multi-source composition,
+collaboration, remote storage, UI, or a stable 1.0 API. Those capabilities and
+their format-neutral boundaries are specified in [develop.md](develop.md).
 
 ## Relationship to TypeMD
 
@@ -67,12 +71,12 @@ Future host: desktop / CLI / service / format adapter
                          v
                    document.Session
        revision, transaction, history, save
-       /          |          |            \
-      v           v          v             v
- document/store recovery document/save document/coordinate
-  Piece Tree   v2 WAL    atomic replace  index / ChangeMap
-       \          |          /             /
-        +---------+---------+-------------+
+       /          |          |            |             \
+      v           v          v             v              v
+ document/store recovery document/save document/coordinate document/virtual
+  Piece Tree   v2 WAL    atomic replace  index/ChangeMap   Page/Fragment
+       \          |          /             /              /
+        +---------+---------+-------------+--------------+
                            |
                            v
                 OS files and io.ReaderAt
@@ -153,6 +157,16 @@ atomic-batch interior revisions are rejected. `TransformAnchors` and
 output. `coordinate.Annotation[T]` carries an opaque host value whose meaning
 is never interpreted by the core.
 
+`document/virtual` builds a deterministic logical Page table for one immutable
+UTF-8 Source revision. Page boundaries prefer LF after a target size and are
+forced at a UTF-8 boundary before a hard maximum. Fragment publications use a
+generation compare-and-swap, and `IndexedThrough` distinguishes analyzed gaps
+from an unindexed suffix. Windows can be addressed by byte, Fragment ID, or
+host-defined non-negative fixed-point `Measure`; every result is bounded by
+bytes, pages, distinct Fragments, and Measure. Giant Fragments become
+continuation Pages without guessing how their Measure is distributed.
+`Session.VirtualPager` owns its Snapshot lease until `Close`.
+
 `Session.Compact` coalesces only contiguous same-source Pieces and rewrites the
 undo store with live references. `CompactOptions.CheckpointJournal` explicitly
 persists a selected revision before rebasing the append-only journal; an
@@ -179,7 +193,7 @@ No compatibility promise applies before 1.0.
 ## Testing
 
 The repository requires 100% statement coverage for every current package and
-contains sixteen Go fuzz targets:
+contains twenty Go fuzz targets:
 
 - Piece Tree reference-model, concurrent snapshot/edit, and compaction/Snapshot
   preservation fuzzers;
@@ -190,7 +204,9 @@ contains sixteen Go fuzz targets:
 - bounded ChangeMap-history retention, expiry, reverse-query, and composition
   state-machine fuzzing;
 - UTF-8 coordinate-reference, ChangeMap composition, and incremental-versus-
-  full-index equivalence fuzzers.
+  full-index equivalence fuzzers;
+- logical Page partition, UTF-8 reconstruction, Fragment-window reference, and
+  Pager generation state-machine fuzzers.
 
 Tests cover malformed and byte-truncated batches, state publication rollback,
 same-size/same-mtime external modification, full-file and boundary-split UTF-8,
@@ -212,6 +228,13 @@ native-Linux directory: all five packages remained at 100% statement coverage,
 three shuffled race runs passed, and all nine affected Session, event,
 change-history, and coordinate fuzz targets passed 10-second runs on both
 platforms.
+
+The v0.5 implementation has been verified on native Windows: all six packages
+report 100% statement coverage, the complete repository passed three shuffled
+race runs, and all four virtualization fuzz targets passed 10-second runs.
+All six Linux test binaries cross-compile successfully. This workstation
+currently has no installed WSL distribution, so native-Linux execution remains
+for Ubuntu CI and is not claimed as a local v0.5 result.
 
 Run the normal checks:
 
@@ -242,6 +265,10 @@ go test ./document -run=^$ -fuzz=FuzzChangeHistoryStateMachine -fuzztime=30s
 go test ./document/coordinate -run=^$ -fuzz=FuzzIndexMatchesUTF8Reference -fuzztime=30s
 go test ./document/coordinate -run=^$ -fuzz=FuzzChangeMapBoundsAndComposition -fuzztime=30s
 go test ./document/coordinate -run=^$ -fuzz=FuzzIncrementalIndexMatchesFullBuild -fuzztime=30s
+go test ./document/virtual -run=^$ -fuzz=FuzzLogicalPagePartition -fuzztime=30s
+go test ./document/virtual -run=^$ -fuzz=FuzzLogicalPagesPreserveUTF8 -fuzztime=30s
+go test ./document/virtual -run=^$ -fuzz=FuzzFragmentWindowsRespectRanges -fuzztime=30s
+go test ./document/virtual -run=^$ -fuzz=FuzzPagerGenerationStateMachine -fuzztime=30s
 ```
 
 Windows race builds require a GCC-compatible MinGW-w64 toolchain; MSVC-target
@@ -263,16 +290,18 @@ Windows race builds require a GCC-compatible MinGW-w64 toolchain; MSVC-target
 - File-watcher candidates and future indexing/virtualization progress events
   are not implemented; save and recovery-WAL persistence transitions are.
 - Journal compaction requires an explicit save checkpoint. Search indexing,
-  Page/Fragment virtualization, index compaction, and composition are not
-  implemented.
+  search-index compaction, and composition are not implemented.
+- Fragment metadata and logical Page tables are bounded by configured page,
+  Fragment, key, task, and cache limits. Cache limits exclude transient copies
+  held by active tasks; peak read memory is additionally bounded by
+  `MaximumTasks × MaximumPageBytes`.
 - The API and on-disk formats remain unstable until 1.0.
 
 ## Next work
 
-With the v0.4 Session and coordinate foundation complete, v0.5 starts the
-format-neutral logical Page/Fragment virtualization layer: bounded Page reads,
-Measure indexing, overscan, continuation pages, generation publication, and
-strict cache/task budgets. Persistent search and multi-source composition then
-build on those foundations. The
-decision-complete target architecture, readiness assessment, edge cases, and
-v0.4–v1.0 milestones are in [develop.md](develop.md).
+With v0.5 virtualization complete, v0.6 starts format-neutral search: a bounded
+streaming literal/regex correctness baseline followed by a contentless trigram
+index, atomic index generations, incremental dirty-region updates,
+cancellation, and candidate verification against the exact Snapshot.
+Multi-source composition follows after search. The target architecture and
+remaining milestones are in [develop.md](develop.md).

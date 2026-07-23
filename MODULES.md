@@ -12,10 +12,53 @@ document/store ----+
 document/save -----+--> document
 recovery ----------+
 document/coordinate+
+document/virtual --+
 ```
 
 The lower packages never import `document`. `document.Session` is the current
 coordination facade and owns their lifecycle.
+
+## `document/virtual`
+
+The virtual package is a format-neutral layer above immutable `ReaderAt`
+sources. `Build` scans a revision exactly once and creates deterministic
+logical Pages. Boundaries prefer the first LF at or after
+`TargetPageBytes`; a long line is forced at the last UTF-8 boundary no later
+than `MaximumPageBytes`. Empty input still has one `[0,0)` Page. LF alone
+advances the logical line, matching `document/coordinate`.
+
+`Pager` is permanently bound to one revision. `BuildOwned` transfers a Source
+lease, and every concurrent `Close` waits for the same task barrier and returns
+the same release result. A Pager created through `Session.VirtualPager` owns a
+Snapshot lease, so later Session edits or saves cannot change its content.
+
+Fragment state is immutable and published with a generation compare-and-swap:
+
+- `IndexedThrough` is a byte watermark; Pages below it are marked analyzed
+  even when no Fragment covers that gap;
+- Fragments are ordered, non-overlapping, UTF-8-aligned ranges with unique
+  opaque IDs and DataKeys;
+- key strings are cloned before publication, and their actual retained byte
+  total is bounded independently of the Fragment count;
+- `Complete` may become true only at EOF, while EOF may remain explicitly
+  incomplete;
+- Provider callbacks run without a Pager or Session lock. A slow result loses
+  the generation CAS instead of overwriting a newer publication.
+
+`Measure` is a non-negative `int64` fixed-point quantity whose scale belongs to
+the host. Prefix sums are checked for overflow. A Fragment's Measure remains
+atomic: continuation Pages repeat its interval instead of inventing a
+byte-proportional layout. Byte, Fragment-ID, and Measure windows support
+asymmetric overscan and enforce hard byte, Page, distinct-Fragment, and Measure
+budgets. If a whole Fragment exceeds a request budget, callers can page through
+it by byte or select an explicit continuation.
+
+Page payloads use a strict byte-capacity LRU. Cache hits and returned values are
+copied so callers cannot mutate cached content. `CacheBytes` covers resident
+LRU payloads; transient active-task copies are bounded separately by
+`MaximumTasks × MaximumPageBytes`. The same task semaphore provides immediate
+`ErrBusy` backpressure. Provider callbacks and owned Source closers must not
+synchronously re-enter the same Pager.
 
 ## `document/store`
 
@@ -333,24 +376,29 @@ the cause. This prevents continued mutation on a partially rebound generation.
 
 The core intentionally retains generic text policy—UTF-8, BOM, newline
 metadata, revisions, ranges, and byte-oriented search foundations—but no format
-semantics. The remaining higher layers are Page/Fragment virtualization,
-persistent search, multi-source composition, automatic cache/index ownership,
-file-watcher integration, and production observability. See
-[develop.md](develop.md).
+semantics. Page/Fragment virtualization is now implemented in
+`document/virtual`; the remaining higher layers are persistent search,
+multi-source composition, file-watcher integration, and production
+observability. See [develop.md](develop.md).
 
 ## Verification
 
-Every current package is held at 100% statement coverage. Tests include
+All six current packages are held at 100% statement coverage. Tests include
 platform-specific replacement and directory-sync faults, complete UTF-8 and
 identity boundaries, every recovery batch truncation, transaction rollback,
 concurrent save/rebase, post-commit fault behavior, snapshot lifetime, integer
-overflow, randomized reference models, race runs, and sixteen fuzz targets.
+overflow, randomized reference models, race runs, and twenty fuzz targets.
 Event-specific tests exercise resumable history, exact overflow accounting,
 save progress and failure phase, WAL Sync failure/restoration, concurrent
 publish/unsubscribe, final-event delivery, and the close barrier. Lifecycle and
 compaction tests cover marker locks, conservative orphan reclamation, cleanup
 faults, live undo remapping, journal checkpoints, and Snapshot preservation.
-Incremental-index tests compare every byte, rune, and line coordinate with a
+Virtualization tests cover UTF-8 Page partitioning, analyzed gaps, incomplete
+watermarks, continuation Pages, byte/Fragment/Measure affinity, all four
+budgets, cache ownership, task backpressure, generation races, provider
+failures, and concurrent Close barriers. Four additional fuzz targets compare
+Page reconstruction, Fragment windows, and generation state with reference
+invariants. Incremental-index tests compare every byte, rune, and line coordinate with a
 fresh full build across randomized sequential UTF-8 edits.
 Change-history state-machine fuzzing covers bounded eviction, unavailable batch
 interiors, forward/reverse maps, metadata, and Anchor equivalence.
@@ -365,3 +413,10 @@ native-Linux directory. All five packages retained 100% statement coverage,
 three shuffled race runs passed, and the nine affected Session, event,
 change-history, and coordinate fuzz targets passed 10-second runs on both
 platforms.
+
+The v0.5 implementation was checked on native Windows with 100% statement
+coverage in all six packages, three shuffled race runs across the repository,
+and four 10-second virtualization fuzz runs. All six Linux test binaries
+cross-compile. No WSL distribution is currently installed on this workstation,
+so native-Linux v0.5 execution is delegated to Ubuntu CI rather than reported
+as a local result.

@@ -22,6 +22,7 @@ import (
 	"github.com/moresleep512/docengine/document/coordinate"
 	"github.com/moresleep512/docengine/document/save"
 	"github.com/moresleep512/docengine/document/store"
+	"github.com/moresleep512/docengine/document/virtual"
 	"github.com/moresleep512/docengine/recovery"
 )
 
@@ -519,6 +520,23 @@ func (s *Session) CoordinateIndex(ctx context.Context, options coordinate.Option
 	}
 	options.Lineage = s.coordinateLineage
 	return coordinate.BuildOwned(ctx, snapshot, revision, options)
+}
+
+// VirtualPager builds a format-neutral logical Page and Fragment pager for one
+// immutable Session revision. The returned Pager owns its Snapshot lease and
+// must be closed by the caller.
+func (s *Session) VirtualPager(ctx context.Context, options virtual.Options) (*virtual.Pager, error) {
+	if ctx == nil {
+		return nil, virtual.ErrInvalidContext
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	revision, snapshot, err := s.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	return virtual.BuildOwned(ctx, snapshot, revision, options)
 }
 
 // RebuildCoordinateIndex derives the current revision's index from a previous

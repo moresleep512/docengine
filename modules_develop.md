@@ -1,6 +1,6 @@
 # Docengine 模块开发历程与设计决策
 
-本文记录 Docengine 从 TypeMD 后端抽离，到 v0.4.2 为止的实际开发顺序、模块形成过程、
+本文记录 Docengine 从 TypeMD 后端抽离，到 v0.5 为止的实际开发顺序、模块形成过程、
 关键取舍、测试方法和问题复盘。它回答的不是“现在有哪些 API”，而是“代码为什么最终
 长成现在这样”。
 
@@ -409,40 +409,103 @@ available/unavailable、相等和不等组合。
 保存前完整 hash 防止覆盖已观察到的外部内容变化；未来文件 watcher 和可注入冲突策略
 仍属于 `develop.md` 中的后续工作。
 
-## 7. 贯穿所有阶段的设计理念
+## 7. v0.5：把 Snapshot 地基变成通用虚拟化
 
-### 7.1 格式中立不是口号，而是依赖约束
+### 7.1 为什么先做逻辑 Page
+
+搜索、渲染调度和多源编排都不能以“整份文档已经在内存”为前提。v0.5 因此先引入
+`document/virtual`：它只依赖 immutable `ReaderAt` Source，不导入根 `document`，再由
+`Session.VirtualPager` 转移 Snapshot lease。旧 Pager 在后续 edit/save 后仍读取旧
+revision，新 Pager 才观察新 revision，这与 coordinate Index 的生命周期完全一致。
+
+逻辑 Page 在 target 大小之后等待 LF，但绝不越过 maximum；长行在 UTF-8 boundary 强制
+切分。空文档也有一个确定的 `[0,0)` Page。这里没有使用 TypeMD 旧实现的 Markdown block、
+`float64` height 或 `strings.ToValidUTF8`：前两者会把格式/像素带回内核，后者会静默修改
+正文。
+
+### 7.2 Fragment publication 为什么需要水位和双 generation
+
+Fragment 只包含 opaque ID/DataKey、byte range 和 `Measure int64`。同一批范围有序、
+不重叠且必须落在 UTF-8 boundary，但允许 gap。`IndexedThrough` 表达 Provider 已分析到的
+前缀，所以水位内 gap 是“已知没有 Fragment”，水位后的 suffix 才是未知；单独一个
+`Complete bool` 无法表达这个差别。
+
+Pager revision 固定正文身份，Fragment generation 固定派生索引身份。Provider 在没有
+Pager/Session 锁的情况下构建结果，发布时用 `BaseGeneration` CAS；慢结果若落后就返回
+stale，不能覆盖新结果。所有 key 都 clone 后保存，避免短 substring 让一个一字节 key
+长期持有数百 MiB backing allocation；Fragment 数、key bytes、单 Fragment Measure 和
+累计 Measure 都有独立检查。
+
+### 7.3 Measure 与 continuation 的边界
+
+宿主只给出整个 Fragment 的 Measure，没有给 continuation 内部的测量分布。按 byte 比例
+拆 Measure 看似方便，却是在内核伪造布局。最终设计让巨型 Fragment 拆成多个有界 I/O
+Page，每页重复父 Fragment 的原子 Measure interval，并允许按 continuation 定位。
+byte、Fragment ID、Measure 三类窗口都携带 revision/generation，支持非对称 overscan，
+并同时执行 byte/page/distinct-fragment/Measure 四项硬预算。
+
+零 Measure、连续零值和 Measure 边界必须有确定 affinity：Before 选择左侧，After 选择
+右侧；全零序列在同一点分别夹到末端和起点。请求超界、索引尚不可用和 generation 过期
+使用不同错误，宿主不需要猜测是等待、重建还是修正参数。
+
+### 7.4 缓存、任务和关闭不是附属实现
+
+Page payload 使用严格 byte-capacity LRU，命中和返回都复制，调用方不能修改缓存。
+`CacheBytes` 只统计驻留 payload；并发 miss 和返回副本的瞬时上限由
+`MaximumTasks × MaximumPageBytes` 约束。任务 semaphore 满时立即返回 `ErrBusy`，形成
+明确背压。
+
+`Close` 先阻止新任务，再等待已接纳任务，所有并发 Close 调用共享同一 barrier 和 Source
+release 错误。开发中曾出现第二个 Close 提前返回、巨型 Fragment 因把全部 continuation
+当作一个 anchor 而永久无法读取、`fragmentIndex + After` 整数溢出、gap Start 落入
+多字节 rune、EOF 被误判为 LF 等问题；它们都在 100% 行覆盖之外通过语义复审和定向
+并发/边界测试发现。
+
+### 7.5 测试为下一层冻结了什么
+
+六个 package 继续保持 100% statement coverage。virtual 测试覆盖 Page 重组、UTF-8
+跨缓冲区、line/continuation、partial/full watermarks、gap fallback、key/Measure overflow、
+三类锚点、四项预算、缓存逐出、Provider stale race、任务背压和并发 Close。四个 fuzz
+target 分别验证逻辑分区、UTF-8 重组、Fragment 窗口和 generation 状态机，并增加 build、
+publish 与 cached-window benchmark。
+
+这层完成后，v0.6 搜索可以复用相同 Page、revision/generation、Context 和预算语义，
+不需要重新发明大文件分块或异步结果淘汰协议。
+
+## 8. 贯穿所有阶段的设计理念
+
+### 8.1 格式中立不是口号，而是依赖约束
 
 内核可以返回 byte range、revision 和通用 annotation，但不能返回 Markdown heading 或
 代码 token。只要底层开始理解一种格式，虚拟化、搜索和组合就会被该格式绑定。
 
-### 7.2 不可变 Snapshot 是并发读的共同语言
+### 8.2 不可变 Snapshot 是并发读的共同语言
 
 保存、坐标构建、搜索和未来 Page 调度都应读取绑定 revision 的 Snapshot，而不是长时间
 持有 Session 锁。Source generation 确保结构不可变之外，底层句柄也活得足够久。
 
-### 7.3 原子发布优先于就地修补
+### 8.3 原子发布优先于就地修补
 
 ApplyBatch、journal append、save rebase、Index 刷新和 generation 切换都先构造完整结果，
 再一次发布。错误路径宁可返回明确失败，也不暴露半个事务。
 
-### 7.4 所有权必须可以回答“谁负责关闭和删除”
+### 8.4 所有权必须可以回答“谁负责关闭和删除”
 
 Tree 不关闭 Source；generation 管理 base/journal；Session 管理 generation、undo、marker
 和后台循环；owned/shared 配置决定目录能否由内核删除。模糊所有权最终都会变成崩溃恢复
 或并发 Close 的数据丢失。
 
-### 7.5 已提交、已同步和仍可编辑是三件不同的事
+### 8.5 已提交、已同步和仍可编辑是三件不同的事
 
 `CommittedRevision`、`DurabilityUncertain`、`RecoveryDurabilityUncertain` 和
 `PersistenceFaulted` 分别表达不同状态。把它们压成一个 error 会让宿主无法做正确决策。
 
-### 7.6 性能优化必须有可验证预算
+### 8.6 性能优化必须有可验证预算
 
 固定扫描缓冲区、单遍 hash、checkpoint 前缀复用、Piece 合并、undo 重写和有界事件/history
 都配套统计或测试。没有约束的缓存和“看起来更快”的增量算法不进入内核。
 
-### 7.7 测试从结果示例逐层走向状态空间
+### 8.7 测试从结果示例逐层走向状态空间
 
 当前测试层次是：
 
@@ -457,18 +520,17 @@ Tree 不关闭 Source；generation 管理 base/journal；Session 管理 generati
 100% statement coverage 是最低门槛，不是终点。v0.4.1 和 v0.4.2 都是在覆盖率已经 100%
 之后发现的语义缺口。
 
-## 8. 到这里为止，以及为什么下一步不是继续堆编辑 API
+## 9. 到这里为止，以及为什么下一步不是继续堆编辑 API
 
-截至 v0.4.2，Docengine 已经有 Piece Tree、不可变 Snapshot、原子事务、recovery v2、
-跨平台保存、显式故障状态、坐标/ChangeMap、事件、资源策略、压缩和严格测试地基。
+截至 v0.5，Docengine 已经有 Piece Tree、不可变 Snapshot、原子事务、recovery v2、
+跨平台保存、显式故障状态、坐标/ChangeMap、事件、资源策略、压缩，以及格式中立的
+Page/Fragment/Measure 虚拟化。
 
 下一阶段应按 `develop.md` 继续完成：
 
-- 有界逻辑 Page 和格式无关 Fragment 虚拟化；
 - 持久化、可验证、可取消的原始文本搜索；
 - 持久区间集合和多 Snapshot Source Composition；
 - watcher、后台任务预算、背压、GC/压缩策略及长期 soak/crash matrix。
 
 这些模块都必须建立在当前 revision、Snapshot、Source 所有权和故障语义之上。先把地基做成
-可证明的内核，再向上增加虚拟化、搜索和编排，是整个项目从 TypeMD 抽离后最重要的开发
-顺序。
+可证明的内核，再向上增加搜索和编排，是整个项目从 TypeMD 抽离后最重要的开发顺序。

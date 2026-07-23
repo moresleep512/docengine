@@ -20,6 +20,7 @@ jobs:
         with:
           go-version: "1.26.x"
           cache: true
+      - run: go mod verify
       - name: Check formatting
         shell: bash
         run: |
@@ -36,7 +37,7 @@ jobs:
         with:
           go-version: "1.26.x"
           cache: true
-      - run: go test -race ./...
+      - run: go test -race -shuffle=on -count=3 ./...
 
   coverage:
     runs-on: ubuntu-latest
@@ -49,7 +50,7 @@ jobs:
       - name: Require full statement coverage
         shell: bash
         run: |
-          for package in ./document ./document/coordinate ./document/save ./document/store ./recovery; do
+          for package in ./document ./document/coordinate ./document/save ./document/store ./document/virtual ./recovery; do
             profile="$(mktemp)"
             go test -coverprofile="$profile" "$package"
             total="$(go tool cover -func="$profile" | awk '/^total:/ { print $3 }')"
@@ -81,3 +82,7 @@ jobs:
       - run: go test ./document/coordinate -run=^$ -fuzz=FuzzIndexMatchesUTF8Reference -fuzztime=10s
       - run: go test ./document/coordinate -run=^$ -fuzz=FuzzChangeMapBoundsAndComposition -fuzztime=10s
       - run: go test ./document/coordinate -run=^$ -fuzz=FuzzIncrementalIndexMatchesFullBuild -fuzztime=10s
+      - run: go test ./document/virtual -run=^$ -fuzz=FuzzLogicalPagePartition -fuzztime=10s
+      - run: go test ./document/virtual -run=^$ -fuzz=FuzzLogicalPagesPreserveUTF8 -fuzztime=10s
+      - run: go test ./document/virtual -run=^$ -fuzz=FuzzFragmentWindowsRespectRanges -fuzztime=10s
+      - run: go test ./document/virtual -run=^$ -fuzz=FuzzPagerGenerationStateMachine -fuzztime=10s
