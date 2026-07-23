@@ -7,13 +7,13 @@ import (
 	"testing"
 )
 
-// FuzzSessionCrashRecovery randomizes the crash-recovery surface: it applies a
-// sequence of edits to a session, closes it WITHOUT saving (simulating a crash
-// with a live WAL), reopens, and verifies the recovered content and Recovered
-// flag. It then corrupts the journal tail at a fuzz-derived offset and reopens
-// again to verify RepairTail lands on a valid batch boundary and the surviving
-// content equals the last fully-committed-batch content. This complements the
-// deterministic recovery tests, which exercise one crash point at a time.
+// FuzzSessionCrashRecovery randomizes the reconstruction surface: it applies a
+// sequence of edits, closes without saving so the WAL remains, reopens, and
+// verifies the recovered content and Recovered flag. Close gives the fuzzer a
+// deterministic handle boundary; it is not presented as a real process crash.
+// TestPersistenceCrashProcessMatrix covers actual process exits. The fuzzer
+// then corrupts the journal tail at a derived offset and verifies RepairTail
+// exposes only a complete-batch prefix.
 func FuzzSessionCrashRecovery(f *testing.F) {
 	f.Add([]byte("base"), []byte{0, 3, 0, 1, 0, 2, 0, 0, 1, 50})
 	f.Add([]byte("abc"), []byte{0, 0, 1, 0, 1, 0, 2, 200})

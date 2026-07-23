@@ -114,11 +114,31 @@ func TestOpenMatchingJournalV2IsolationAndQuarantine(t *testing.T) {
 	journal, replay, err = openMatchingJournal(dir, fingerprint)
 	var recoveryErr *RecoveryOpenError
 	if !errors.As(err, &recoveryErr) || journal != nil || len(replay.Batches) != 0 {
-		t.Fatalf("ambiguous openMatchingJournal = (%v, %+v, %v)", journal, replay, err)
+		t.Fatalf("invalid-candidate openMatchingJournal = (%v, %+v, %v)", journal, replay, err)
 	}
-	quarantined, err := filepath.Glob(filepath.Join(dir, "*.quarantine-ambiguous-*"))
+	quarantined, err := filepath.Glob(filepath.Join(dir, "*.quarantine-invalid-header-*"))
+	if err != nil || len(quarantined) != 1 {
+		t.Fatalf("invalid quarantined journals = %v, error = %v", quarantined, err)
+	}
+	if _, err := os.Stat(older); err != nil {
+		t.Fatalf("valid candidate changed after invalid peer: %v", err)
+	}
+
+	second := filepath.Join(dir, prefix+".second.docengine-journal-v2")
+	created, _, err := recovery.Open(second, fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := created.Close(); err != nil {
+		t.Fatal(err)
+	}
+	journal, replay, err = openMatchingJournal(dir, fingerprint)
+	if !errors.As(err, &recoveryErr) || journal != nil || len(replay.Batches) != 0 {
+		t.Fatalf("ambiguous matching journals = (%v, %+v, %v)", journal, replay, err)
+	}
+	quarantined, err = filepath.Glob(filepath.Join(dir, "*.quarantine-ambiguous-*"))
 	if err != nil || len(quarantined) != 2 {
-		t.Fatalf("quarantined journals = %v, error = %v", quarantined, err)
+		t.Fatalf("ambiguous quarantined journals = %v, error = %v", quarantined, err)
 	}
 }
 

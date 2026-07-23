@@ -68,6 +68,17 @@ type Metadata struct {
 	PersistenceFaulted          bool
 }
 
+// RecoveryStats is an atomic view of recovery-journal growth and automatic
+// checkpoint scheduling. JournalBytes is zero while no journal is open.
+type RecoveryStats struct {
+	JournalBytes              int64
+	MaxJournalBytes           int64
+	AutoCheckpointBytes       int64
+	NextAutoCheckpointBytes   int64
+	AutomaticCheckpoints      uint64
+	AutomaticCheckpointQueued bool
+}
+
 type RecoveryOpenError struct {
 	JournalPath     string
 	QuarantinedPath string
@@ -109,6 +120,7 @@ type pendingOperation struct {
 	group                      uint64
 	start, deleteLength        int64
 	insertOffset, insertLength int64
+	insertNewlines             int64
 }
 
 type stagedOperation struct {
@@ -120,17 +132,20 @@ type stagedOperation struct {
 const stagingSourceID store.SourceID = 255
 
 type sessionOperations struct {
-	absolutePath  func(string) (string, error)
-	evalSymlinks  func(string) (string, error)
-	openBase      func(string) (*os.File, error)
-	stat          func(string) (os.FileInfo, error)
-	openRecovery  func(string, recovery.Fingerprint) (*recovery.Journal, recovery.ReplayResult, error)
-	readRecovery  func(*recovery.Journal, []byte, int64) (int, error)
-	syncRecovery  func(*recovery.Journal) error
-	newTree       func(io.ReaderAt, store.Piece) (*store.Tree, error)
-	cloneTree     func(*store.Tree) (*store.Tree, error)
-	atomicChecked func(string, os.FileMode, []byte, func(io.Writer) (int64, error), func() error) (int64, error)
-	syncParent    func(string) error
+	absolutePath   func(string) (string, error)
+	evalSymlinks   func(string) (string, error)
+	openBase       func(string) (*os.File, error)
+	stat           func(string) (os.FileInfo, error)
+	openRecovery   func(string, recovery.Fingerprint) (*recovery.Journal, recovery.ReplayResult, error)
+	readRecovery   func(*recovery.Journal, []byte, int64) (int, error)
+	sizeRecovery   func(*recovery.Journal) (int64, error)
+	appendRecovery func(*recovery.Journal, uint64, uint64, []recovery.ReplaceOperation) (recovery.BatchAppendResult, error)
+	syncRecovery   func(*recovery.Journal) error
+	removeRecovery func(string) error
+	newTree        func(io.ReaderAt, store.Piece) (*store.Tree, error)
+	cloneTree      func(*store.Tree) (*store.Tree, error)
+	atomicChecked  func(string, os.FileMode, []byte, func(io.Writer) (int64, error), func() error) (int64, error)
+	syncParent     func(string) error
 }
 
 var systemSessionOperations = sessionOperations{
@@ -142,8 +157,13 @@ var systemSessionOperations = sessionOperations{
 	readRecovery: func(journal *recovery.Journal, buffer []byte, offset int64) (int, error) {
 		return journal.ReadAt(buffer, offset)
 	},
-	syncRecovery: func(journal *recovery.Journal) error { return journal.Sync() },
-	newTree:      store.NewWithBasePiece,
+	sizeRecovery: func(journal *recovery.Journal) (int64, error) { return journal.Size() },
+	appendRecovery: func(journal *recovery.Journal, revision, group uint64, operations []recovery.ReplaceOperation) (recovery.BatchAppendResult, error) {
+		return journal.AppendBatch(revision, group, operations)
+	},
+	syncRecovery:   func(journal *recovery.Journal) error { return journal.Sync() },
+	removeRecovery: os.Remove,
+	newTree:        store.NewWithBasePiece,
 	cloneTree: func(source *store.Tree) (*store.Tree, error) {
 		return cloneDocumentTree(source), nil
 	},
@@ -158,46 +178,51 @@ type fileIdentity struct {
 }
 
 type Session struct {
-	mu                  sync.RWMutex
-	saveMu              sync.Mutex
-	path                string
-	resolvedPath        string
-	mode                os.FileMode
-	base                *os.File
-	journal             *recovery.Journal
-	generation          *sourceGeneration
-	tree                *store.Tree
-	revision            uint64
-	committedRevision   uint64
-	undo                []historyEntry
-	redo                []historyEntry
-	undoStore           *undoStore
-	sessionMarker       *sessionMarker
-	undoEpoch           uint64
-	pending             []pendingOperation
-	dirty               bool
-	recovered           bool
-	hasBOM              bool
-	eol                 EOLStyle
-	recoveryDir         string
-	sessionDir          string
-	config              SessionConfig
-	fingerprint         recovery.Fingerprint
-	diskIdentity        fileIdentity
-	durabilityUncertain bool
-	fault               error
-	closed              bool
-	commitHook          func(string)
-	stopSync            chan struct{}
-	syncDone            chan struct{}
-	operations          sessionOperations
-	events              *eventHub
-	changeHistory       *changeHistory
-	coordinateLineage   *coordinate.Lineage
-	closeDone           chan struct{}
-	closeErr            error
-	nextPersistenceID   uint64
-	journalSyncErr      error
+	mu                         sync.RWMutex
+	saveMu                     sync.Mutex
+	path                       string
+	resolvedPath               string
+	mode                       os.FileMode
+	base                       *os.File
+	journal                    *recovery.Journal
+	generation                 *sourceGeneration
+	tree                       *store.Tree
+	revision                   uint64
+	committedRevision          uint64
+	undo                       []historyEntry
+	redo                       []historyEntry
+	undoStore                  *undoStore
+	sessionMarker              *sessionMarker
+	undoEpoch                  uint64
+	pending                    []pendingOperation
+	dirty                      bool
+	recovered                  bool
+	hasBOM                     bool
+	eol                        EOLStyle
+	recoveryDir                string
+	sessionDir                 string
+	config                     SessionConfig
+	fingerprint                recovery.Fingerprint
+	diskIdentity               fileIdentity
+	durabilityUncertain        bool
+	fault                      error
+	closed                     bool
+	commitHook                 func(string)
+	stopSync                   chan struct{}
+	syncDone                   chan struct{}
+	operations                 sessionOperations
+	events                     *eventHub
+	changeHistory              *changeHistory
+	coordinateLineage          *coordinate.Lineage
+	closeDone                  chan struct{}
+	closeErr                   error
+	nextPersistenceID          uint64
+	journalSyncErr             error
+	journalBytes               int64
+	nextJournalCheckpoint      int64
+	automaticCheckpoints       uint64
+	checkpointRequest          chan uint64
+	automaticCheckpointPending bool
 }
 
 func Open(path string, options OpenOptions) (*Session, error) {
@@ -290,7 +315,7 @@ func openSessionContext(ctx context.Context, path string, options OpenOptions, o
 		path: absolute, resolvedPath: resolved, mode: info.Mode(), base: base, journal: journal, generation: generation, tree: tree,
 		undoStore: undo, sessionMarker: marker, hasBOM: scan.hasBOM, eol: scan.eol, recoveryDir: config.RecoveryDir,
 		sessionDir: config.SessionDir, config: config, fingerprint: fingerprint, diskIdentity: identityFor(info, scan.contentHash),
-		stopSync: make(chan struct{}), syncDone: make(chan struct{}), operations: operations,
+		stopSync: make(chan struct{}), syncDone: make(chan struct{}), checkpointRequest: make(chan uint64, 1), operations: operations,
 		events: newEventHub(config.Limits.EventHistory), coordinateLineage: coordinate.NewLineage(), closeDone: make(chan struct{}),
 	}
 	if journal != nil {
@@ -302,12 +327,18 @@ func openSessionContext(ctx context.Context, path string, options OpenOptions, o
 				return nil, errors.Join(err, generation.retireAndWait(false), undo.close(), marker.close(), cleanupOwnedDirectories(config, true))
 			}
 		}
+		session.journalBytes, err = operations.sizeRecovery(journal)
+		if err != nil {
+			return nil, errors.Join(err, generation.retireAndWait(false), undo.close(), marker.close(), cleanupOwnedDirectories(config, true))
+		}
 	}
+	session.resetJournalCheckpointLocked()
 	session.changeHistory = newChangeHistory(config.Limits.ChangeHistory, session.revision, session.tree.Len())
 	session.publishEventLocked(EventOpened, ChangeOriginNone, coordinate.ChangeMap{}, nil)
 	if session.recovered {
 		session.publishEventLocked(EventRecovered, ChangeOriginNone, coordinate.ChangeMap{}, nil)
 	}
+	session.maybeScheduleJournalCheckpointLocked()
 	go session.syncLoop()
 	return session, nil
 }
@@ -317,6 +348,15 @@ func openMatchingJournal(dir string, fingerprint recovery.Fingerprint) (*recover
 }
 
 func openMatchingJournalWith(dir string, fingerprint recovery.Fingerprint, openRecovery func(string, recovery.Fingerprint) (*recovery.Journal, recovery.ReplayResult, error)) (*recovery.Journal, recovery.ReplayResult, error) {
+	return openMatchingJournalWithQuarantine(dir, fingerprint, openRecovery, quarantineRecovery)
+}
+
+func openMatchingJournalWithQuarantine(
+	dir string,
+	fingerprint recovery.Fingerprint,
+	openRecovery func(string, recovery.Fingerprint) (*recovery.Journal, recovery.ReplayResult, error),
+	quarantine func(string, string, error) error,
+) (*recovery.Journal, recovery.ReplayResult, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, recovery.ReplayResult{}, err
 	}
@@ -329,29 +369,58 @@ func openMatchingJournalWith(dir string, fingerprint recovery.Fingerprint, openR
 		right, _ := os.Stat(paths[j])
 		return left != nil && right != nil && left.ModTime().After(right.ModTime())
 	})
-	if len(paths) > 1 {
+	if len(paths) == 0 {
+		return nil, recovery.ReplayResult{}, nil
+	}
+	matching := make([]string, 0, len(paths))
+	var probeErrors []error
+	for _, path := range paths {
+		stored, probeErr := recovery.ReadFingerprint(path)
+		if probeErr != nil {
+			probeErrors = append(probeErrors, quarantine(path, "invalid-header", probeErr))
+			continue
+		}
+		if stored == fingerprint {
+			matching = append(matching, path)
+		}
+	}
+	if len(probeErrors) != 0 {
+		return nil, recovery.ReplayResult{}, errors.Join(probeErrors...)
+	}
+	if len(matching) > 1 {
 		quarantineErrors := make([]error, 0, len(paths))
-		for _, path := range paths {
-			quarantineErrors = append(quarantineErrors, quarantineRecovery(path, "ambiguous", errors.New("multiple recovery journals exist")))
+		for _, path := range matching {
+			quarantineErrors = append(quarantineErrors, quarantine(path, "ambiguous", errors.New("multiple recovery journals exist")))
 		}
 		return nil, recovery.ReplayResult{}, errors.Join(quarantineErrors...)
 	}
-	if len(paths) == 1 {
-		path := paths[0]
-		stored, probeErr := recovery.ReadFingerprint(path)
-		if probeErr != nil {
-			return nil, recovery.ReplayResult{}, quarantineRecovery(path, "invalid-header", probeErr)
+	if len(matching) == 0 {
+		quarantineErrors := make([]error, 0, len(paths))
+		for _, path := range paths {
+			quarantineErrors = append(quarantineErrors, quarantine(path, "base-mismatch", recovery.ErrStaleJournal))
 		}
-		if stored != fingerprint {
-			return nil, recovery.ReplayResult{}, quarantineRecovery(path, "base-mismatch", recovery.ErrStaleJournal)
-		}
-		journal, replay, openErr := openRecovery(path, fingerprint)
-		if openErr != nil {
-			return nil, recovery.ReplayResult{}, quarantineRecovery(path, "open-failed", openErr)
-		}
-		return journal, replay, nil
+		return nil, recovery.ReplayResult{}, errors.Join(quarantineErrors...)
 	}
-	return nil, recovery.ReplayResult{}, nil
+	path := matching[0]
+	var retiredErrors []error
+	for _, candidate := range paths {
+		if candidate == path {
+			continue
+		}
+		retired := quarantine(candidate, "retired-base", recovery.ErrStaleJournal)
+		var recoveryErr *RecoveryOpenError
+		if !errors.As(retired, &recoveryErr) || recoveryErr.QuarantinedPath == "" {
+			retiredErrors = append(retiredErrors, retired)
+		}
+	}
+	if len(retiredErrors) != 0 {
+		return nil, recovery.ReplayResult{}, errors.Join(retiredErrors...)
+	}
+	journal, replay, openErr := openRecovery(path, fingerprint)
+	if openErr != nil {
+		return nil, recovery.ReplayResult{}, quarantine(path, "open-failed", openErr)
+	}
+	return journal, replay, nil
 }
 
 func quarantineRecovery(path, reason string, cause error) error {
@@ -419,7 +488,11 @@ func (s *Session) replay(result recovery.ReplayResult) error {
 			}
 			entry.forward = append(entry.forward, historyOperation{start: operation.Start, deleteLength: operation.DeleteLength, insert: forwardRef})
 			entry.inverse = append([]historyOperation{{start: operation.Start, deleteLength: operation.InsertLength, insert: inverseRef}}, entry.inverse...)
-			s.pending = append(s.pending, pendingOperation{revision: revision, group: batch.Group, start: operation.Start, deleteLength: operation.DeleteLength, insertOffset: operation.PayloadOffset, insertLength: operation.InsertLength})
+			s.pending = append(s.pending, pendingOperation{
+				revision: revision, group: batch.Group, start: operation.Start, deleteLength: operation.DeleteLength,
+				insertOffset: operation.PayloadOffset, insertLength: operation.InsertLength,
+				insertNewlines: int64(bytes.Count(inserted, []byte{'\n'})),
+			})
 			s.revision = revision
 		}
 		s.undo = append(s.undo, entry)
@@ -442,6 +515,14 @@ func (s *Session) Config() SessionConfig {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.config
+}
+
+// RecoveryStats returns recovery-journal growth and checkpoint scheduling
+// state without touching the filesystem. It remains available after Close.
+func (s *Session) RecoveryStats() RecoveryStats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.recoveryStatsLocked()
 }
 
 // Subscribe creates a nonblocking, ordered Session event stream. Historical
@@ -482,6 +563,39 @@ func (s *Session) recordJournalSyncResultLocked(journal *recovery.Journal, syncE
 
 func (s *Session) metadataLocked() Metadata {
 	return Metadata{Path: s.path, ResolvedPath: s.resolvedPath, Name: filepath.Base(s.path), ByteLength: s.tree.Len(), Revision: s.revision, CommittedRevision: s.committedRevision, Dirty: s.dirty, Recovered: s.recovered, HasBOM: s.hasBOM, EOL: s.eol, DurabilityUncertain: s.durabilityUncertain, RecoveryDurabilityUncertain: s.journalSyncErr != nil, PersistenceFaulted: s.fault != nil}
+}
+
+func (s *Session) recoveryStatsLocked() RecoveryStats {
+	return RecoveryStats{
+		JournalBytes:              s.journalBytes,
+		MaxJournalBytes:           s.config.Limits.MaxJournalBytes,
+		AutoCheckpointBytes:       s.config.AutoCheckpointJournalBytes,
+		NextAutoCheckpointBytes:   s.nextJournalCheckpoint,
+		AutomaticCheckpoints:      s.automaticCheckpoints,
+		AutomaticCheckpointQueued: s.automaticCheckpointPending,
+	}
+}
+
+func (s *Session) resetJournalCheckpointLocked() {
+	s.nextJournalCheckpoint = s.config.AutoCheckpointJournalBytes
+}
+
+func (s *Session) maybeScheduleJournalCheckpointLocked() {
+	threshold := s.config.AutoCheckpointJournalBytes
+	if threshold == 0 || s.closed || s.fault != nil || s.journal == nil ||
+		s.journalBytes < s.nextJournalCheckpoint || s.automaticCheckpointPending {
+		return
+	}
+	s.nextJournalCheckpoint = nextCheckpointThreshold(s.journalBytes, threshold)
+	s.automaticCheckpointPending = true
+	s.checkpointRequest <- s.revision
+}
+
+func nextCheckpointThreshold(current, threshold int64) int64 {
+	if current > math.MaxInt64-threshold {
+		return math.MaxInt64
+	}
+	return current + threshold
 }
 
 // Fault returns the cause that placed this Session into its permanent
@@ -649,16 +763,29 @@ func (s *Session) applyOperationsLocked(ctx context.Context, operations []Replac
 	if err := ctx.Err(); err != nil {
 		return coordinate.ChangeMap{}, err
 	}
-	if err := s.ensureJournalLocked(); err != nil {
-		return coordinate.ChangeMap{}, err
-	}
 	recoveryOperations := make([]recovery.ReplaceOperation, len(staged))
 	for index, operation := range staged {
 		recoveryOperations[index] = recovery.ReplaceOperation{
 			Start: operation.operation.Start, DeleteLength: operation.operation.DeleteLength, Inserted: operation.inserted,
 		}
 	}
-	appendResult, err := s.journal.AppendBatch(s.revision+1, group, recoveryOperations)
+	// Staging and the revision-overflow check above establish every invariant
+	// required by BatchEncodedSize.
+	batchBytes, _ := recovery.BatchEncodedSize(s.revision+1, group, recoveryOperations)
+	anticipatedBytes := s.journalBytes
+	if s.journal == nil {
+		anticipatedBytes = recovery.EmptyJournalBytes
+	}
+	if err := checkJournalQuota(anticipatedBytes, batchBytes, s.config.Limits.MaxJournalBytes); err != nil {
+		return coordinate.ChangeMap{}, err
+	}
+	if err := s.ensureJournalLocked(); err != nil {
+		return coordinate.ChangeMap{}, err
+	}
+	if err := checkJournalQuota(s.journalBytes, batchBytes, s.config.Limits.MaxJournalBytes); err != nil {
+		return coordinate.ChangeMap{}, err
+	}
+	appendResult, err := s.operations.appendRecovery(s.journal, s.revision+1, group, recoveryOperations)
 	if err != nil {
 		return coordinate.ChangeMap{}, err
 	}
@@ -701,6 +828,7 @@ func (s *Session) applyOperationsLocked(ctx context.Context, operations []Replac
 		}
 	}
 
+	s.journalBytes = appendResult.EndOffset
 	s.tree = finalTree
 	firstRevision := s.revision + 1
 	for index, operation := range staged {
@@ -708,6 +836,7 @@ func (s *Session) applyOperationsLocked(ctx context.Context, operations []Replac
 		s.pending = append(s.pending, pendingOperation{
 			revision: revision, group: group, start: operation.operation.Start, deleteLength: operation.operation.DeleteLength,
 			insertOffset: appendResult.PayloadOffsets[index], insertLength: int64(len(operation.inserted)),
+			insertNewlines: int64(bytes.Count(operation.inserted, []byte{'\n'})),
 		})
 	}
 	s.revision += uint64(len(staged))
@@ -716,7 +845,16 @@ func (s *Session) applyOperationsLocked(ctx context.Context, operations []Replac
 		s.undo = append(s.undo, entry)
 		s.redo = nil
 	}
+	s.maybeScheduleJournalCheckpointLocked()
 	return changes, nil
+}
+
+func checkJournalQuota(currentBytes, batchBytes, maximumBytes int64) error {
+	if currentBytes <= maximumBytes-batchBytes {
+		return nil
+	}
+	return fmt.Errorf("%w: recovery journal has %d bytes, batch adds %d, maximum is %d",
+		ErrLimitExceeded, currentBytes, batchBytes, maximumBytes)
 }
 
 func (s *Session) stageOperationsLocked(ctx context.Context, operations []ReplaceOperation) ([]stagedOperation, error) {
@@ -872,10 +1010,114 @@ func (s *Session) ensureJournalLocked() error {
 	if err != nil {
 		return err
 	}
+	size, err := s.operations.sizeRecovery(journal)
+	if err != nil {
+		return errors.Join(err, journal.Close(), s.operations.removeRecovery(path))
+	}
 	s.journal = journal
 	s.generation.attachJournal(journal)
 	s.tree.SetSource(store.SourceJournal, journal)
+	s.journalBytes = size
 	return nil
+}
+
+type preparedJournalRebase struct {
+	journal *recovery.Journal
+	path    string
+	pending []pendingOperation
+	bytes   int64
+}
+
+func (s *Session) discardPreparedJournal(prepared *preparedJournalRebase, remove bool) error {
+	if prepared == nil || prepared.journal == nil {
+		return nil
+	}
+	closeErr := prepared.journal.Close()
+	prepared.journal = nil
+	if !remove {
+		return closeErr
+	}
+	removeErr := s.operations.removeRecovery(prepared.path)
+	if errors.Is(removeErr, os.ErrNotExist) {
+		removeErr = nil
+	}
+	return errors.Join(closeErr, removeErr)
+}
+
+// prepareJournalRebaseLocked builds and syncs the recovery journal that will
+// belong to the replacement base. The caller holds s.mu, preventing an edit
+// from landing only in the old journal after this snapshot is taken.
+func (s *Session) prepareJournalRebaseLocked(fingerprint recovery.Fingerprint, targetRevision uint64) (*preparedJournalRebase, error) {
+	newer := make([]pendingOperation, 0, len(s.pending))
+	for _, operation := range s.pending {
+		if operation.revision > targetRevision {
+			newer = append(newer, operation)
+		}
+	}
+	path := filepath.Join(s.recoveryDir, journalPrefix(fingerprint)+"."+randomSuffix()+".docengine-journal-v2")
+	journal, replay, err := s.operations.openRecovery(path, fingerprint)
+	if err != nil {
+		return nil, err
+	}
+	prepared := &preparedJournalRebase{journal: journal, path: path}
+	fail := func(cause error) (*preparedJournalRebase, error) {
+		return nil, errors.Join(cause, s.discardPreparedJournal(prepared, true))
+	}
+	if replay.Truncated || len(replay.Batches) != 0 {
+		return fail(errors.New("document: new recovery journal was not empty"))
+	}
+	size, err := s.operations.sizeRecovery(journal)
+	if err != nil {
+		return fail(err)
+	}
+	prepared.bytes = size
+	for first := 0; first < len(newer); {
+		last := first + 1
+		for last < len(newer) && newer[last].group == newer[first].group {
+			last++
+		}
+		batch := make([]recovery.ReplaceOperation, last-first)
+		for index := first; index < last; index++ {
+			operation := newer[index]
+			inserted := make([]byte, operation.insertLength)
+			if operation.insertLength > 0 {
+				n, readErr := s.operations.readRecovery(s.journal, inserted, operation.insertOffset)
+				if readErr != nil && !(errors.Is(readErr, io.EOF) && int64(n) == operation.insertLength) {
+					return fail(readErr)
+				}
+				if int64(n) != operation.insertLength {
+					return fail(io.ErrUnexpectedEOF)
+				}
+			}
+			batch[index-first] = recovery.ReplaceOperation{
+				Start: operation.start, DeleteLength: operation.deleteLength, Inserted: inserted,
+			}
+		}
+		// These operations are a subset of the already quota-checked current
+		// journal, so their rebased encoding cannot exceed MaxJournalBytes.
+		appendResult, appendErr := s.operations.appendRecovery(journal, newer[first].revision, newer[first].group, batch)
+		if appendErr != nil {
+			return fail(appendErr)
+		}
+		prepared.bytes = appendResult.EndOffset
+		for index := first; index < last; index++ {
+			operation := newer[index]
+			operation.insertOffset = appendResult.PayloadOffsets[index-first]
+			prepared.pending = append(prepared.pending, operation)
+		}
+		first = last
+	}
+	if err := s.operations.syncRecovery(journal); err != nil {
+		return fail(err)
+	}
+	if err := s.operations.syncParent(path); err != nil {
+		var durability *save.DurabilityError
+		if errors.As(err, &durability) {
+			err = durability.Err
+		}
+		return fail(fmt.Errorf("document: sync prepared recovery directory: %w", err))
+	}
+	return prepared, nil
 }
 
 func (s *Session) Save() (Metadata, error) { return s.CommitAtLeast(0) }
@@ -975,18 +1217,40 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (result Metadata, resul
 			return Metadata{}, ErrExternalChange
 		}
 	}
-	checkIdentity := func() error {
-		current, scanErr := scanDiskIdentity(context.Background(), path, s.operations)
-		if scanErr != nil {
-			return scanErr
-		}
-		if current.size != expectedIdentity.size || current.contentHash != expectedIdentity.contentHash {
-			return ErrExternalChange
-		}
-		return nil
-	}
 	hasher := sha256.New()
 	_, _ = hasher.Write(prefix)
+	var (
+		newContentHash [32]byte
+		newFingerprint recovery.Fingerprint
+		prepared       *preparedJournalRebase
+		boundaryLocked bool
+	)
+	checkIdentity := func() error {
+		s.mu.Lock()
+		boundaryLocked = true
+		unlock := func(err error) error {
+			boundaryLocked = false
+			s.mu.Unlock()
+			return err
+		}
+		current, scanErr := scanDiskIdentity(context.Background(), path, s.operations)
+		if scanErr != nil {
+			return unlock(scanErr)
+		}
+		if current.size != expectedIdentity.size || current.contentHash != expectedIdentity.contentHash {
+			return unlock(ErrExternalChange)
+		}
+		copy(newContentHash[:], hasher.Sum(nil))
+		newFingerprint = recovery.FingerprintFor(path, persistence.TotalBytes, newContentHash)
+		var prepareErr error
+		prepared, prepareErr = s.prepareJournalRebaseLocked(newFingerprint, targetRevision)
+		if prepareErr != nil {
+			return unlock(prepareErr)
+		}
+		// Keep s.mu held through the atomic replacement. No edit can land only
+		// in the old journal after the synced replacement journal was prepared.
+		return nil
+	}
 	writeContent := func(writer io.Writer) (int64, error) {
 		progressWriter := newSaveProgressWriter(writer, int64(len(prefix)), persistence.TotalBytes, func(completed int64) {
 			persistence.CompletedBytes = completed
@@ -1001,14 +1265,20 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (result Metadata, resul
 	total, atomicErr := s.operations.atomicChecked(path, mode, prefix, writeContent, checkIdentity)
 	var durabilityErr *save.DurabilityError
 	if atomicErr != nil && !errors.As(atomicErr, &durabilityErr) {
+		if boundaryLocked {
+			discardErr := s.discardPreparedJournal(prepared, true)
+			s.mu.Unlock()
+			boundaryLocked = false
+			return Metadata{}, errors.Join(atomicErr, discardErr)
+		}
 		return Metadata{}, atomicErr
 	}
-	var newContentHash [32]byte
-	copy(newContentHash[:], hasher.Sum(nil))
-
-	s.mu.Lock()
+	if !boundaryLocked {
+		return Metadata{}, errors.New("document: atomic replacement skipped its final identity check")
+	}
 	defer s.mu.Unlock()
 	commitFailure := func(cause error) (Metadata, error) {
+		cause = errors.Join(cause, s.discardPreparedJournal(prepared, false))
 		s.committedRevision = targetRevision
 		s.diskIdentity = fileIdentity{size: total, contentHash: newContentHash}
 		s.dirty = s.revision > s.committedRevision
@@ -1023,7 +1293,6 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (result Metadata, resul
 	if info.Size() != total {
 		return commitFailure(errors.New("document: committed file length mismatch"))
 	}
-	newFingerprint := recovery.FingerprintFor(path, info.Size(), newContentHash)
 	newBase, err := s.operations.openBase(path)
 	if err != nil {
 		return commitFailure(err)
@@ -1037,86 +1306,44 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (result Metadata, resul
 	if s.config.RecoveryDirOwnership == DirectoryOwned {
 		newGeneration.setJournalCleanupDirectory(s.recoveryDir)
 	}
-	remaining := make([]pendingOperation, 0)
-	if s.revision > targetRevision {
-		journalPath := filepath.Join(s.recoveryDir, journalPrefix(newFingerprint)+"."+randomSuffix()+".docengine-journal-v2")
-		newJournal, _, openErr := s.operations.openRecovery(journalPath, newFingerprint)
-		if openErr != nil {
-			_ = newGeneration.retireAndWait(true)
-			return commitFailure(openErr)
-		}
-		newGeneration.attachJournal(newJournal)
-		newTree.SetSource(store.SourceJournal, newJournal)
-		newer := make([]pendingOperation, 0, len(s.pending))
-		for _, operation := range s.pending {
-			if operation.revision > targetRevision {
-				newer = append(newer, operation)
-			}
-		}
-		for first := 0; first < len(newer); {
-			last := first + 1
-			for last < len(newer) && newer[last].group == newer[first].group {
-				last++
-			}
-			batch := make([]recovery.ReplaceOperation, last-first)
-			payloads := make([][]byte, last-first)
-			for index := first; index < last; index++ {
-				operation := newer[index]
-				inserted := make([]byte, operation.insertLength)
-				if operation.insertLength > 0 {
-					n, readErr := s.operations.readRecovery(s.journal, inserted, operation.insertOffset)
-					if readErr != nil && !(errors.Is(readErr, io.EOF) && int64(n) == operation.insertLength) {
-						_ = newGeneration.retireAndWait(true)
-						return commitFailure(readErr)
-					}
-					if int64(n) != operation.insertLength {
-						_ = newGeneration.retireAndWait(true)
-						return commitFailure(io.ErrUnexpectedEOF)
-					}
+	remaining := []pendingOperation(nil)
+	journalBytes := int64(0)
+	if prepared != nil {
+		newGeneration.attachJournal(prepared.journal)
+		newTree.SetSource(store.SourceJournal, prepared.journal)
+		prepared.journal = nil // ownership transferred to newGeneration
+		remaining = prepared.pending
+		journalBytes = prepared.bytes
+		for _, operation := range remaining {
+			piece := store.Piece{}
+			if operation.insertLength > 0 {
+				piece = store.Piece{
+					Source: store.SourceJournal, Offset: operation.insertOffset, Length: operation.insertLength,
+					Newlines: operation.insertNewlines, NewlinesKnown: true,
 				}
-				batch[index-first] = recovery.ReplaceOperation{
-					Start: operation.start, DeleteLength: operation.deleteLength, Inserted: inserted,
-				}
-				payloads[index-first] = inserted
 			}
-			appendResult, appendErr := newJournal.AppendBatch(newer[first].revision, newer[first].group, batch)
-			if appendErr != nil {
-				_ = newGeneration.retireAndWait(true)
-				return commitFailure(appendErr)
+			if _, _, replaceErr := newTree.ReplacePiece(operation.start, operation.deleteLength, piece); replaceErr != nil {
+				_ = newGeneration.retireAndWait(false)
+				return commitFailure(replaceErr)
 			}
-			for index := first; index < last; index++ {
-				inserted := payloads[index-first]
-				piece := store.Piece{}
-				if len(inserted) > 0 {
-					piece = store.Piece{
-						Source: store.SourceJournal, Offset: appendResult.PayloadOffsets[index-first], Length: int64(len(inserted)),
-						Newlines: int64(bytes.Count(inserted, []byte{'\n'})), NewlinesKnown: true,
-					}
-				}
-				operation := newer[index]
-				if _, _, replaceErr := newTree.ReplacePiece(operation.start, operation.deleteLength, piece); replaceErr != nil {
-					_ = newGeneration.retireAndWait(true)
-					return commitFailure(replaceErr)
-				}
-				operation.insertOffset = appendResult.PayloadOffsets[index-first]
-				remaining = append(remaining, operation)
-			}
-			first = last
 		}
 	}
 	oldGeneration := s.generation
 	s.base, s.generation, s.tree = newBase, newGeneration, newTree
 	s.journal = newGeneration.journal
 	s.pending = remaining
+	s.journalBytes = journalBytes
 	s.committedRevision = targetRevision
 	s.fingerprint = newFingerprint
 	s.diskIdentity = identityFor(info, newContentHash)
 	s.durabilityUncertain = durabilityErr != nil
 	s.dirty = s.revision > s.committedRevision
+	s.resetJournalCheckpointLocked()
 	if !s.dirty {
 		s.recovered = false
-		s.recordJournalSyncResultLocked(s.journal, nil)
 	}
+	s.recordJournalSyncResultLocked(s.journal, nil)
+	s.maybeScheduleJournalCheckpointLocked()
 	oldGeneration.retire(true)
 	metadata := s.metadataLocked()
 	persistence.CompletedBytes, persistence.Committed = persistence.TotalBytes, true
@@ -1127,10 +1354,8 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (result Metadata, resul
 
 func (s *Session) Close() error {
 	// Save may install a replacement source generation after its immutable
-	// snapshot has been streamed. Serialize Close with that entire operation so
-	// Close always retires the final installed generation exactly once.
-	s.saveMu.Lock()
-	defer s.saveMu.Unlock()
+	// snapshot has been streamed. Stop background checkpoint scheduling before
+	// waiting for saveMu so the checkpoint worker cannot deadlock behind Close.
 	s.mu.Lock()
 	if s.closed {
 		done := s.closeDone
@@ -1145,7 +1370,10 @@ func (s *Session) Close() error {
 	close(s.stopSync)
 	s.mu.Unlock()
 	<-s.syncDone
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
 	s.mu.Lock()
+	s.automaticCheckpointPending = false
 	dirty, generation := s.dirty, s.generation
 	var syncErr error
 	if s.journal != nil {
@@ -1184,6 +1412,15 @@ func (s *Session) syncLoop() {
 				s.recordJournalSyncResultLocked(journal, syncErr)
 				s.mu.Unlock()
 			}
+		case target := <-s.checkpointRequest:
+			metadata, _ := s.CommitAtLeast(target)
+			s.mu.Lock()
+			s.automaticCheckpointPending = false
+			if metadata.CommittedRevision >= target {
+				s.automaticCheckpoints++
+			}
+			s.maybeScheduleJournalCheckpointLocked()
+			s.mu.Unlock()
 		case <-s.stopSync:
 			return
 		}

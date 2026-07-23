@@ -20,6 +20,9 @@ const (
 	maximumBatchSize    = 256
 	maximumBatchPayload = 1 << 30
 	journalVersion      = 2
+	// EmptyJournalBytes is the physical size of a valid v2 journal containing
+	// only its fingerprinted file header.
+	EmptyJournalBytes int64 = fileHeaderSize
 )
 
 var (
@@ -60,6 +63,7 @@ type Batch struct {
 type BatchAppendResult struct {
 	BatchOffset    int64
 	PayloadOffsets []int64
+	EndOffset      int64
 }
 
 // Fingerprint binds a journal to the complete bytes and normalized resolved
@@ -183,6 +187,31 @@ func (j *Journal) Path() string {
 	return j.path
 }
 
+// Size returns the current physical journal length.
+func (j *Journal) Size() (int64, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.file == nil {
+		return 0, ErrClosed
+	}
+	info, err := j.file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
+// BatchEncodedSize returns the exact number of bytes AppendBatch would add.
+// It performs the same structural and payload-limit validation without
+// allocating the encoded payload.
+func BatchEncodedSize(firstRevision, group uint64, operations []ReplaceOperation) (int64, error) {
+	payloadSize, err := batchPayloadSize(firstRevision, group, operations)
+	if err != nil {
+		return 0, err
+	}
+	return batchHeaderSize + payloadSize, nil
+}
+
 // ReadFingerprint inspects a journal without opening it for mutation.
 func ReadFingerprint(path string) (Fingerprint, error) {
 	file, err := os.Open(path)
@@ -212,6 +241,7 @@ func (j *Journal) AppendBatch(firstRevision, group uint64, operations []ReplaceO
 	result := BatchAppendResult{
 		BatchOffset:    batchOffset,
 		PayloadOffsets: make([]int64, len(relativeOffsets)),
+		EndOffset:      payloadOffset + int64(len(payload)),
 	}
 	for index, relative := range relativeOffsets {
 		result.PayloadOffsets[index] = payloadOffset + relative
@@ -255,6 +285,7 @@ func (j *Journal) Replay() (ReplayResult, error) {
 		return ReplayResult{}, err
 	}
 	result := ReplayResult{ValidBytes: fileHeaderSize}
+	var buffer []byte
 	for offset := int64(fileHeaderSize); offset < info.Size(); {
 		if info.Size()-offset < batchHeaderSize {
 			result.Truncated = true
@@ -276,7 +307,9 @@ func (j *Journal) Replay() (ReplayResult, error) {
 		}
 		end := payloadOffset + payloadLength
 		crc := crc32.Update(0, castagnoli, header[:56])
-		buffer := make([]byte, 64<<10)
+		if buffer == nil {
+			buffer = make([]byte, 64<<10)
+		}
 		remaining, cursor := payloadLength, payloadOffset
 		for remaining > 0 {
 			want := min(int64(len(buffer)), remaining)
@@ -436,17 +469,11 @@ func decodeBatchHeader(header []byte) (Batch, int64, uint32, bool) {
 }
 
 func encodeBatchPayload(firstRevision, group uint64, operations []ReplaceOperation) ([]byte, []int64, error) {
-	if len(operations) == 0 || len(operations) > maximumBatchSize || firstRevision == 0 || group == 0 || firstRevision > math.MaxUint64-uint64(len(operations)-1) {
-		return nil, nil, ErrInvalidBatch
+	total, err := batchPayloadSize(firstRevision, group, operations)
+	if err != nil {
+		return nil, nil, err
 	}
 	metadataLength := int64(len(operations) * batchRecordSize)
-	total := metadataLength
-	for _, operation := range operations {
-		if operation.Start < 0 || operation.DeleteLength < 0 || int64(len(operation.Inserted)) > maximumBatchPayload-total {
-			return nil, nil, ErrInvalidBatch
-		}
-		total += int64(len(operation.Inserted))
-	}
 	payload := make([]byte, int(total))
 	relativeOffsets := make([]int64, len(operations))
 	cursor := metadataLength
@@ -460,6 +487,21 @@ func encodeBatchPayload(firstRevision, group uint64, operations []ReplaceOperati
 		cursor += int64(len(operation.Inserted))
 	}
 	return payload, relativeOffsets, nil
+}
+
+func batchPayloadSize(firstRevision, group uint64, operations []ReplaceOperation) (int64, error) {
+	if len(operations) == 0 || len(operations) > maximumBatchSize || firstRevision == 0 || group == 0 || firstRevision > math.MaxUint64-uint64(len(operations)-1) {
+		return 0, ErrInvalidBatch
+	}
+	metadataLength := int64(len(operations) * batchRecordSize)
+	total := metadataLength
+	for _, operation := range operations {
+		if operation.Start < 0 || operation.DeleteLength < 0 || int64(len(operation.Inserted)) > maximumBatchPayload-total {
+			return 0, ErrInvalidBatch
+		}
+		total += int64(len(operation.Inserted))
+	}
+	return total, nil
 }
 
 func decodeBatchOperations(file io.ReaderAt, batch Batch, payloadOffset, payloadLength int64) ([]Operation, bool, error) {

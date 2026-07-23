@@ -44,6 +44,8 @@ It currently provides:
 - lock-protected reclamation of stale owned Session directories;
 - safe first-generation Piece/undo compaction and explicit save-checkpoint
   journal rebasing;
+- a 4 GiB default recovery-journal hard limit, exact growth statistics, and
+  explicitly enabled automatic save checkpoints with failure backoff;
 - revision-bound UTF-8 logical Page virtualization with hard page/window
   budgets, bounded LRU caching, and concurrent-task backpressure;
 - atomically published, format-neutral Fragment generations with explicit
@@ -96,12 +98,24 @@ compactions without reading document bytes.
 complete base SHA-256; `DOCJNL02` batches are exposed only after the complete
 header, operation table, payload, and CRC-32C validate. Invalid tails are
 repairable without exposing a partial transaction.
+`Journal.Size`, `BatchEncodedSize`, and `BatchAppendResult.EndOffset` expose
+exact physical growth without decoding or allocating a candidate batch.
 
 `document/save` streams a Snapshot into a same-directory temporary file, syncs
 it, performs a final full-content conflict check, and atomically replaces the
 target. If replacement commits but POSIX directory sync fails, it returns a
 typed `DurabilityError` so callers do not mistake a committed write for a
 failed replacement.
+
+For a save that overlaps newer edits, Session builds and syncs the replacement
+base's journal, including its parent directory entry, before replacing the
+base. The final identity check, journal preparation, and replacement share one
+short mutation barrier. A process exit therefore leaves either the old base
+with its old journal or the new base with its already-durable journal. Even a
+save with no concurrent edit prepares an empty replacement journal for this
+crash window. On reopen, exactly one candidate must match the current complete
+base fingerprint; retired candidates are quarantined, while zero or multiple
+matches still block the open.
 
 `document.Session` owns the Piece Tree, revision history, recovery, source
 generations, save rebasing, and lifecycle. `OpenContext` scans the complete
@@ -115,8 +129,14 @@ but permanently non-mutating fault state instead of continuing unsafely.
 
 `OpenOptions` resolves zero-valued limits to documented defaults: 256
 operations per batch, 1 MiB per insertion, 256 MiB of undo storage, 256 retained
-events, 256 retained ChangeMaps, 65,536 Anchors per batch, and a one-second
-journal sync interval. Explicit directories are shared by default; an omitted
+events, 256 retained ChangeMaps, 65,536 Anchors per batch, a 4 GiB recovery
+journal hard limit, and a one-second journal sync interval. Automatic journal
+checkpointing is disabled unless `AutoCheckpointJournalBytes` is set; enabling
+it explicitly authorizes background saves once physical journal growth crosses
+the threshold. Failed automatic checkpoints back off by another threshold.
+`Session.RecoveryStats` reports current and next thresholds, physical bytes,
+queued work, and completed automatic checkpoints. Explicit directories are
+shared by default; an omitted
 Session directory is unique and owned. Undo files use collision-free temporary
 names and are removed on close. Owned directories are removed only when they
 are actual empty directories, while dirty recovery journals and unknown host
@@ -197,13 +217,13 @@ No compatibility promise applies before 1.0.
 ## Testing
 
 The repository requires 100% statement coverage for every current package and
-contains twenty-two Go fuzz targets:
+contains twenty-three Go fuzz targets:
 
 - Piece Tree reference-model, concurrent snapshot/edit, compaction/Snapshot
   preservation, and automatic-compaction policy fuzzers;
 - v2 header, operation decoder, replay-resilience, and stateful journal fuzzers;
-- Session state-machine, concurrent save/edit, crash-recovery, and UTF-8 edit
-  boundary fuzzers;
+- Session state-machine, concurrent save/edit, crash-recovery, journal-quota
+  atomicity, and UTF-8 edit boundary fuzzers;
 - resumable event-history, subscriber-overflow, and close state-machine fuzzing;
 - bounded ChangeMap-history retention, expiry, reverse-query, and composition
   state-machine fuzzing;
@@ -217,7 +237,9 @@ same-size/same-mtime external modification, full-file and boundary-split UTF-8,
 symlink retargeting, concurrent edit/save/recovery, platform durability faults,
 the post-commit read-only state, configured resource limits, concurrent shared
 runtime directories, marker-lock orphan reclamation, conservative cleanup,
-live undo remapping, and Snapshot-safe Piece compaction. Event tests additionally
+live undo remapping, Snapshot-safe Piece compaction, exact journal quota
+rejection, automatic-checkpoint backoff, and real child-process exits before
+and after replacement with and without concurrent edits. Event tests additionally
 cover exact loss accounting, replay cursors, save progress and failure phase,
 journal Sync failure/restoration, a final close event under queue overflow,
 concurrent publish/unsubscribe, and multiple callers waiting on one close barrier.
@@ -248,6 +270,14 @@ Tree fuzz targets each ran for 30 seconds on both platforms; automatic
 compaction boundary tests also passed 100 consecutive runs, and the four
 committed store benchmarks executed on both systems.
 
+The v0.5.3 Recovery/Save suite was run on native Windows and Debian under
+WSL 2 from a native Linux `/tmp` directory. All six packages retained 100%
+statement coverage and three shuffled race runs passed. Four recovery fuzzers,
+concurrent-save, crash-recovery, and journal-quota fuzzers each ran for 30
+seconds on both systems. The real child-process crash matrix passed 20
+consecutive runs per platform, checkpoint/quota boundary tests passed 100
+consecutive runs, and the Recovery/Save/Session benchmarks executed on both.
+
 Run the normal checks:
 
 ```bash
@@ -272,6 +302,7 @@ go test ./recovery -run=^$ -fuzz=FuzzJournalReplayResilience -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzSessionStateMachine -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzSessionConcurrentSaveEdit -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzSessionCrashRecovery -fuzztime=30s
+go test ./document -run=^$ -fuzz=FuzzSessionJournalQuotaIsAtomic -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzUTF8ReplacementBoundaries -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzEventHubStateMachine -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzChangeHistoryStateMachine -fuzztime=30s

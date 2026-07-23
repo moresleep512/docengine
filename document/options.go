@@ -12,6 +12,8 @@ const (
 	DefaultMaxBatchOperations  = 256
 	DefaultMaxInsertBytes      = int64(1 << 20)
 	DefaultUndoBytes           = int64(256 << 20)
+	DefaultMaxJournalBytes     = int64(4 << 30)
+	MinimumJournalBytes        = int64(96 + 64 + 24)
 	MaximumInsertBytes         = int64((1 << 30) - 24)
 	DefaultChangeHistory       = 256
 	MaximumChangeHistory       = 4_096
@@ -37,6 +39,7 @@ type SessionLimits struct {
 	MaxBatchOperations int
 	MaxInsertBytes     int64
 	UndoBytes          int64
+	MaxJournalBytes    int64
 	EventHistory       int
 	ChangeHistory      int
 	MaxAnchorBatch     int
@@ -49,17 +52,22 @@ type OpenOptions struct {
 	SessionDirOwnership  DirectoryOwnership
 	Limits               SessionLimits
 	JournalSyncInterval  time.Duration
+	// AutoCheckpointJournalBytes enables background save checkpoints when the
+	// recovery journal reaches this physical size. Zero disables automatic
+	// checkpoints; the hard MaxJournalBytes limit still applies.
+	AutoCheckpointJournalBytes int64
 }
 
 // SessionConfig is the fully resolved immutable configuration of an open
 // Session. DirectoryOwnershipDefault never appears in a resolved config.
 type SessionConfig struct {
-	RecoveryDir          string
-	SessionDir           string
-	RecoveryDirOwnership DirectoryOwnership
-	SessionDirOwnership  DirectoryOwnership
-	Limits               SessionLimits
-	JournalSyncInterval  time.Duration
+	RecoveryDir                string
+	SessionDir                 string
+	RecoveryDirOwnership       DirectoryOwnership
+	SessionDirOwnership        DirectoryOwnership
+	Limits                     SessionLimits
+	JournalSyncInterval        time.Duration
+	AutoCheckpointJournalBytes int64
 }
 
 func resolveOpenOptions(options OpenOptions) (SessionConfig, error) {
@@ -72,6 +80,9 @@ func resolveOpenOptions(options OpenOptions) (SessionConfig, error) {
 	}
 	if limits.UndoBytes == 0 {
 		limits.UndoBytes = DefaultUndoBytes
+	}
+	if limits.MaxJournalBytes == 0 {
+		limits.MaxJournalBytes = DefaultMaxJournalBytes
 	}
 	if limits.EventHistory == 0 {
 		limits.EventHistory = DefaultEventHistory
@@ -91,6 +102,9 @@ func resolveOpenOptions(options OpenOptions) (SessionConfig, error) {
 	if limits.UndoBytes < 0 {
 		return SessionConfig{}, fmt.Errorf("%w: UndoBytes must be positive", ErrInvalidOptions)
 	}
+	if limits.MaxJournalBytes < MinimumJournalBytes {
+		return SessionConfig{}, fmt.Errorf("%w: MaxJournalBytes must be at least %d", ErrInvalidOptions, MinimumJournalBytes)
+	}
 	if limits.EventHistory < 0 || limits.EventHistory > MaximumEventHistory {
 		return SessionConfig{}, fmt.Errorf("%w: EventHistory must be between 1 and %d", ErrInvalidOptions, MaximumEventHistory)
 	}
@@ -106,6 +120,13 @@ func resolveOpenOptions(options OpenOptions) (SessionConfig, error) {
 	}
 	if syncInterval < 0 {
 		return SessionConfig{}, fmt.Errorf("%w: JournalSyncInterval must be positive", ErrInvalidOptions)
+	}
+	checkpointBytes := options.AutoCheckpointJournalBytes
+	if checkpointBytes < 0 || checkpointBytes > 0 && checkpointBytes < MinimumJournalBytes {
+		return SessionConfig{}, fmt.Errorf("%w: AutoCheckpointJournalBytes must be zero or at least %d", ErrInvalidOptions, MinimumJournalBytes)
+	}
+	if checkpointBytes > limits.MaxJournalBytes {
+		return SessionConfig{}, fmt.Errorf("%w: AutoCheckpointJournalBytes cannot exceed MaxJournalBytes", ErrInvalidOptions)
 	}
 	recoveryDir, recoveryOwnership, err := resolveDirectory(
 		options.RecoveryDir,
@@ -128,7 +149,7 @@ func resolveOpenOptions(options OpenOptions) (SessionConfig, error) {
 	return SessionConfig{
 		RecoveryDir: recoveryDir, SessionDir: sessionDir,
 		RecoveryDirOwnership: recoveryOwnership, SessionDirOwnership: sessionOwnership,
-		Limits: limits, JournalSyncInterval: syncInterval,
+		Limits: limits, JournalSyncInterval: syncInterval, AutoCheckpointJournalBytes: checkpointBytes,
 	}, nil
 }
 

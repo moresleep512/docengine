@@ -165,8 +165,17 @@ and payload cursor validate.
 
 An invalid or incomplete tail returns the last verified offset and never
 exposes part of a transaction. `document` repairs that tail. A corrupt header,
-base mismatch, or ambiguous set of v2 journals is quarantined and reported as a
-typed `RecoveryOpenError` instead of silently discarded.
+base mismatch, or ambiguous set of matching v2 journals is quarantined and
+reported as a typed `RecoveryOpenError` instead of silently discarded. Save may
+temporarily leave old- and new-base journals under the same path namespace;
+open reads every strong fingerprint and proceeds only when exactly one
+candidate matches the current complete base. Proven retired candidates are
+quarantined. Zero matches and multiple matching candidates still block open.
+
+`Journal.Size` reports physical bytes, `BatchEncodedSize` performs allocation-
+free exact growth validation, and `BatchAppendResult.EndOffset` reports the new
+verified end. Replay allocates one 64 KiB CRC buffer per complete scan and
+reuses it across batches.
 
 ## `document/save`
 
@@ -257,10 +266,12 @@ target. A symlink later redirected elsewhere does not change the save target.
 
 `OpenOptions` resolves into an immutable `SessionConfig`. The configurable
 limits are maximum operations per batch, bytes per insertion, undo-store bytes,
-retained Session events, retained ChangeMaps, Anchors per transform batch, and
-journal sync interval. Zero values select the documented defaults; negative
-values and limits beyond the v2 journal or in-memory envelopes are rejected
-before the base file is opened.
+recovery-journal bytes, retained Session events, retained ChangeMaps, Anchors
+per transform batch, and journal sync interval. The default hard journal limit
+is 4 GiB. `AutoCheckpointJournalBytes` is separate and zero by default because
+enabling it authorizes background saves; a nonzero threshold cannot exceed the
+hard limit. Negative values and limits beyond the v2 journal or in-memory
+envelopes are rejected before the base file is opened.
 
 Explicit RecoveryDir and SessionDir paths are shared unless marked owned. An
 omitted RecoveryDir uses the shared process-temporary recovery namespace; an
@@ -287,6 +298,8 @@ appends one recovery batch, builds a second tree using durable payload offsets,
 and only then publishes content, pending operations, revisions, and one undo
 entry. Validation, cancellation, journal, tree, or undo-store failures publish
 nothing; post-append failures repair the journal to its previous batch boundary.
+The exact v2 encoded size is checked before creating or appending a journal, so
+`MaxJournalBytes` rejection changes neither revision, content, nor filesystem.
 
 Inserted strings must be valid UTF-8 and no larger than 1 MiB. Every edit start
 and end must be a rune boundary in the state produced by preceding batch edits,
@@ -327,6 +340,15 @@ The first `Session.Close` retires resources, while all concurrent Close callers
 wait on one barrier and return the same joined cleanup result. Explicit
 subscription close is idempotent and races safely with publication and Session
 close.
+
+When `AutoCheckpointJournalBytes` is enabled, accepted edits schedule a
+background `CommitAtLeast` after the physical threshold. The one-slot request
+queue coalesces work; a failed checkpoint moves the next trigger forward by a
+full threshold rather than retrying in a hot loop. Automatic saves publish the
+normal persistence events. `RecoveryStats` atomically exposes journal bytes,
+the hard and automatic thresholds, queued/active work, and completed
+checkpoints. Close stops scheduling before waiting for the shared save mutex,
+so an active automatic checkpoint cannot deadlock resource retirement.
 
 ### Retained changes, ranges, and annotations
 
@@ -383,15 +405,29 @@ replacement it stably reads and hashes the complete current target. A different
 hash returns `ErrExternalChange`, including same-length changes with a preserved
 mtime. A timestamp-only change with identical bytes is allowed.
 
-After replacement, the committed file is reopened as a new generation. Edits
-that arrived during streaming are copied in their original groups into a new
-v2 journal rooted at the saved content and replayed onto the new Tree.
+After streaming but before replacement, Session takes a short mutation barrier,
+performs the final identity scan, writes every edit newer than the target into
+a journal fingerprinted to the replacement content, syncs that journal and its
+parent directory, and then keeps the barrier through atomic replacement.
+Even when there is no newer edit, an empty replacement journal is prepared.
+After replacement, the committed file is reopened as a new generation and the
+already-durable pending groups are attached to the new Tree.
 
-If replacement committed but stat, reopen, Tree construction, new journal, or
-rebase fails, `CommittedRevision` is still advanced and the Session enters a
-permanent read-only fault state. `ReadAt`, `Snapshot`, `Metadata`, `Fault`, and
-`Close` remain usable; edit, undo, redo, and save return `ErrFaulted` joined with
-the cause. This prevents continued mutation on a partially rebound generation.
+This ordering closes the process-crash window between base replacement and
+journal rebasing. A crash before replacement leaves the old base and old
+journal as the unique matching pair; a crash after replacement leaves the new
+base and prepared journal as the unique pair. A normal clean close removes the
+empty current journal, and successful reopen quarantines the proven retired
+candidate.
+
+New-journal creation, source reads, append, file Sync, and recovery-directory
+Sync now fail before replacement and leave the Session writable on its old
+generation. If replacement commits but stat, reopen, Tree construction, or
+prepared-journal installation fails, `CommittedRevision` is still advanced and
+the Session enters a permanent read-only fault state. `ReadAt`, `Snapshot`,
+`Metadata`, `Fault`, and `Close` remain usable; edit, undo, redo, and save return
+`ErrFaulted` joined with the cause. This prevents continued mutation on a
+partially rebound generation.
 
 ### Remaining policy
 
@@ -408,12 +444,15 @@ All six current packages are held at 100% statement coverage. Tests include
 platform-specific replacement and directory-sync faults, complete UTF-8 and
 identity boundaries, every recovery batch truncation, transaction rollback,
 concurrent save/rebase, post-commit fault behavior, snapshot lifetime, integer
-overflow, randomized reference models, race runs, and twenty-two fuzz targets.
+overflow, randomized reference models, race runs, and twenty-three fuzz targets.
 Event-specific tests exercise resumable history, exact overflow accounting,
 save progress and failure phase, WAL Sync failure/restoration, concurrent
 publish/unsubscribe, final-event delivery, and the close barrier. Lifecycle and
 compaction tests cover marker locks, conservative orphan reclamation, cleanup
 faults, live undo remapping, journal checkpoints, and Snapshot preservation.
+Recovery/Save tests additionally cover exact quota rejection, automatic
+checkpoint backoff, replacement-journal file/directory durability, and real
+child-process exits on both sides of replacement with concurrent edits.
 Virtualization tests cover UTF-8 Page partitioning, analyzed gaps, incomplete
 watermarks, continuation Pages, byte/Fragment/Measure affinity, all four
 budgets, cache ownership, task backpressure, generation races, provider
@@ -447,3 +486,11 @@ coverage in all six packages and passed three shuffled race runs. The four
 Piece Tree fuzz targets ran for 30 seconds each on both systems, the automatic
 compaction boundary suite passed 100 consecutive Windows runs, and all four
 store benchmarks executed on both platforms.
+
+For v0.5.3, native Windows and Debian under WSL 2 both retained 100% statement
+coverage in all six packages and passed three shuffled race runs. The four
+recovery fuzzers plus concurrent-save, crash-recovery, and journal-quota
+fuzzers each ran for 30 seconds on both systems. The real child-process crash
+matrix passed 20 consecutive runs per platform, checkpoint/quota boundary
+tests passed 100 consecutive runs, and all committed Recovery/Save/Session
+benchmarks executed on both.

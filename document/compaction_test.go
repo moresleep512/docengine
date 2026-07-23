@@ -35,7 +35,7 @@ func TestSessionCompactReclaimsPiecesUndoAndCheckpointsJournal(t *testing.T) {
 	if got := compactSessionContent(t, session); got != beforeContent {
 		t.Fatalf("content changed: %q -> %q", beforeContent, got)
 	}
-	if len(session.pending) != 0 || session.journal != nil {
+	if len(session.pending) != 0 || session.journal == nil {
 		t.Fatalf("journal not checkpointed: pending=%d journal=%v", len(session.pending), session.journal)
 	}
 	if _, err := os.Stat(journalPath); !errors.Is(err, os.ErrNotExist) {

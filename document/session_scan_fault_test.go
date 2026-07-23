@@ -248,8 +248,11 @@ func TestCommitPostStatSizeAndRebaseShortReadFaults(t *testing.T) {
 		defer session.Close()
 		session.operations.readRecovery = func(*recovery.Journal, []byte, int64) (int, error) { return 0, nil }
 		close(proceed)
-		if err := <-saved; !errors.Is(err, ErrFaulted) || !errors.Is(err, io.ErrUnexpectedEOF) {
+		if err := <-saved; !errors.Is(err, io.ErrUnexpectedEOF) {
 			t.Fatalf("Save = %v", err)
+		}
+		if session.Fault() != nil {
+			t.Fatalf("pre-commit short read faulted Session: %v", session.Fault())
 		}
 	})
 }

@@ -16,8 +16,8 @@ func TestResolveOpenOptionsDefaultsAndCustomValues(t *testing.T) {
 	}
 	if !filepath.IsAbs(defaults.RecoveryDir) || !filepath.IsAbs(defaults.SessionDir) ||
 		defaults.RecoveryDirOwnership != DirectoryShared || defaults.SessionDirOwnership != DirectoryOwned ||
-		defaults.Limits != (SessionLimits{MaxBatchOperations: DefaultMaxBatchOperations, MaxInsertBytes: DefaultMaxInsertBytes, UndoBytes: DefaultUndoBytes, EventHistory: DefaultEventHistory, ChangeHistory: DefaultChangeHistory, MaxAnchorBatch: DefaultMaxAnchorBatch}) ||
-		defaults.JournalSyncInterval != DefaultJournalSyncInterval {
+		defaults.Limits != (SessionLimits{MaxBatchOperations: DefaultMaxBatchOperations, MaxInsertBytes: DefaultMaxInsertBytes, UndoBytes: DefaultUndoBytes, MaxJournalBytes: DefaultMaxJournalBytes, EventHistory: DefaultEventHistory, ChangeHistory: DefaultChangeHistory, MaxAnchorBatch: DefaultMaxAnchorBatch}) ||
+		defaults.JournalSyncInterval != DefaultJournalSyncInterval || defaults.AutoCheckpointJournalBytes != 0 {
 		t.Fatalf("default config = %+v", defaults)
 	}
 
@@ -25,8 +25,9 @@ func TestResolveOpenOptionsDefaultsAndCustomValues(t *testing.T) {
 	options := OpenOptions{
 		RecoveryDir: filepath.Join(dir, "recovery"), SessionDir: filepath.Join(dir, "session"),
 		RecoveryDirOwnership: DirectoryOwned, SessionDirOwnership: DirectoryShared,
-		Limits:              SessionLimits{MaxBatchOperations: 2, MaxInsertBytes: 3, UndoBytes: 4, EventHistory: 5, ChangeHistory: 6, MaxAnchorBatch: 7},
-		JournalSyncInterval: 5 * time.Millisecond,
+		Limits:                     SessionLimits{MaxBatchOperations: 2, MaxInsertBytes: 3, UndoBytes: 4, MaxJournalBytes: 4_096, EventHistory: 5, ChangeHistory: 6, MaxAnchorBatch: 7},
+		JournalSyncInterval:        5 * time.Millisecond,
+		AutoCheckpointJournalBytes: 2_048,
 	}
 	custom, err := resolveOpenOptions(options)
 	if err != nil {
@@ -34,7 +35,8 @@ func TestResolveOpenOptionsDefaultsAndCustomValues(t *testing.T) {
 	}
 	if custom.RecoveryDir != options.RecoveryDir || custom.SessionDir != options.SessionDir ||
 		custom.RecoveryDirOwnership != DirectoryOwned || custom.SessionDirOwnership != DirectoryShared ||
-		custom.Limits != options.Limits || custom.JournalSyncInterval != options.JournalSyncInterval {
+		custom.Limits != options.Limits || custom.JournalSyncInterval != options.JournalSyncInterval ||
+		custom.AutoCheckpointJournalBytes != options.AutoCheckpointJournalBytes {
 		t.Fatalf("custom config = %+v", custom)
 	}
 
@@ -52,6 +54,8 @@ func TestResolveOpenOptionsRejectsInvalidValues(t *testing.T) {
 		{Limits: SessionLimits{MaxInsertBytes: -1}},
 		{Limits: SessionLimits{MaxInsertBytes: MaximumInsertBytes + 1}},
 		{Limits: SessionLimits{UndoBytes: -1}},
+		{Limits: SessionLimits{MaxJournalBytes: -1}},
+		{Limits: SessionLimits{MaxJournalBytes: MinimumJournalBytes - 1}},
 		{Limits: SessionLimits{EventHistory: -1}},
 		{Limits: SessionLimits{EventHistory: MaximumEventHistory + 1}},
 		{Limits: SessionLimits{ChangeHistory: -1}},
@@ -59,6 +63,9 @@ func TestResolveOpenOptionsRejectsInvalidValues(t *testing.T) {
 		{Limits: SessionLimits{MaxAnchorBatch: -1}},
 		{Limits: SessionLimits{MaxAnchorBatch: MaximumAnchorBatch + 1}},
 		{JournalSyncInterval: -1},
+		{AutoCheckpointJournalBytes: -1},
+		{AutoCheckpointJournalBytes: MinimumJournalBytes - 1},
+		{Limits: SessionLimits{MaxJournalBytes: MinimumJournalBytes}, AutoCheckpointJournalBytes: MinimumJournalBytes + 1},
 		{RecoveryDirOwnership: DirectoryShared},
 		{SessionDirOwnership: DirectoryOwned},
 		{RecoveryDir: filepath.Join(dir, "r"), RecoveryDirOwnership: DirectoryOwnership(99)},
@@ -153,8 +160,9 @@ func TestConfiguredLimitsAndConfigLifetime(t *testing.T) {
 	}
 	options := OpenOptions{
 		RecoveryDir: filepath.Join(dir, "recovery"), SessionDir: filepath.Join(dir, "session"),
-		Limits:              SessionLimits{MaxBatchOperations: 2, MaxInsertBytes: 2, UndoBytes: 3, EventHistory: 4, ChangeHistory: 5, MaxAnchorBatch: 6},
-		JournalSyncInterval: 5 * time.Millisecond,
+		Limits:                     SessionLimits{MaxBatchOperations: 2, MaxInsertBytes: 2, UndoBytes: 3, MaxJournalBytes: 4_096, EventHistory: 4, ChangeHistory: 5, MaxAnchorBatch: 6},
+		JournalSyncInterval:        5 * time.Millisecond,
+		AutoCheckpointJournalBytes: 2_048,
 	}
 	session, err := Open(path, options)
 	if err != nil {
@@ -162,7 +170,8 @@ func TestConfiguredLimitsAndConfigLifetime(t *testing.T) {
 	}
 	defer session.Close()
 	config := session.Config()
-	if config.Limits != options.Limits || config.JournalSyncInterval != options.JournalSyncInterval {
+	if config.Limits != options.Limits || config.JournalSyncInterval != options.JournalSyncInterval ||
+		config.AutoCheckpointJournalBytes != options.AutoCheckpointJournalBytes {
 		t.Fatalf("Config = %+v", config)
 	}
 	if _, err := session.ApplyBatch(nil, 0, nil); !errors.Is(err, ErrInvalidContext) {

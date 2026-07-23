@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	docsave "github.com/moresleep512/docengine/document/save"
 	"github.com/moresleep512/docengine/document/store"
 	"github.com/moresleep512/docengine/recovery"
 )
@@ -271,16 +270,15 @@ func TestCommitInjectedPostWriteAndRebaseFailures(t *testing.T) {
 	t.Run("rebase source read", func(t *testing.T) {
 		session, proceed, saved := startConcurrentFaultSave(t)
 		defer session.Close()
-		session.operations.atomicChecked = func(path string, mode os.FileMode, prefix []byte, write func(io.Writer) (int64, error), check func() error) (int64, error) {
-			total, err := docsave.AtomicChecked(path, mode, prefix, write, check)
-			if err == nil {
-				_ = session.journal.Close()
-			}
-			return total, err
+		session.operations.readRecovery = func(*recovery.Journal, []byte, int64) (int, error) {
+			return 0, recovery.ErrClosed
 		}
 		close(proceed)
 		if err := <-saved; !errors.Is(err, recovery.ErrClosed) {
 			t.Fatalf("Save error = %v", err)
+		}
+		if session.Fault() != nil {
+			t.Fatalf("pre-commit rebase read faulted Session: %v", session.Fault())
 		}
 	})
 
