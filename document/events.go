@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/moresleep512/docengine/document/coordinate"
+	"github.com/moresleep512/docengine/document/virtual"
 )
 
 const (
@@ -67,6 +68,14 @@ const (
 	// EventCompactionFailed reports a compaction error. Compaction.Committed
 	// distinguishes a discarded candidate from committed cleanup failure.
 	EventCompactionFailed
+	// EventVirtualizationStarted begins one Fragment publication or refresh.
+	EventVirtualizationStarted
+	// EventVirtualizationProgress reports a provider watermark advance.
+	EventVirtualizationProgress
+	// EventVirtualizationCompleted reports an atomically published generation.
+	EventVirtualizationCompleted
+	// EventVirtualizationFailed reports a rejected or canceled publication.
+	EventVirtualizationFailed
 )
 
 // ChangeOrigin identifies the operation that produced an EventChanged map.
@@ -88,15 +97,16 @@ const (
 // delivery. Consumers that observe a drop must rebuild derived state from the
 // event Metadata and a matching Snapshot instead of applying Changes blindly.
 type SessionEvent struct {
-	Sequence    uint64
-	Dropped     uint64
-	Kind        EventKind
-	Origin      ChangeOrigin
-	Metadata    Metadata
-	Changes     coordinate.ChangeMap
-	Persistence PersistenceProgress
-	Compaction  CompactionProgress
-	Cause       error
+	Sequence       uint64
+	Dropped        uint64
+	Kind           EventKind
+	Origin         ChangeOrigin
+	Metadata       Metadata
+	Changes        coordinate.ChangeMap
+	Persistence    PersistenceProgress
+	Compaction     CompactionProgress
+	Virtualization virtual.Progress
+	Cause          error
 }
 
 // PersistenceProgress correlates save events. CompletedBytes is monotonic for

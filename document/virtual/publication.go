@@ -10,46 +10,65 @@ import (
 // Publish validates and atomically installs all Fragments known below one
 // indexed watermark.
 func (p *Pager) Publish(ctx context.Context, publication Publication) (Stats, error) {
-	if err := p.acquireTask(ctx); err != nil {
+	taskContext, finish, err := p.acquireTask(ctx)
+	if err != nil {
 		return Stats{}, err
 	}
-	defer p.releaseTask()
-	return p.publish(ctx, publication)
+	defer finish()
+	operation, err := p.startProgress(taskContext, ProgressPublish)
+	if err != nil {
+		return Stats{}, err
+	}
+	var stats Stats
+	if operation != nil {
+		defer func() { operation.finish(stats, err) }()
+	}
+	stats, err = p.publish(taskContext, publication)
+	return stats, err
 }
 
 // Refresh asks provider for a replacement without holding a Pager lock, then
 // installs it only if no newer generation won the race.
 func (p *Pager) Refresh(ctx context.Context, provider FragmentProvider) (Stats, error) {
-	if err := p.acquireTask(ctx); err != nil {
+	taskContext, finish, err := p.acquireTask(ctx)
+	if err != nil {
 		return Stats{}, err
 	}
-	defer p.releaseTask()
+	defer finish()
 	if provider == nil {
 		return Stats{}, ErrInvalidPublication
 	}
+	operation, err := p.startProgress(taskContext, ProgressRefresh)
+	if err != nil {
+		return Stats{}, err
+	}
+	var stats Stats
+	defer func() { operation.finish(stats, err) }()
 	p.mu.RLock()
 	request := FragmentRequest{
 		Revision: p.revision, BaseGeneration: p.state.generation,
 		ByteLength: p.length, MaxFragments: p.options.maximumFragments,
 		MaxKeyBytes: p.options.maximumKeyBytes, MaxFragmentMeasure: p.options.window.Measure,
+		Report: operation.report,
 	}
 	p.mu.RUnlock()
-	result, err := provider.Fragments(ctx, request)
-	if err != nil {
+	result, providerErr := provider.Fragments(taskContext, request)
+	if err = operation.finishProvider(result, providerErr); err != nil {
 		return Stats{}, err
 	}
-	return p.publish(ctx, Publication{
+	stats, err = p.publish(taskContext, Publication{
 		Revision: request.Revision, BaseGeneration: request.BaseGeneration,
 		IndexedThrough: result.IndexedThrough, Complete: result.Complete,
 		Fragments: result.Fragments,
 	})
+	return stats, err
 }
 
 func (p *Pager) publish(ctx context.Context, publication Publication) (Stats, error) {
 	if ctx == nil {
 		return Stats{}, ErrInvalidContext
 	}
-	if err := ctx.Err(); err != nil {
+	if err := contextError(ctx); err != nil {
 		return Stats{}, err
 	}
 	p.mu.RLock()
@@ -114,7 +133,7 @@ func (p *Pager) validateFragments(ctx context.Context, publication Publication, 
 	var total Measure
 	var keyBytes int64
 	for index, fragment := range publication.Fragments {
-		if err := ctx.Err(); err != nil {
+		if err := contextError(ctx); err != nil {
 			return nil, 0, 0, err
 		}
 		if fragment.ID == "" || fragment.Start < cursor || fragment.End <= fragment.Start ||
@@ -174,7 +193,7 @@ func (p *Pager) buildPublishedPages(ctx context.Context, fragments []fragmentMet
 	pages := make([]pageMeta, 0, len(boundaries)-1)
 	fragmentIndex := 0
 	for index := 0; index+1 < len(boundaries); index++ {
-		if err := ctx.Err(); err != nil {
+		if err := contextError(ctx); err != nil {
 			return nil, err
 		}
 		start, end := boundaries[index], boundaries[index+1]

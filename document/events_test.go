@@ -116,6 +116,10 @@ func TestEventKindsRemainAppendOnly(t *testing.T) {
 		EventCompactionProgress,
 		EventCompacted,
 		EventCompactionFailed,
+		EventVirtualizationStarted,
+		EventVirtualizationProgress,
+		EventVirtualizationCompleted,
+		EventVirtualizationFailed,
 	}
 	for index, kind := range kinds {
 		if want := EventKind(index + 1); kind != want {

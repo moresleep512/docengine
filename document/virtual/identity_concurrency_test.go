@@ -18,7 +18,7 @@ func (c *errOnlyStepContext) Done() <-chan struct{}       { return nil }
 func (c *errOnlyStepContext) Value(any) any               { return nil }
 func (c *errOnlyStepContext) Err() error {
 	c.calls++
-	if c.calls >= 2 {
+	if c.calls >= 5 {
 		return context.Canceled
 	}
 	return nil
@@ -114,8 +114,8 @@ func TestMultiPageWindowCacheIsolationAndCancellation(t *testing.T) {
 	}
 
 	key := reloaded.Pages[0].Key
-	cancelAtSecondCheck := &errOnlyStepContext{}
-	if _, err := pager.ReadPage(cancelAtSecondCheck, key); !errors.Is(err, context.Canceled) {
+	cancelAfterAdmission := &errOnlyStepContext{}
+	if _, err := pager.ReadPage(cancelAfterAdmission, key); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cached ReadPage cancellation = %v", err)
 	}
 	if stats := pager.Stats(); stats.ActiveTasks != 0 {

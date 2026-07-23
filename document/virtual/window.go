@@ -9,15 +9,16 @@ import (
 // ReadPage reads one exact current Page. Keys from an older Fragment
 // generation are rejected.
 func (p *Pager) ReadPage(ctx context.Context, key PageKey) (Page, error) {
-	if err := p.acquireTask(ctx); err != nil {
+	taskContext, finish, err := p.acquireTask(ctx)
+	if err != nil {
 		return Page{}, err
 	}
-	defer p.releaseTask()
+	defer finish()
 	state, err := p.capture(key.Revision, key.Generation)
 	if err != nil {
 		return Page{}, err
 	}
-	if err := ctx.Err(); err != nil {
+	if err := contextError(taskContext); err != nil {
 		return Page{}, err
 	}
 	if key.identity != p.identity {
@@ -30,7 +31,12 @@ func (p *Pager) ReadPage(ctx context.Context, key PageKey) (Page, error) {
 	if key.Start != meta.start || key.End != meta.end {
 		return Page{}, ErrInvalidRequest
 	}
-	page, err := p.readMeta(ctx, state, key.Index)
+	reserved := meta.end - meta.start
+	if err := p.reserveInflight(reserved); err != nil {
+		return Page{}, err
+	}
+	defer p.releaseInflight(reserved)
+	page, err := p.readMeta(taskContext, state, key.Index)
 	if err != nil {
 		return Page{}, err
 	}
@@ -41,10 +47,11 @@ func (p *Pager) ReadPage(ctx context.Context, key PageKey) (Page, error) {
 }
 
 func (p *Pager) WindowByByte(ctx context.Context, request ByteWindowRequest) (Window, error) {
-	if err := p.acquireTask(ctx); err != nil {
+	taskContext, finish, err := p.acquireTask(ctx)
+	if err != nil {
 		return Window{}, err
 	}
-	defer p.releaseTask()
+	defer finish()
 	if request.Offset < 0 || request.Before < 0 || request.After < 0 {
 		return Window{}, ErrInvalidRequest
 	}
@@ -74,14 +81,19 @@ func (p *Pager) WindowByByte(ctx context.Context, request ByteWindowRequest) (Wi
 			last = pageBeforeByte(state.pages, end, p.length)
 		}
 	}
-	return p.readWindow(ctx, state, anchor, anchor, first, last, budget)
+	if err := p.reserveInflight(budget.Bytes); err != nil {
+		return Window{}, err
+	}
+	defer p.releaseInflight(budget.Bytes)
+	return p.readWindow(taskContext, state, anchor, anchor, first, last, budget)
 }
 
 func (p *Pager) WindowByFragment(ctx context.Context, request FragmentWindowRequest) (Window, error) {
-	if err := p.acquireTask(ctx); err != nil {
+	taskContext, finish, err := p.acquireTask(ctx)
+	if err != nil {
 		return Window{}, err
 	}
-	defer p.releaseTask()
+	defer finish()
 	if request.ID == "" || request.Continuation < 0 || request.Before < 0 || request.After < 0 {
 		return Window{}, ErrInvalidRequest
 	}
@@ -107,18 +119,23 @@ func (p *Pager) WindowByFragment(ctx context.Context, request FragmentWindowRequ
 		return Window{}, ErrInvalidRequest
 	}
 	anchor := target.pageFirst + request.Continuation
+	if err := p.reserveInflight(budget.Bytes); err != nil {
+		return Window{}, err
+	}
+	defer p.releaseInflight(budget.Bytes)
 	return p.readWindow(
-		ctx, state, anchor, anchor,
+		taskContext, state, anchor, anchor,
 		state.fragments[firstFragment].pageFirst, state.fragments[lastFragment].pageLast,
 		budget,
 	)
 }
 
 func (p *Pager) WindowByMeasure(ctx context.Context, request MeasureWindowRequest) (Window, error) {
-	if err := p.acquireTask(ctx); err != nil {
+	taskContext, finish, err := p.acquireTask(ctx)
+	if err != nil {
 		return Window{}, err
 	}
-	defer p.releaseTask()
+	defer finish()
 	if request.Offset < 0 || request.Before < 0 || request.After < 0 ||
 		(request.Affinity != AffinityBefore && request.Affinity != AffinityAfter) {
 		return Window{}, ErrInvalidRequest
@@ -162,8 +179,12 @@ func (p *Pager) WindowByMeasure(ctx context.Context, request MeasureWindowReques
 			lastFragment = fragmentAtMeasure(state.fragments, end, AffinityBefore)
 		}
 	}
+	if err := p.reserveInflight(budget.Bytes); err != nil {
+		return Window{}, err
+	}
+	defer p.releaseInflight(budget.Bytes)
 	return p.readWindow(
-		ctx, state, anchorPage, anchorPage,
+		taskContext, state, anchorPage, anchorPage,
 		state.fragments[firstFragment].pageFirst, state.fragments[lastFragment].pageLast,
 		budget,
 	)
@@ -208,7 +229,7 @@ func (p *Pager) readWindow(ctx context.Context, state *pagerState, anchorFirst, 
 	}
 	pages := make([]Page, 0, last-first+1)
 	for index := first; index <= last; index++ {
-		if err := ctx.Err(); err != nil {
+		if err := contextError(ctx); err != nil {
 			return Window{}, err
 		}
 		page, err := p.readMeta(ctx, state, index)

@@ -68,3 +68,36 @@ func BenchmarkWindowByByteCached(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkRefreshProgressLifecycle(b *testing.B) {
+	for _, test := range []struct {
+		name     string
+		observer ProgressObserver
+	}{
+		{name: "reporter-only"},
+		{name: "observed", observer: ProgressObserverFunc(func(Progress) {})},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			pager, err := Build(context.Background(), testSource("abcd"), 1, Options{
+				TargetPageBytes: 4, MaximumPageBytes: 4, Observer: test.observer,
+			})
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer pager.Close()
+			provider := fragmentProviderFunc(func(_ context.Context, request FragmentRequest) (FragmentResult, error) {
+				if err := request.Report(FragmentProgress{IndexedThrough: 4}); err != nil {
+					return FragmentResult{}, err
+				}
+				return FragmentResult{IndexedThrough: 4, Complete: true}, nil
+			})
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				if _, err := pager.Refresh(context.Background(), provider); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

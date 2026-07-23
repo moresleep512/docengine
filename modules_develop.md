@@ -1,6 +1,6 @@
 # Docengine 模块开发历程与设计决策
 
-本文记录 Docengine 从 TypeMD 后端抽离，到 v0.5.6 为止的实际开发顺序、模块形成过程、
+本文记录 Docengine 从 TypeMD 后端抽离，到 v0.5.7 为止的实际开发顺序、模块形成过程、
 关键取舍、测试方法和问题复盘。它回答的不是“现在有哪些 API”，而是“代码为什么最终
 长成现在这样”。
 
@@ -753,6 +753,76 @@ v0.5.x 模块结束后单独修复和发布。基准显示零订阅发布约 29 
 12.5–13.2 µs，二者均零分配；4 MiB 存活 undo 重写在 Windows 约 3.43–3.51 ms、
 Linux 约 3.41–3.72 ms。数字不作为跨机器承诺，但订阅总量硬上限、发布零分配和复制
 字节吞吐现在有了可重复基线。
+
+### 7.12 v0.5.7：一个 Pager 有界，不代表所有并发读取与跨 revision 生命周期有界
+
+v0.5.1 已经解决 PageKey 不能跨 Pager 伪造、缓存命中也必须观察取消等组合问题，但横向
+审计仍留下三类缺口。第一，`MaximumTasks` 只限制 goroutine 数；如果每个 Window 都使用
+大预算，活跃 payload 上界仍是任务数乘单请求预算。第二，旧 `Close` 只能等待 Provider
+返回，不能通知正在执行的 Provider 或读取任务停止；一个遵守 Context 的 Provider 也收
+不到 Pager 生命周期取消。第三，Pager 固定 revision 虽然保证旧读稳定，却没有一条受信
+任路径把同一资源策略带到 Session 当前 Snapshot，宿主容易手工复制 Options、漏掉新字段
+或误把无关 Pager 当作同一来源历史。
+
+最终没有选择“把默认 `MaximumTasks` 降到 1”或“按实际返回后再记账”。前者牺牲并发却
+仍不能表达内存预算；后者在分配完成后才发现超限，已经失去背压意义。实现新增独立
+`MaximumInflightBytes`：每个 Window 在读取前预留其完整硬预算，`ReadPage` 预留精确 Page
+长度，任何并发组合都不能超过总量。预留完整预算比预测实际裁剪结果更保守，但检查为
+O(1)，失败发生在 I/O 和分配之前，而且调用者可以用请求 Budget 明确换取更高并发。
+窗口策略本身也补上 bytes/pages/fragments/Measure 绝对硬上限，防止配置把“有界”退化为
+平台整数最大值附近的事实无界。
+
+关闭协议复用了 Session v0.5.4 的核心思想，但所有权更窄。Pager 创建独立生命周期
+Context；任务接纳在同一把锁下完成第二次调用方取消检查、占用 task permit、安装
+生命周期监听，因而 Close 无法插进“任务已计数但还收不到取消”的缝隙。
+`CloseContext` 第一次调用只启动一个清理 goroutine：先标记 closed、取消生命周期，再
+等待全部 permit 归还，清空缓存并且只调用一次 owned Source `Close`。等待方 Context
+超时只停止等待，后台清理不被放弃；后续 Close 读取同一个终态错误。实现初稿在解锁后
+才安装生命周期监听，覆盖率审计暴露了一个只能靠竞态命中的补救分支；调整为持锁安装后，
+该分支从状态空间中被删除，而不是编写概率测试粉饰它。
+
+Provider 构建 Fragment 时需要可观察，但进度不能变成第二套可变索引。每次 Refresh 都
+收到非 nil、仅在本次调用期间有效的 `Report`；它只接受不倒退且不超过 byte/Fragment
+硬上限的候选水位。Provider 若忽略一次非法 Report 的错误，错误仍会粘滞，最终结果不能
+发布。完成结果还必须不落后于最后一次报告。Publish 与 Refresh 共享单调 operation ID，
+产生 started/advanced/completed/failed 四类状态；只有 generation CAS 成功才标记
+published。Session 创建 Pager 时包装 Observer，把这些状态映射到现有有界事件流，再
+调用宿主 Observer。回调不持 Pager 或 Session 锁，可以查看 Stats，但不能同步重入同一
+Pager 的任务型 API 或 Close；否则调用方会把同步进度通道变成自身等待环。
+
+跨 revision 刷新没有在内核内偷偷监听文件或猜测何时重建。`Lineage` 是只比较指针身份
+的 opaque token；Session 强制覆盖调用方 Options 中的 lineage。`Rebuild` 复制上一个
+Pager 已解析后的全部 Page、Fragment、task、key、cache、window、in-flight、Observer
+策略，`RebuildOwned` 在 Build、Provider 或发布任一点失败时关闭新 Source。
+`Session.RefreshVirtualPager` 只接受自身 lineage，取得当前 Snapshot 后建立新 Pager；
+旧 Pager 和旧 Snapshot lease 保持独立可读。Provider 可为 nil，此时新 Pager 明确停在
+generation 0 的逻辑 Page fallback。没有实现“自动把旧 Fragment 字节范围平移到新
+revision”，因为格式无关内核无法证明任意宿主 Fragment 在 ChangeMap 后仍有同一语义；
+需要增量策略时，应由宿主 Analyzer 基于新 Snapshot 决定。
+
+本阶段测试分为五层：
+
+- 确定性生命周期测试阻塞可取消与拒绝取消的 Provider，分别证明 Close 主动终止和
+  CloseContext 超时后继续清理；多个等待方共享释放错误，关闭中拒绝新任务；
+- 资源测试同时占满 task 与 in-flight bytes，覆盖 byte、Fragment、Measure Window 和
+  ReadPage，不允许任何错误路径泄漏计数；
+- 进度测试覆盖重复报告、倒退、越界、调用方取消、Provider 错误、最终结果倒退、迟到
+  Report、operation ID 耗尽和 generation 竞争；
+- Session 综合测试串起编辑、旧 Pager、当前 Snapshot 重建、用户 Observer、事件流、
+  foreign/closed Pager、Provider 失败及 Snapshot lease 回收；
+- 新的独立窗口参考模型不用生产查询辅助函数计算预期值，而是穷举 Page/Fragment/
+  Measure 选择和四维预算；第二个状态机随机组合 Refresh、非法报告、Provider 失败、
+  Publish、Stats 与 Close，验证 operation 阶段和 generation 永远原子。
+
+Windows 与 WSL 2 Debian 两端继续保持六包 100% statement coverage。Linux 全仓三轮
+shuffle race 无排除通过；受影响路径在 Windows 通过 100 轮普通重复和 10 轮 race
+重复，在 Linux 通过 10 轮 race 重复。六个 Virtual fuzz 每端各运行 30 秒；两个新增
+模型在 Windows 约执行 810 万输入、Linux 约执行 500 万输入。缓存 64 KiB Window 在
+Windows 约 12.5–17.0 µs、Linux 约 21.3–22.5 µs，约 66 KiB/9 alloc；Refresh progress
+在两端约 1.9–2.3 µs、1,288 B/22 alloc，安装 Observer 不增加分配。这些数字不是跨机器
+承诺，但并发 payload 总量、关闭取消边界、进度状态和刷新身份已经成为可回归的契约。
+已登记的 Windows journal-sync 事件超时与 undo store 打开句柄失败没有混入本提交，
+按计划留给 v0.5.x 模块收口后的独立补丁版本。
 
 ## 8. 贯穿所有阶段的设计理念
 

@@ -37,9 +37,9 @@ It currently provides:
   forward/reverse revision queries, lineage-checked index refresh, and
   cancellable atomic batch Anchor/range transforms with opaque annotations;
 - bounded, resumable Session event streams with a total subscription budget,
-  atomic statistics, precise slow-consumer loss reporting, save/compaction
-  progress, recovery-WAL durability transitions, and a concurrent close
-  barrier;
+  atomic statistics, precise slow-consumer loss reporting,
+  save/compaction/virtualization progress, recovery-WAL durability
+  transitions, and a concurrent close barrier;
 - resolved Session resource limits, journal sync cadence, and explicit shared
   or owned runtime-directory policies;
 - one cross-generation budget for host-owned Snapshot, coordinate Index, and
@@ -51,11 +51,13 @@ It currently provides:
   journal rebasing;
 - a 4 GiB default recovery-journal hard limit, exact growth statistics, and
   explicitly enabled automatic save checkpoints with failure backoff;
-- revision-bound UTF-8 logical Page virtualization with hard page/window
-  budgets, bounded LRU caching, and concurrent-task backpressure;
+- revision-bound UTF-8 logical Page virtualization with hard page/window and
+  aggregate in-flight byte budgets, bounded LRU caching, cancellable providers,
+  and timeout-aware cleanup;
 - atomically published, format-neutral Fragment generations with explicit
   indexed watermarks, fixed-point Measure indexes, three anchor types,
-  asymmetric overscan, and giant-Fragment continuation Pages.
+  asymmetric overscan, giant-Fragment continuation Pages, monotonic progress,
+  and lineage-checked refresh onto a current Session Snapshot.
 
 It does not yet provide full-text search, multi-source composition,
 collaboration, remote storage, UI, or a stable 1.0 API. Those capabilities and
@@ -211,7 +213,15 @@ from an unindexed suffix. Windows can be addressed by byte, Fragment ID, or
 host-defined non-negative fixed-point `Measure`; every result is bounded by
 bytes, pages, distinct Fragments, and Measure. Giant Fragments become
 continuation Pages without guessing how their Measure is distributed.
-`Session.VirtualPager` owns its Snapshot lease until `Close`.
+`MaximumInflightBytes` also bounds aggregate payload reserved by concurrent
+reads instead of multiplying one window by the task count. `Refresh` gives a
+provider a cancellation-aware monotonic reporter and publishes only one
+complete generation. `CloseContext` cancels admitted provider/read tasks, may
+stop waiting without abandoning cleanup, and shares one terminal Source
+release result. `Session.VirtualPager` owns its Snapshot lease until close;
+`Session.RefreshVirtualPager` lineage-checks the previous Pager, inherits its
+exact policy, and builds the current immutable Snapshot while the old Pager
+remains usable. Progress is mirrored into the bounded Session event stream.
 
 `Session.Compact` coalesces only contiguous same-source Pieces and rewrites the
 undo store with live references. It validates and copies into a candidate store
@@ -248,7 +258,7 @@ No compatibility promise applies before 1.0.
 ## Testing
 
 The repository requires 100% statement coverage for every current package and
-contains twenty-four Go fuzz targets:
+contains twenty-seven Go fuzz targets:
 
 - Piece Tree reference-model, concurrent snapshot/edit, compaction/Snapshot
   preservation, and automatic-compaction policy fuzzers;
@@ -260,8 +270,9 @@ contains twenty-four Go fuzz targets:
   state-machine fuzzing;
 - UTF-8 coordinate-reference, ChangeMap composition, and incremental-versus-
   full-index equivalence fuzzers;
-- logical Page partition, UTF-8 reconstruction, Fragment-window reference, and
-  Pager generation state-machine fuzzers.
+- logical Page partition, UTF-8 reconstruction, Fragment-window invariants, an
+  independent byte/Fragment/Measure window reference model, Pager generation,
+  and Refresh/progress/close state-machine fuzzers.
 
 Tests cover malformed and byte-truncated batches, state publication rollback,
 same-size/same-mtime external modification, full-file and boundary-split UTF-8,
@@ -345,6 +356,19 @@ backlogged subscribers remained allocation-free at roughly 29 ns and
 12.5–13.2 µs; rewriting 4 MiB of live undo data measured roughly 3.43–3.51 ms
 on Windows and 3.41–3.72 ms on Linux.
 
+The v0.5.7 Virtual suite retained six-package 100% statement coverage on native
+Windows and Debian under WSL 2. Linux passed the complete three-run shuffled
+race suite. The affected Virtual/Session paths passed 100 normal repetitions
+and ten race-enabled repetitions on Windows, and ten race-enabled repetitions
+on Linux. All six Virtual fuzzers ran for 30 seconds per platform; the two new
+reference/state-machine targets executed about 8.1 million Windows and
+5.0 million Linux inputs. A cached 64 KiB Window measured about 12.5–17.0 µs on
+Windows and 21.3–22.5 µs on Linux at roughly 66 KiB/nine allocations. Refresh
+progress measured about 1.9–2.3 µs and 1,288 B/22 allocations on both systems,
+with the observer path adding no allocations. The separately tracked
+intermittent Windows journal-sync event/handle failure remains intentionally
+unfixed in this tag.
+
 Run the normal checks:
 
 ```bash
@@ -383,6 +407,8 @@ go test ./document/virtual -run=^$ -fuzz=FuzzLogicalPagePartition -fuzztime=30s
 go test ./document/virtual -run=^$ -fuzz=FuzzLogicalPagesPreserveUTF8 -fuzztime=30s
 go test ./document/virtual -run=^$ -fuzz=FuzzFragmentWindowsRespectRanges -fuzztime=30s
 go test ./document/virtual -run=^$ -fuzz=FuzzPagerGenerationStateMachine -fuzztime=30s
+go test ./document/virtual -run=^$ -fuzz=FuzzVirtualWindowsMatchReferenceModel -fuzztime=30s
+go test ./document/virtual -run=^$ -fuzz=FuzzPagerRefreshLifecycleStateMachine -fuzztime=30s
 ```
 
 Windows race builds require a GCC-compatible MinGW-w64 toolchain; MSVC-target
@@ -401,21 +427,19 @@ Windows race builds require a GCC-compatible MinGW-w64 toolchain; MSVC-target
   expired revision requires a full rebuild. Suffix reuse requires the new
   Source to be the exact ChangeMap result. Coordinate cache budgets cover
   resident windows, not a concurrent miss's transient read buffer.
-- File-watcher candidates and Virtual refresh/progress events are not
-  implemented; save, compaction, and recovery-WAL transitions are.
+- File-watcher candidates are not implemented. Save, compaction,
+  recovery-WAL, and Virtual publication/refresh transitions are published.
 - Journal compaction requires an explicit save checkpoint. Search indexing,
   search-index compaction, and composition are not implemented.
 - Fragment metadata and logical Page tables are bounded by configured page,
-  Fragment, key, task, and cache limits. Cache limits exclude transient copies
-  held by active tasks; simultaneous in-core Window payloads are bounded by
-  `MaximumTasks × Window.Bytes`. Hosts control how long returned copies remain
-  live and must include those retained results in their own memory budgets.
+  Fragment, key, task, cache, window-policy, and aggregate in-flight byte
+  limits. Hosts control how long returned copies remain live and must include
+  those retained results in their own memory budgets.
 - The API and on-disk formats remain unstable until 1.0.
 
 ## Next work
 
-The v0.5.x maintenance line next closes Virtual refresh, progress, identity,
-and performance gaps. After every existing module is closed, the known Windows
-journal-durability CI race is fixed and released separately. Only then does
-v0.6 start format-neutral search. The target architecture and remaining
-milestones are in [develop.md](develop.md).
+The v0.5.x module maintenance line is complete. The next small release fixes
+the separately tracked Windows journal-durability CI event/handle race. Only
+then does v0.6 start format-neutral search. The target architecture and
+remaining milestones are in [develop.md](develop.md).

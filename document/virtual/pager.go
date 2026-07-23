@@ -9,13 +9,16 @@ import (
 )
 
 type resolvedOptions struct {
-	targetPageBytes  int64
-	maximumPageBytes int64
-	maximumFragments int
-	maximumTasks     int
-	maximumKeyBytes  int64
-	cacheBytes       int64
-	window           Budget
+	targetPageBytes      int64
+	maximumPageBytes     int64
+	maximumFragments     int
+	maximumTasks         int
+	maximumKeyBytes      int64
+	cacheBytes           int64
+	maximumInflightBytes int64
+	window               Budget
+	lineage              *Lineage
+	observer             ProgressObserver
 }
 
 type pageMeta struct {
@@ -61,21 +64,28 @@ type cacheEntry struct {
 // Pager is permanently bound to one immutable Source revision. Fragment
 // publication changes only its independent generation.
 type Pager struct {
-	mu        sync.RWMutex
-	source    Source
-	release   func() error
-	identity  *pagerIdentity
-	revision  uint64
-	length    int64
-	options   resolvedOptions
-	logical   []pageMeta
-	state     *pagerState
-	closed    bool
-	closing   bool
-	closeDone chan struct{}
-	closeErr  error
+	mu               sync.RWMutex
+	source           Source
+	release          func() error
+	identity         *pagerIdentity
+	lineage          *Lineage
+	observer         ProgressObserver
+	revision         uint64
+	length           int64
+	options          resolvedOptions
+	logical          []pageMeta
+	state            *pagerState
+	closed           bool
+	closing          bool
+	closeCompleted   bool
+	closeDone        chan struct{}
+	closeErr         error
+	lifecycleContext context.Context
+	cancelLifecycle  context.CancelCauseFunc
+	nextOperationID  uint64
 
-	tasks chan struct{}
+	tasks               chan struct{}
+	activeInflightBytes int64
 
 	cacheList  *list.List
 	cache      map[cacheKey]*list.Element
@@ -127,11 +137,13 @@ func build(ctx context.Context, source Source, revision uint64, options Options,
 	pager := &Pager{
 		source: source, release: release, revision: revision, length: length,
 		identity: &pagerIdentity{},
-		options:  resolved, logical: logical,
+		lineage:  resolved.lineage, observer: resolved.observer,
+		options: resolved, logical: logical,
 		tasks:     make(chan struct{}, resolved.maximumTasks),
 		cacheList: list.New(), cache: make(map[cacheKey]*list.Element),
 		closeDone: make(chan struct{}),
 	}
+	pager.lifecycleContext, pager.cancelLifecycle = context.WithCancelCause(context.Background())
 	pager.taskCond = sync.NewCond(&pager.mu)
 	pager.state = &pagerState{pages: initial, fragmentByID: make(map[string]int)}
 	return pager, nil
@@ -141,7 +153,9 @@ func resolveOptions(options Options) (resolvedOptions, error) {
 	resolved := resolvedOptions{
 		targetPageBytes: options.TargetPageBytes, maximumPageBytes: options.MaximumPageBytes,
 		maximumFragments: options.MaximumFragments, maximumTasks: options.MaximumTasks,
-		maximumKeyBytes: options.MaximumKeyBytes, cacheBytes: options.CacheBytes, window: options.Window,
+		maximumKeyBytes: options.MaximumKeyBytes, cacheBytes: options.CacheBytes,
+		maximumInflightBytes: options.MaximumInflightBytes, window: options.Window,
+		lineage: options.Lineage, observer: options.Observer,
 	}
 	if resolved.targetPageBytes == 0 {
 		resolved.targetPageBytes = DefaultTargetPageBytes
@@ -178,6 +192,9 @@ func resolveOptions(options Options) (resolvedOptions, error) {
 	if resolved.window.Measure == 0 {
 		resolved.window.Measure = DefaultWindowMeasure
 	}
+	if resolved.maximumInflightBytes == 0 {
+		resolved.maximumInflightBytes = max(DefaultMaximumInflightBytes, resolved.window.Bytes)
+	}
 	if resolved.targetPageBytes < 4 || resolved.maximumPageBytes < resolved.targetPageBytes ||
 		resolved.maximumPageBytes > MaximumPageBytes ||
 		resolved.maximumFragments < 1 || resolved.maximumFragments > MaximumFragments ||
@@ -186,7 +203,13 @@ func resolveOptions(options Options) (resolvedOptions, error) {
 		resolved.cacheBytes < 0 || resolved.cacheBytes > MaximumCacheBytes ||
 		resolved.window.Bytes < 1 || resolved.window.Pages < 1 ||
 		resolved.window.Fragments < 1 || resolved.window.Measure < 1 ||
-		resolved.window.Bytes < resolved.maximumPageBytes {
+		resolved.window.Bytes > MaximumWindowBytes ||
+		resolved.window.Pages > MaximumWindowPages ||
+		resolved.window.Fragments > MaximumWindowFragments ||
+		resolved.window.Measure > MaximumWindowMeasure ||
+		resolved.window.Bytes < resolved.maximumPageBytes ||
+		resolved.maximumInflightBytes < resolved.window.Bytes ||
+		resolved.maximumInflightBytes > MaximumInflightBytes {
 		return resolvedOptions{}, ErrInvalidOptions
 	}
 	return resolved, nil
@@ -209,22 +232,58 @@ func (p *Pager) statsLocked() Stats {
 		ActiveTasks: len(p.tasks), MaximumTasks: cap(p.tasks),
 		MaximumKeyBytes: p.options.maximumKeyBytes,
 		KeyBytes:        state.keyBytes,
+		WindowBytes:     p.options.window.Bytes, WindowPages: p.options.window.Pages,
+		WindowFragments: p.options.window.Fragments, WindowMeasure: p.options.window.Measure,
+		ActiveInflightBytes:  p.activeInflightBytes,
+		MaximumInflightBytes: p.options.maximumInflightBytes,
+		Closing:              p.closing && !p.closeCompleted, Closed: p.closeCompleted,
 	}
 }
 
 func (p *Pager) Close() error {
-	p.mu.Lock()
-	if p.closing {
-		done := p.closeDone
-		p.mu.Unlock()
-		<-done
+	return p.CloseContext(context.Background())
+}
+
+// CloseContext starts one shared shutdown and waits for all admitted tasks.
+// Closing cancels their derived Contexts. If ctx expires, cleanup continues
+// and a later Close observes the same result.
+func (p *Pager) CloseContext(ctx context.Context) error {
+	if ctx == nil {
+		return ErrInvalidContext
+	}
+	select {
+	case <-p.closeDone:
 		p.mu.RLock()
 		err := p.closeErr
 		p.mu.RUnlock()
 		return err
+	default:
 	}
-	p.closing = true
-	p.closed = true
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	if !p.closing {
+		p.closing = true
+		p.closed = true
+		p.cancelLifecycle(ErrClosed)
+		go p.finishClose()
+	}
+	done := p.closeDone
+	p.mu.Unlock()
+	select {
+	case <-done:
+		p.mu.RLock()
+		err := p.closeErr
+		p.mu.RUnlock()
+		return err
+	case <-ctx.Done():
+		return contextError(ctx)
+	}
+}
+
+func (p *Pager) finishClose() {
+	p.mu.Lock()
 	for len(p.tasks) != 0 {
 		p.taskCond.Wait()
 	}
@@ -240,37 +299,90 @@ func (p *Pager) Close() error {
 	}
 	p.mu.Lock()
 	p.closeErr = err
+	p.closeCompleted = true
 	close(p.closeDone)
 	p.mu.Unlock()
-	return err
 }
 
-func (p *Pager) acquireTask(ctx context.Context) error {
-	if ctx == nil {
-		return ErrInvalidContext
+func (p *Pager) acquireTask(parent context.Context) (context.Context, func(), error) {
+	if parent == nil {
+		return nil, nil, ErrInvalidContext
 	}
-	if err := ctx.Err(); err != nil {
-		return err
+	if err := contextError(parent); err != nil {
+		return nil, nil, err
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.closed {
-		return ErrClosed
+		p.mu.Unlock()
+		return nil, nil, ErrClosed
+	}
+	if err := contextError(parent); err != nil {
+		p.mu.Unlock()
+		return nil, nil, err
 	}
 	select {
 	case p.tasks <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
 	default:
-		return ErrBusy
+		p.mu.Unlock()
+		return nil, nil, ErrBusy
 	}
+	merged, cancel := context.WithCancelCause(parent)
+	taskContext := &pagerTaskContext{Context: merged, parent: parent, lifecycle: p.lifecycleContext}
+	stop := context.AfterFunc(p.lifecycleContext, func() { cancel(ErrClosed) })
+	p.mu.Unlock()
+	return taskContext, func() {
+		stop()
+		cancel(nil)
+		p.releaseTask()
+	}, nil
 }
 
 func (p *Pager) releaseTask() {
 	<-p.tasks
 	p.mu.Lock()
 	p.taskCond.Broadcast()
+	p.mu.Unlock()
+}
+
+type pagerTaskContext struct {
+	context.Context
+	parent    context.Context
+	lifecycle context.Context
+}
+
+func (c *pagerTaskContext) Err() error {
+	if err := c.parent.Err(); err != nil {
+		return err
+	}
+	if context.Cause(c.lifecycle) != nil {
+		return ErrClosed
+	}
+	return c.Context.Err()
+}
+
+func contextError(ctx context.Context) error {
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	return ctx.Err()
+}
+
+func (p *Pager) reserveInflight(bytes int64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return ErrClosed
+	}
+	if bytes < 0 || bytes > p.options.maximumInflightBytes-p.activeInflightBytes {
+		return ErrBusy
+	}
+	p.activeInflightBytes += bytes
+	return nil
+}
+
+func (p *Pager) releaseInflight(bytes int64) {
+	p.mu.Lock()
+	p.activeInflightBytes -= bytes
 	p.mu.Unlock()
 }
 
@@ -327,4 +439,80 @@ func checkedAddMeasure(left, right Measure) (Measure, bool) {
 		return 0, false
 	}
 	return left + right, true
+}
+
+// BelongsTo reports whether this Pager was built or rebuilt with lineage. It
+// remains available after Close and does not expose the stored token.
+func (p *Pager) BelongsTo(lineage *Lineage) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return lineage != nil && p.lineage == lineage
+}
+
+func (p *Pager) rebuildOptions() (Options, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.closed {
+		return Options{}, ErrClosed
+	}
+	return Options{
+		TargetPageBytes:      p.options.targetPageBytes,
+		MaximumPageBytes:     p.options.maximumPageBytes,
+		MaximumFragments:     p.options.maximumFragments,
+		MaximumTasks:         p.options.maximumTasks,
+		MaximumKeyBytes:      p.options.maximumKeyBytes,
+		CacheBytes:           p.options.cacheBytes,
+		MaximumInflightBytes: p.options.maximumInflightBytes,
+		Window:               p.options.window,
+		DisableCache:         p.options.cacheBytes == 0,
+		Lineage:              p.lineage,
+		Observer:             p.observer,
+	}, nil
+}
+
+// Rebuild creates a new revision-bound Pager with the previous Pager's exact
+// resource policy and lineage. provider may be nil to retain logical fallback.
+func Rebuild(ctx context.Context, source Source, revision uint64, previous *Pager, provider FragmentProvider) (*Pager, error) {
+	if previous == nil {
+		return nil, ErrInvalidPager
+	}
+	options, err := previous.rebuildOptions()
+	if err != nil {
+		return nil, err
+	}
+	pager, err := Build(ctx, source, revision, options)
+	if err != nil {
+		return nil, err
+	}
+	return finishRebuild(ctx, pager, provider)
+}
+
+// RebuildOwned is Rebuild with Source ownership transferred to the result. The
+// Source is closed on every failure.
+func RebuildOwned(ctx context.Context, source OwnedSource, revision uint64, previous *Pager, provider FragmentProvider) (*Pager, error) {
+	if source == nil {
+		return nil, ErrInvalidSource
+	}
+	if previous == nil {
+		return nil, errors.Join(ErrInvalidPager, source.Close())
+	}
+	options, err := previous.rebuildOptions()
+	if err != nil {
+		return nil, errors.Join(err, source.Close())
+	}
+	pager, err := BuildOwned(ctx, source, revision, options)
+	if err != nil {
+		return nil, err
+	}
+	return finishRebuild(ctx, pager, provider)
+}
+
+func finishRebuild(ctx context.Context, pager *Pager, provider FragmentProvider) (*Pager, error) {
+	if provider == nil {
+		return pager, nil
+	}
+	if _, err := pager.Refresh(ctx, provider); err != nil {
+		return nil, errors.Join(err, pager.Close())
+	}
+	return pager, nil
 }

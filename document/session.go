@@ -231,6 +231,7 @@ type Session struct {
 	events                     *eventHub
 	changeHistory              *changeHistory
 	coordinateLineage          *coordinate.Lineage
+	virtualLineage             *virtual.Lineage
 	closeDone                  chan struct{}
 	closeErr                   error
 	closeCompleted             bool
@@ -342,7 +343,8 @@ func openSessionContext(ctx context.Context, path string, options OpenOptions, o
 		undoStore: undo, sessionMarker: marker, hasBOM: scan.hasBOM, eol: scan.eol, recoveryDir: config.RecoveryDir,
 		sessionDir: config.SessionDir, config: config, fingerprint: fingerprint, diskIdentity: identityFor(info, scan.contentHash),
 		stopSync: make(chan struct{}), syncDone: make(chan struct{}), checkpointRequest: make(chan uint64, 1), operations: operations,
-		events: newEventHub(config.Limits.EventHistory, config.Limits.MaxSubscriptions), coordinateLineage: coordinate.NewLineage(), closeDone: make(chan struct{}),
+		events:            newEventHub(config.Limits.EventHistory, config.Limits.MaxSubscriptions),
+		coordinateLineage: coordinate.NewLineage(), virtualLineage: virtual.NewLineage(), closeDone: make(chan struct{}),
 		saveGate: saveGate, lifecycleContext: lifecycleContext, cancelLifecycle: cancelLifecycle,
 	}
 	if journal != nil {
@@ -695,7 +697,58 @@ func (s *Session) VirtualPager(ctx context.Context, options virtual.Options) (*v
 	if err != nil {
 		return nil, err
 	}
+	options.Lineage = s.virtualLineage
+	options.Observer = sessionVirtualObserver{session: s, next: options.Observer}
 	return virtual.BuildOwned(operationContext, snapshot, revision, options)
+}
+
+// RefreshVirtualPager builds the current revision with the previous Pager's
+// exact resource policy and lineage, then optionally asks provider to publish
+// a Fragment generation. The previous Pager remains independently usable.
+func (s *Session) RefreshVirtualPager(ctx context.Context, previous *virtual.Pager, provider virtual.FragmentProvider) (*virtual.Pager, error) {
+	operationContext, finish, err := s.operationContext(ctx)
+	if errors.Is(err, ErrInvalidContext) {
+		return nil, virtual.ErrInvalidContext
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
+	if previous == nil {
+		return nil, virtual.ErrInvalidPager
+	}
+	if !previous.BelongsTo(s.virtualLineage) {
+		return nil, virtual.ErrLineageMismatch
+	}
+	revision, snapshot, err := s.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	return virtual.RebuildOwned(operationContext, snapshot, revision, previous, provider)
+}
+
+type sessionVirtualObserver struct {
+	session *Session
+	next    virtual.ProgressObserver
+}
+
+func (o sessionVirtualObserver) ObserveVirtualProgress(progress virtual.Progress) {
+	kind := EventVirtualizationProgress
+	switch progress.Stage {
+	case virtual.ProgressStarted:
+		kind = EventVirtualizationStarted
+	case virtual.ProgressCompleted:
+		kind = EventVirtualizationCompleted
+	case virtual.ProgressFailed:
+		kind = EventVirtualizationFailed
+	}
+	o.session.events.publish(SessionEvent{
+		Kind: kind, Metadata: o.session.Metadata(),
+		Virtualization: progress, Cause: progress.Cause,
+	})
+	if o.next != nil {
+		o.next.ObserveVirtualProgress(progress)
+	}
 }
 
 // RebuildCoordinateIndex derives the current revision's index from a previous

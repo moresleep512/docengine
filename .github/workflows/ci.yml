@@ -91,3 +91,5 @@ jobs:
       - run: go test ./document/virtual -run=^$ -fuzz=FuzzLogicalPagesPreserveUTF8 -fuzztime=10s
       - run: go test ./document/virtual -run=^$ -fuzz=FuzzFragmentWindowsRespectRanges -fuzztime=10s
       - run: go test ./document/virtual -run=^$ -fuzz=FuzzPagerGenerationStateMachine -fuzztime=10s
+      - run: go test ./document/virtual -run=^$ -fuzz=FuzzVirtualWindowsMatchReferenceModel -fuzztime=10s
+      - run: go test ./document/virtual -run=^$ -fuzz=FuzzPagerRefreshLifecycleStateMachine -fuzztime=10s

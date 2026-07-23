@@ -431,7 +431,7 @@ func TestTaskLimitCloseBarrierAndOwnedRelease(t *testing.T) {
 	if _, err := pager.ReadPage(cancelled, key); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled task Context error = %v", err)
 	}
-	if err := pager.acquireTask(newCoreStepContext()); !errors.Is(err, context.Canceled) {
+	if _, _, err := pager.acquireTask(newCoreStepContext()); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Context cancelled at task select error = %v", err)
 	}
 

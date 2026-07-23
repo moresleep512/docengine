@@ -214,7 +214,12 @@ func TestBuildOptionsDefaultsValidationAndLimits(t *testing.T) {
 		defaultStats.MaximumPageBytes != DefaultMaximumPageBytes ||
 		defaultStats.MaximumCacheBytes != DefaultCacheBytes ||
 		defaultStats.MaximumTasks != DefaultMaximumConcurrentTasks ||
-		defaultStats.MaximumKeyBytes != DefaultMaximumKeyBytes {
+		defaultStats.MaximumKeyBytes != DefaultMaximumKeyBytes ||
+		defaultStats.WindowBytes != DefaultWindowBytes ||
+		defaultStats.WindowPages != DefaultWindowPages ||
+		defaultStats.WindowFragments != DefaultWindowFragments ||
+		defaultStats.WindowMeasure != DefaultWindowMeasure ||
+		defaultStats.MaximumInflightBytes != DefaultMaximumInflightBytes {
 		t.Fatalf("defaults not resolved: %+v", defaultStats)
 	}
 	if err := defaultPager.Close(); err != nil {
@@ -225,14 +230,21 @@ func TestBuildOptionsDefaultsValidationAndLimits(t *testing.T) {
 		TargetPageBytes: 4, MaximumPageBytes: MaximumPageBytes,
 		MaximumFragments: MaximumFragments, MaximumTasks: MaximumConcurrentTasks,
 		MaximumKeyBytes: MaximumKeyBytes, CacheBytes: MaximumCacheBytes,
-		Window: Budget{Bytes: math.MaxInt64, Pages: math.MaxInt, Fragments: math.MaxInt, Measure: Measure(math.MaxInt64)},
+		MaximumInflightBytes: MaximumInflightBytes,
+		Window: Budget{
+			Bytes: MaximumWindowBytes, Pages: MaximumWindowPages,
+			Fragments: MaximumWindowFragments, Measure: MaximumWindowMeasure,
+		},
 	})
 	if err != nil {
 		t.Fatalf("maximum accepted options: %v", err)
 	}
 	if got := limitPager.Stats(); got.Revision != math.MaxUint64 ||
 		got.MaximumPageBytes != MaximumPageBytes || got.MaximumCacheBytes != MaximumCacheBytes ||
-		got.MaximumKeyBytes != MaximumKeyBytes {
+		got.MaximumKeyBytes != MaximumKeyBytes ||
+		got.MaximumInflightBytes != MaximumInflightBytes ||
+		got.WindowBytes != MaximumWindowBytes || got.WindowPages != MaximumWindowPages ||
+		got.WindowFragments != MaximumWindowFragments || got.WindowMeasure != MaximumWindowMeasure {
 		t.Fatalf("maximum stats = %+v", got)
 	}
 	if err := limitPager.Close(); err != nil {
@@ -265,9 +277,18 @@ func TestBuildOptionsDefaultsValidationAndLimits(t *testing.T) {
 		{CacheBytes: MaximumCacheBytes + 1},
 		{DisableCache: true, CacheBytes: 1},
 		{Window: Budget{Bytes: -1}},
+		{Window: Budget{Bytes: MaximumWindowBytes + 1}},
 		{Window: Budget{Pages: -1}},
+		{Window: Budget{Pages: MaximumWindowPages + 1}},
 		{Window: Budget{Fragments: -1}},
+		{Window: Budget{Fragments: MaximumWindowFragments + 1}},
 		{Window: Budget{Measure: -1}},
+		{MaximumInflightBytes: -1},
+		{
+			TargetPageBytes: 4, MaximumPageBytes: 4,
+			Window: Budget{Bytes: 8}, MaximumInflightBytes: 7,
+		},
+		{MaximumInflightBytes: MaximumInflightBytes + 1},
 	}
 	for index, options := range invalid {
 		if _, err := Build(context.Background(), newCoreTestSource(nil), 0, options); !errors.Is(err, ErrInvalidOptions) {

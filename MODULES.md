@@ -28,9 +28,12 @@ than `MaximumPageBytes`. Empty input still has one `[0,0)` Page. LF alone
 advances the logical line, matching `document/coordinate`.
 
 `Pager` is permanently bound to one revision. `BuildOwned` transfers a Source
-lease, and every concurrent `Close` waits for the same task barrier and returns
-the same release result. A Pager created through `Session.VirtualPager` owns a
-Snapshot lease, so later Session edits or saves cannot change its content.
+lease. `CloseContext` starts one shared shutdown, rejects new work, cancels the
+derived Context of every admitted read or Provider task, and may stop waiting
+without abandoning cleanup. Every later `Close` waits for the same barrier and
+returns the same release result. A Pager created through
+`Session.VirtualPager` owns a Snapshot lease, so later Session edits or saves
+cannot change its content.
 
 Fragment state is immutable and published with a generation compare-and-swap:
 
@@ -43,7 +46,13 @@ Fragment state is immutable and published with a generation compare-and-swap:
 - `Complete` may become true only at EOF, while EOF may remain explicitly
   incomplete;
 - Provider callbacks run without a Pager or Session lock. A slow result loses
-  the generation CAS instead of overwriting a newer publication.
+  the generation CAS instead of overwriting a newer publication;
+- each Refresh receives a non-nil, call-scoped progress reporter. Watermarks
+  and Fragment counts must be monotonic and bounded; an invalid report is
+  sticky and prevents publication even if the Provider ignores its error;
+- Publish and Refresh use monotonically increasing operation IDs and emit
+  started, advanced, completed, or failed progress. Session-created Pagers
+  mirror those transitions into the bounded Session event stream.
 
 `Measure` is a non-negative `int64` fixed-point quantity whose scale belongs to
 the host. Prefix sums are checked for overflow. A Fragment's Measure remains
@@ -55,10 +64,12 @@ it by byte or select an explicit continuation.
 
 Page payloads use a strict byte-capacity LRU. Cache hits and returned values are
 copied so callers cannot mutate cached content. `CacheBytes` covers resident
-LRU payloads; transient active-task copies are bounded separately by
-`MaximumTasks × Window.Bytes`; copies retained by the host after a call returns
-belong to its own memory budget. The same task semaphore provides immediate
-`ErrBusy` backpressure. Provider callbacks may inspect `Stats`, but must not
+LRU payloads. `MaximumInflightBytes` separately bounds the total bytes reserved
+by all active `ReadPage` and Window operations; each Window reserves its hard
+request budget before reading, so concurrency cannot multiply an unaccounted
+payload. Copies retained by the host after return belong to its own memory
+budget. The task semaphore and byte budget both provide immediate `ErrBusy`
+backpressure. Provider and Observer callbacks may inspect `Stats`, but must not
 synchronously invoke task-bearing operations or `Close` on the same Pager.
 Owned Source closers must not re-enter their Pager.
 
@@ -67,6 +78,15 @@ revision, Fragment generation, index, and byte range. Copying a key preserves
 its capability, while reconstructing one or passing it to a different Pager is
 rejected; equal revision numbers are not treated as proof of equal Source
 identity.
+
+`Lineage` is an opaque pointer identity for one trusted revision history.
+`Rebuild` and `RebuildOwned` copy the previous Pager's fully resolved page,
+Fragment, task, key, cache, window, in-flight, Observer, and lineage policy,
+while keeping the previous Pager independently usable. The owned form closes
+the new Source on every build or Provider failure. Session overrides caller
+lineage and exposes `RefreshVirtualPager`, which rejects foreign Pagers and
+rebuilds from the current immutable Snapshot. A nil Provider intentionally
+keeps generation zero and logical-Page fallback.
 
 ## `document/store`
 
@@ -517,12 +537,13 @@ All six current packages are held at 100% statement coverage. Tests include
 platform-specific replacement and directory-sync faults, complete UTF-8 and
 identity boundaries, every recovery batch truncation, transaction rollback,
 concurrent save/rebase, post-commit fault behavior, snapshot lifetime, integer
-overflow, randomized reference models, race runs, and twenty-four fuzz targets.
+overflow, randomized reference models, race runs, and twenty-seven fuzz targets.
 Event-specific tests exercise resumable history, exact overflow accounting,
-save progress and failure phase, WAL Sync failure/restoration, concurrent
-publish/unsubscribe, final-event delivery, and the close barrier. Lifecycle and
-compaction tests cover marker locks, conservative orphan reclamation, cleanup
-faults, live undo remapping, journal checkpoints, and Snapshot preservation.
+save/virtualization progress and failure phase, WAL Sync failure/restoration,
+concurrent publish/unsubscribe, final-event delivery, and the close barrier.
+Lifecycle and compaction tests cover marker locks, conservative orphan
+reclamation, cleanup faults, live undo remapping, journal checkpoints, and
+Snapshot preservation.
 Recovery/Save tests additionally cover exact quota rejection, automatic
 checkpoint backoff, replacement-journal file/directory durability, and real
 child-process exits on both sides of replacement with concurrent edits.
@@ -533,12 +554,14 @@ automatic checkpoint followed by successful journal recovery. A dedicated
 stateful fuzzer compares lease counts, old Snapshot bytes, edits, saves, and
 derived consumers against a bounded reference model.
 Virtualization tests cover UTF-8 Page partitioning, analyzed gaps, incomplete
-watermarks, continuation Pages, byte/Fragment/Measure affinity, all four
-budgets, cache ownership, task backpressure, generation races, provider
-failures, and concurrent Close barriers. Four additional fuzz targets compare
-Page reconstruction, Fragment windows, and generation state with reference
-invariants. Incremental-index tests compare every byte, rune, and line coordinate with a
-fresh full build across randomized sequential UTF-8 edits.
+watermarks, continuation Pages, byte/Fragment/Measure affinity, all window and
+aggregate in-flight budgets, cache ownership, task backpressure, generation
+races, Provider progress, lineage, cross-revision rebuilding, cancellation,
+timed cleanup, and concurrent Close barriers. Six fuzz targets compare Page
+reconstruction, Fragment invariants, all three Window APIs against an
+independent reference model, and generation/Refresh/progress/close state
+machines. Incremental-index tests compare every byte, rune, and line coordinate
+with a fresh full build across randomized sequential UTF-8 edits.
 Change-history state-machine fuzzing covers bounded eviction, unavailable batch
 interiors, forward/reverse maps, metadata, and Anchor equivalence.
 
@@ -603,3 +626,17 @@ undo-rewrite state-machine fuzzers ran for 30 seconds per platform. Event
 publication remained allocation-free with zero and 128 backlogged subscribers;
 4 MiB live undo rewrite sustained about 1.20 GiB/s on Windows and
 1.13–1.23 GiB/s on Linux in the committed benchmark.
+
+For v0.5.7, both platforms again retained 100% statement coverage in all six
+packages; Linux passed the complete three-run shuffled race suite. Affected
+Virtual/Session paths passed 100 normal and ten race-enabled Windows
+repetitions, plus ten race-enabled Linux repetitions. All six Virtual fuzzers
+ran for 30 seconds per platform. The independent Window model checks exact
+page selection, byte/Fragment/Measure usage, anchor fit, and asymmetric
+truncation; the lifecycle state machine checks atomic generations, monotonic
+operation stages, sticky invalid reports, Provider errors, and Close. Cached
+64 KiB Windows measured roughly 12.5–17.0 µs on Windows and 21.3–22.5 µs on
+Linux at about 66 KiB/nine allocations. Refresh progress measured roughly
+1.9–2.3 µs and 1,288 B/22 allocations, with no allocation difference when an
+Observer is installed. The known intermittent Windows journal-sync
+event/open-handle failure remains isolated for the next patch tag.
