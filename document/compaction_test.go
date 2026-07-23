@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"testing"
 )
@@ -112,8 +113,9 @@ func TestSessionCompactValidationCancellationClosedAndFaulted(t *testing.T) {
 	}
 }
 
-func TestSessionCompactChecksCancellationAfterJournalCheckpoint(t *testing.T) {
-	session, _, _ := openAtomicTestSession(t, "a")
+func TestSessionCompactCancellationBeforeJournalCheckpointIsAtomic(t *testing.T) {
+	session, path, _ := openAtomicTestSession(t, "a")
+	defer session.Close()
 	if _, err := session.ApplyBatch(context.Background(), 0, []ReplaceOperation{{Start: 1, Insert: "x"}}); err != nil {
 		t.Fatal(err)
 	}
@@ -124,11 +126,33 @@ func TestSessionCompactChecksCancellationAfterJournalCheckpoint(t *testing.T) {
 		}
 	}
 	result, err := session.Compact(ctx, CompactOptions{CheckpointJournal: true})
+	if !errors.Is(err, context.Canceled) || result.JournalCheckpointed || result.Metadata != (Metadata{}) {
+		t.Fatalf("cancel before checkpoint = (%+v, %v)", result, err)
+	}
+	if metadata := session.Metadata(); metadata.CommittedRevision != 0 || !metadata.Dirty {
+		t.Fatalf("metadata after cancellation = %+v", metadata)
+	}
+	if content, readErr := os.ReadFile(path); readErr != nil || string(content) != "a" {
+		t.Fatalf("disk after cancellation = %q, %v", content, readErr)
+	}
+}
+
+func TestSessionCompactChecksCancellationAfterCommittedJournalCheckpoint(t *testing.T) {
+	session, _, _ := openAtomicTestSession(t, "a")
+	defer session.Close()
+	if _, err := session.ApplyBatch(context.Background(), 0, []ReplaceOperation{{Start: 1, Insert: "x"}}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	atomicChecked := session.operations.atomicChecked
+	session.operations.atomicChecked = func(path string, mode os.FileMode, prefix []byte, writeContent func(io.Writer) (int64, error), checkIdentity func() error) (int64, error) {
+		total, err := atomicChecked(path, mode, prefix, writeContent, checkIdentity)
+		cancel()
+		return total, err
+	}
+	result, err := session.Compact(ctx, CompactOptions{CheckpointJournal: true})
 	if !errors.Is(err, context.Canceled) || !result.JournalCheckpointed || result.Metadata.CommittedRevision != 1 {
 		t.Fatalf("cancel after checkpoint = (%+v, %v)", result, err)
-	}
-	if err := session.Close(); err != nil {
-		t.Fatal(err)
 	}
 }
 

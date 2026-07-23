@@ -41,6 +41,10 @@ It currently provides:
   concurrent close barrier;
 - resolved Session resource limits, journal sync cadence, and explicit shared
   or owned runtime-directory policies;
+- one cross-generation budget for host-owned Snapshot, coordinate Index, and
+  virtual Pager leases, with atomic lifecycle statistics;
+- cancellable save/commit/undo/redo APIs and a timeout-aware close barrier that
+  continues cleanup after a caller stops waiting;
 - lock-protected reclamation of stale owned Session directories;
 - safe first-generation Piece/undo compaction and explicit save-checkpoint
   journal rebasing;
@@ -135,8 +139,11 @@ checkpointing is disabled unless `AutoCheckpointJournalBytes` is set; enabling
 it explicitly authorizes background saves once physical journal growth crosses
 the threshold. Failed automatic checkpoints back off by another threshold.
 `Session.RecoveryStats` reports current and next thresholds, physical bytes,
-queued work, and completed automatic checkpoints. Explicit directories are
-shared by default; an omitted
+queued work, and completed automatic checkpoints. Host-facing Snapshot,
+coordinate Index, and virtual Pager ownership shares a default limit of 1,024
+leases across current and retired source generations. `Session.LifecycleStats`
+reports active/peak leases, save waiters, active persistence, automatic work,
+and closing/closed state. Explicit directories are shared by default; an omitted
 Session directory is unique and owned. Undo files use collision-free temporary
 names and are removed on close. Owned directories are removed only when they
 are actual empty directories, while dirty recovery journals and unknown host
@@ -211,19 +218,22 @@ details.
 - `ReplayResult` returns atomic batches rather than legacy logical frames.
 - `document.OpenContext`, `Metadata.ResolvedPath`, durability/fault metadata,
   `Session.Fault`, `document.ErrFaulted`, and `save.DurabilityError` were added.
+- `SaveContext`, `CommitAtLeastContext`, `UndoContext`, `RedoContext`, and
+  `CloseContext` define cancellation boundaries; `CloseContext` may stop
+  waiting while the one shared cleanup barrier continues.
 
 No compatibility promise applies before 1.0.
 
 ## Testing
 
 The repository requires 100% statement coverage for every current package and
-contains twenty-three Go fuzz targets:
+contains twenty-four Go fuzz targets:
 
 - Piece Tree reference-model, concurrent snapshot/edit, compaction/Snapshot
   preservation, and automatic-compaction policy fuzzers;
 - v2 header, operation decoder, replay-resilience, and stateful journal fuzzers;
 - Session state-machine, concurrent save/edit, crash-recovery, journal-quota
-  atomicity, and UTF-8 edit boundary fuzzers;
+  atomicity, cross-generation lifecycle-budget, and UTF-8 edit boundary fuzzers;
 - resumable event-history, subscriber-overflow, and close state-machine fuzzing;
 - bounded ChangeMap-history retention, expiry, reverse-query, and composition
   state-machine fuzzing;
@@ -239,7 +249,10 @@ the post-commit read-only state, configured resource limits, concurrent shared
 runtime directories, marker-lock orphan reclamation, conservative cleanup,
 live undo remapping, Snapshot-safe Piece compaction, exact journal quota
 rejection, automatic-checkpoint backoff, and real child-process exits before
-and after replacement with and without concurrent edits. Event tests additionally
+and after replacement with and without concurrent edits. Session lifecycle
+tests additionally cover exact lease saturation, 64-way acquisition races,
+queued-save wakeup, pre-commit cancellation at every checkpoint, timed close
+continuation, and recovery after canceling an automatic checkpoint. Event tests additionally
 cover exact loss accounting, replay cursors, save progress and failure phase,
 journal Sync failure/restoration, a final close event under queue overflow,
 concurrent publish/unsubscribe, and multiple callers waiting on one close barrier.
@@ -278,6 +291,16 @@ seconds on both systems. The real child-process crash matrix passed 20
 consecutive runs per platform, checkpoint/quota boundary tests passed 100
 consecutive runs, and the Recovery/Save/Session benchmarks executed on both.
 
+The v0.5.4 Session lifecycle suite passed on native Windows and Debian under
+WSL 2 from native Linux `/tmp`: all six packages remained at 100% statement
+coverage and three shuffled race runs passed. Lifecycle-budget, Session-state,
+concurrent-save, crash-recovery, and Session/Pager fuzzers each ran for 30
+seconds per platform. Core lease/close/cancellation races passed 100 repeated
+runs and the detailed pre-commit matrix passed 30. Snapshot lease acquisition
+measured about 447–467 ns on Windows and 347–353 ns on Linux (368 B and four
+allocations); the 4 MiB Session save benchmark measured about 49–50 ms and
+10–11 ms respectively.
+
 Run the normal checks:
 
 ```bash
@@ -303,6 +326,7 @@ go test ./document -run=^$ -fuzz=FuzzSessionStateMachine -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzSessionConcurrentSaveEdit -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzSessionCrashRecovery -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzSessionJournalQuotaIsAtomic -fuzztime=30s
+go test ./document -run=^$ -fuzz=FuzzSessionLifecycleBudgets -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzUTF8ReplacementBoundaries -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzEventHubStateMachine -fuzztime=30s
 go test ./document -run=^$ -fuzz=FuzzChangeHistoryStateMachine -fuzztime=30s

@@ -29,10 +29,12 @@ type CompactionResult struct {
 // persistence checkpoint because rewriting an uncommitted WAL in place cannot
 // preserve both revision identity and crash atomicity.
 func (s *Session) Compact(ctx context.Context, options CompactOptions) (CompactionResult, error) {
-	if ctx == nil {
-		return CompactionResult{}, ErrInvalidContext
+	operationContext, finish, err := s.operationContext(ctx)
+	if err != nil {
+		return CompactionResult{}, err
 	}
-	if err := ctx.Err(); err != nil {
+	defer finish()
+	if err := contextError(operationContext); err != nil {
 		return CompactionResult{}, err
 	}
 	var result CompactionResult
@@ -49,7 +51,7 @@ func (s *Session) Compact(ctx context.Context, options CompactOptions) (Compacti
 		}
 		target := s.revision
 		s.mu.RUnlock()
-		metadata, err := s.CommitAtLeast(target)
+		metadata, err := s.CommitAtLeastContext(operationContext, target)
 		result.Metadata = metadata
 		if err != nil {
 			return result, err
@@ -65,7 +67,7 @@ func (s *Session) Compact(ctx context.Context, options CompactOptions) (Compacti
 	if s.fault != nil {
 		return result, errors.Join(ErrFaulted, s.fault)
 	}
-	if err := ctx.Err(); err != nil {
+	if err := contextError(operationContext); err != nil {
 		return result, err
 	}
 	result.Pieces = s.tree.Compact()

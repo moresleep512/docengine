@@ -267,11 +267,12 @@ target. A symlink later redirected elsewhere does not change the save target.
 `OpenOptions` resolves into an immutable `SessionConfig`. The configurable
 limits are maximum operations per batch, bytes per insertion, undo-store bytes,
 recovery-journal bytes, retained Session events, retained ChangeMaps, Anchors
-per transform batch, and journal sync interval. The default hard journal limit
-is 4 GiB. `AutoCheckpointJournalBytes` is separate and zero by default because
-enabling it authorizes background saves; a nonzero threshold cannot exceed the
-hard limit. Negative values and limits beyond the v2 journal or in-memory
-envelopes are rejected before the base file is opened.
+per transform batch, host-owned Snapshot leases, and journal sync interval. The
+default hard journal limit is 4 GiB and the default cross-generation lease
+limit is 1,024. `AutoCheckpointJournalBytes` is separate and zero by default
+because enabling it authorizes background saves; a nonzero threshold cannot
+exceed the hard limit. Negative values and limits beyond the v2 journal or
+in-memory envelopes are rejected before the base file is opened.
 
 Explicit RecoveryDir and SessionDir paths are shared unless marked owned. An
 omitted RecoveryDir uses the shared process-temporary recovery namespace; an
@@ -341,6 +342,20 @@ wait on one barrier and return the same joined cleanup result. Explicit
 subscription close is idempotent and races safely with publication and Session
 close.
 
+`SaveContext`, `CommitAtLeastContext`, `UndoContext`, and `RedoContext` preserve
+transaction atomicity at every cancellation checkpoint. A queued save can
+leave without acquiring the serializer and publishes no persistence attempt.
+Cancellation during streaming or replacement-journal preparation is
+pre-commit; after atomic replacement, the committed result is authoritative.
+An active host save is governed by its caller's Context, while Close cancels
+Session-owned automatic checkpoints and immediately wakes queued saves.
+
+`CloseContext` initiates the same one-time shutdown as `Close`, but its caller
+may stop waiting. Resource retirement continues independently, and every later
+Close observes the same final cleanup result. This prevents a leaked host lease
+from permanently trapping a deadline-bound shutdown caller without weakening
+the rule that source handles remain alive until the lease is released.
+
 When `AutoCheckpointJournalBytes` is enabled, accepted edits schedule a
 background `CommitAtLeast` after the physical threshold. The one-slot request
 queue coalesces work; a failed checkpoint moves the next trigger forward by a
@@ -397,6 +412,14 @@ generation reference count. Save can install a new generation while old leases
 continue reading the retired one. Handles close and committed journals are
 removed only after the last lease releases.
 
+Every host-facing `Session.Snapshot`, coordinate Index, and virtual Pager lease
+also consumes one Session-wide permit across all generations. Exact saturation
+returns `ErrLimitExceeded` without acquiring a generation reference; closing
+any consumer releases one permit. Internal save snapshots do not consume this
+host budget, so a host leak cannot prevent persistence. `LifecycleStats`
+atomically reports active and peak leases, the configured maximum, waiting and
+active saves, automatic checkpoint work, and closing/completed shutdown state.
+
 ### Saving and conflicts
 
 Save captures an immutable target revision without blocking subsequent edits.
@@ -444,7 +467,7 @@ All six current packages are held at 100% statement coverage. Tests include
 platform-specific replacement and directory-sync faults, complete UTF-8 and
 identity boundaries, every recovery batch truncation, transaction rollback,
 concurrent save/rebase, post-commit fault behavior, snapshot lifetime, integer
-overflow, randomized reference models, race runs, and twenty-three fuzz targets.
+overflow, randomized reference models, race runs, and twenty-four fuzz targets.
 Event-specific tests exercise resumable history, exact overflow accounting,
 save progress and failure phase, WAL Sync failure/restoration, concurrent
 publish/unsubscribe, final-event delivery, and the close barrier. Lifecycle and
@@ -453,6 +476,12 @@ faults, live undo remapping, journal checkpoints, and Snapshot preservation.
 Recovery/Save tests additionally cover exact quota rejection, automatic
 checkpoint backoff, replacement-journal file/directory durability, and real
 child-process exits on both sides of replacement with concurrent edits.
+Session lifecycle tests cover exact cross-generation lease saturation, 64-way
+acquisition races, all pre-commit cancellation checkpoints, queued-save wakeup,
+timeout-aware close continuation, shared cleanup errors, and cancellation of an
+automatic checkpoint followed by successful journal recovery. A dedicated
+stateful fuzzer compares lease counts, old Snapshot bytes, edits, saves, and
+derived consumers against a bounded reference model.
 Virtualization tests cover UTF-8 Page partitioning, analyzed gaps, incomplete
 watermarks, continuation Pages, byte/Fragment/Measure affinity, all four
 budgets, cache ownership, task backpressure, generation races, provider
@@ -494,3 +523,12 @@ fuzzers each ran for 30 seconds on both systems. The real child-process crash
 matrix passed 20 consecutive runs per platform, checkpoint/quota boundary
 tests passed 100 consecutive runs, and all committed Recovery/Save/Session
 benchmarks executed on both.
+
+For v0.5.4, native Windows and Debian under WSL 2 again retained 100% statement
+coverage in all six packages and passed three shuffled race runs. Five Session
+lifecycle/state/save/recovery/Pager fuzzers ran for 30 seconds per platform.
+Core lease, close, queued-save, streaming-cancellation, and recovery boundaries
+passed 100 repeated runs; the detailed lifecycle/pre-commit matrix passed 30.
+Snapshot lease acquisition measured roughly 447–467 ns on Windows and
+347–353 ns on Linux at 368 B/four allocations, while the 4 MiB Session save
+benchmark measured roughly 49–50 ms and 10–11 ms respectively.

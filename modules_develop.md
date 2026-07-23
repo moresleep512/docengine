@@ -570,6 +570,58 @@ coverage、通过全仓三轮 shuffle race；四个 recovery fuzz、并发保存
 fuzz 各运行 30 秒。真实子进程矩阵每端连续通过 20 次，checkpoint/配额边界连续通过
 100 次，Recovery/Save/Session benchmark 也在两端实际执行。
 
+### 7.9 v0.5.4：生命周期预算必须跨 generation，而关闭超时不能中断所有权
+
+Session 原来保证单个 `sourceGeneration` 会等最后一个 lease 才关闭，但没有限制宿主能
+持有多少 lease。宿主若在每次 Save 前保留一个 Snapshot、coordinate Index 或 virtual
+Pager，就能让任意多个退役 generation 同时保留 base/journal 句柄；单个模块各自正确，
+整个进程的文件句柄和磁盘生命周期仍然无界。普通 `Close` 又只能无限等待最后一个 lease，
+Save/Commit/Undo/Redo 除 Apply 外没有 Context 版本，后台自动 checkpoint 也没有独立于
+调用 goroutine 的取消域。
+
+按 generation 分别限额被否决，因为宿主可以在每次保存后重新获得一整份预算；让
+`Close` 强行关闭尚存 Snapshot 也被否决，因为这会破坏已经发布的不可变读取契约。最终
+预算放在 Session：所有宿主可获得的 `SnapshotLease`、coordinate `Index` 和 virtual
+`Pager` 在所有当前/退役 generation 间共享 `MaxSnapshotLeases`，默认 1,024。精确饱和
+直接返回 `ErrLimitExceeded`，不会先加 generation 引用再回滚。内部 Save Snapshot 不占
+宿主 permit，因此泄漏的派生消费者不能阻止宿主把当前内容持久化。包装 lease 使用
+`sync.Once` 释放 permit，重复 Close 不会重复扣减。
+
+`LifecycleStats` 把 active/peak lease、硬上限、等待/执行中的 Save、自动 checkpoint 和
+closing/closed 放进一个锁快照。Save 的串行边界从不可取消的 mutex 改为单 permit gate：
+等待者可被自己的 Context 或 Session 关闭唤醒；已经取得 gate 的宿主 Save 仍由调用方
+Context 决定，避免 Close 在未知时刻擅自取消用户要求的提交。自动 checkpoint 明确传入
+Session 生命周期 Context，因此关闭会取消它。流式写、最终强身份扫描和替换 journal
+准备阶段都检查 Context；原子替换一旦成功，后续取消不能伪装成“未提交”。
+
+`CloseContext` 也没有在 deadline 时放弃清理。第一次有效调用只启动一次独立关闭流程，
+调用者超时只是不再等待；后台仍同步 journal、等待 lease、关闭 generation/undo/marker、
+发布最终事件并完成同一个 `closeDone`。后续 `Close` 得到完全相同的 joined cleanup
+错误。所有尚未取得 save gate 的调用会在关闭时一起醒来，不必逐个等前一个排队者释放
+permit；已开始的宿主 Save 完成后再由关闭流程退役最终 generation。
+
+实现过程中出现两个容易被标准 Context 测试漏掉的问题。第一，测试使用了合法但
+`Done()==nil`、只在 `Err()` 中推进取消点的 Context；直接 `WithCancel` 包装会屏蔽其
+动态 `Err`，使本应失败的 Pager 构建成功并泄漏 lease，最终让 Close 永久等待。合并
+Context 因此保留父 Context 的直接 `Err()` 轮询，同时用派生 Done 合并 Session 关闭。
+第二，为覆盖最终身份锁前后的取消点，Save 的私有阶段 hook 增加第二个调用位置；并发
+fuzz 随即通过 race detector 发现 hook 指针被另一 goroutine 清空。Save 现在在持锁捕获
+Snapshot 时同时捕获一次 hook，整个尝试只读这个局部快照。
+
+测试按资源和时序两条轴展开：精确 lease 饱和、64 goroutine 同时抢 permit、旧/新
+generation 混合消费者、派生对象失败自动归还、排队 Save 取消不发布尝试事件、所有
+等待保存被 Close 同时唤醒、流式写及 prepared journal 每个检查点取消、Undo/Redo 中途
+取消原子性、CloseContext deadline 后继续清理并保留最终错误、自动 checkpoint 被关闭
+取消后由 journal 完整恢复。新的 `FuzzSessionLifecycleBudgets` 把 lease 获取/释放、
+编辑、保存、取消和派生消费者与有界参考状态比较；Snapshot permit 热路径和 4 MiB Save
+都纳入 benchmark。这里仍不实现 watcher，也不声称已经具备进程级内存/句柄总量采样。
+
+最终 Windows 本机与 WSL 2 Debian 原生 Linux `/tmp` 两端均保持六包 100% statement
+coverage，并通过全仓三轮 shuffle race；五个 Session 生命周期相关 fuzz target 各运行
+30 秒。核心并发边界连续通过 100 轮，详细逐检查点矩阵通过 30 轮。Snapshot lease 获取
+在 Windows 约 447–467 ns、Linux 约 347–353 ns，均为 368 B/4 alloc；4 MiB Session Save
+分别约 49–50 ms 与 10–11 ms。
+
 ## 8. 贯穿所有阶段的设计理念
 
 ### 8.1 格式中立不是口号，而是依赖约束
@@ -620,13 +672,12 @@ Tree 不关闭 Source；generation 管理 base/journal；Session 管理 generati
 
 ## 9. 到这里为止，以及为什么下一步不是继续堆编辑 API
 
-截至 v0.5.3，Docengine 已经有 Piece Tree、不可变 Snapshot、原子事务、recovery v2、
+截至 v0.5.4，Docengine 已经有 Piece Tree、不可变 Snapshot、原子事务、recovery v2、
 跨平台保存、显式故障状态、坐标/ChangeMap、事件、资源策略、压缩，以及格式中立的
 Page/Fragment/Measure 虚拟化。
 
 下一阶段仍按 `develop.md` 横向补齐，不进入 v0.6：
 
-- Session 后台任务预算、取消、资源所有权和稳定错误边界；
 - Coordinate/ChangeMap 已有增量能力的缓存、后缀复用与压力边界；
 - 事件/压缩和 Virtual 的刷新、进度、长期性能及组合生命周期死角；
 - 所有现有模块完成后，最后单独修复 Windows journal durability CI 问题。

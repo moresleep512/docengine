@@ -61,22 +61,33 @@ func TestApplyBatchValidationFailuresAreAtomic(t *testing.T) {
 }
 
 func TestApplyBatchCancellationIsAtomicAtEveryBoundary(t *testing.T) {
-	for cancelAt := 1; cancelAt <= 4; cancelAt++ {
-		t.Run(string(rune('0'+cancelAt)), func(t *testing.T) {
-			session, _, _ := openAtomicTestSession(t, "abc")
-			defer session.Close()
-			ctx := &countingCancelContext{cancelAt: cancelAt}
-			_, err := session.ApplyBatch(ctx, 0, []ReplaceOperation{
-				{Start: 3, Insert: "d"},
-				{Start: 4, Insert: "e"},
-				{Start: 5, Insert: "f"},
-			})
-			if !errors.Is(err, context.Canceled) {
-				t.Fatalf("ApplyBatch error = %v, want %v", err, context.Canceled)
-			}
-			assertSessionState(t, session, Metadata{ByteLength: 3}, "abc")
+	// Three operations cross staging, pre-WAL checks, post-append repair,
+	// replacement-tree construction, and undo-history materialization. Stop at
+	// the first poll count beyond all cancellation points so added checkpoints
+	// automatically become part of this test.
+	for cancelAt := 1; cancelAt <= 64; cancelAt++ {
+		session, _, _ := openAtomicTestSession(t, "abc")
+		ctx := &countingCancelContext{cancelAt: cancelAt}
+		_, err := session.ApplyBatch(ctx, 0, []ReplaceOperation{
+			{Start: 3, Insert: "d"},
+			{Start: 4, Insert: "e"},
+			{Start: 5, Insert: "f"},
 		})
+		if err == nil {
+			if closeErr := session.Close(); closeErr != nil {
+				t.Fatal(closeErr)
+			}
+			return
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelAt %d ApplyBatch error = %v, want %v", cancelAt, err, context.Canceled)
+		}
+		assertSessionState(t, session, Metadata{ByteLength: 3}, "abc")
+		if closeErr := session.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
 	}
+	t.Fatal("ApplyBatch still observed cancellation after 64 checkpoints")
 }
 
 func TestApplyBatchUsesSequentialCoordinates(t *testing.T) {

@@ -79,6 +79,20 @@ type RecoveryStats struct {
 	AutomaticCheckpointQueued bool
 }
 
+// LifecycleStats is an atomic view of host-owned leases, serialized saves, and
+// shutdown. Closing means shutdown was requested but resource retirement has
+// not completed; Closed means the shared close barrier has completed.
+type LifecycleStats struct {
+	ActiveSnapshotLeases       int
+	PeakSnapshotLeases         int
+	MaxSnapshotLeases          int
+	WaitingSaves               int
+	SaveActive                 bool
+	AutomaticCheckpointPending bool
+	Closing                    bool
+	Closed                     bool
+}
+
 type RecoveryOpenError struct {
 	JournalPath     string
 	QuarantinedPath string
@@ -179,7 +193,10 @@ type fileIdentity struct {
 
 type Session struct {
 	mu                         sync.RWMutex
-	saveMu                     sync.Mutex
+	closeOnce                  sync.Once
+	saveGate                   chan struct{}
+	lifecycleContext           context.Context
+	cancelLifecycle            context.CancelCauseFunc
 	path                       string
 	resolvedPath               string
 	mode                       os.FileMode
@@ -216,6 +233,7 @@ type Session struct {
 	coordinateLineage          *coordinate.Lineage
 	closeDone                  chan struct{}
 	closeErr                   error
+	closeCompleted             bool
 	nextPersistenceID          uint64
 	journalSyncErr             error
 	journalBytes               int64
@@ -223,6 +241,10 @@ type Session struct {
 	automaticCheckpoints       uint64
 	checkpointRequest          chan uint64
 	automaticCheckpointPending bool
+	activeSnapshotLeases       int
+	peakSnapshotLeases         int
+	waitingSaves               int
+	saveActive                 bool
 }
 
 func Open(path string, options OpenOptions) (*Session, error) {
@@ -241,7 +263,7 @@ func openSessionContext(ctx context.Context, path string, options OpenOptions, o
 	if ctx == nil {
 		return nil, ErrInvalidContext
 	}
-	if err := ctx.Err(); err != nil {
+	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
 	config, err := resolveOpenOptions(options)
@@ -311,24 +333,31 @@ func openSessionContext(ctx context.Context, path string, options OpenOptions, o
 	if config.RecoveryDirOwnership == DirectoryOwned {
 		generation.setJournalCleanupDirectory(config.RecoveryDir)
 	}
+	lifecycleContext, cancelLifecycle := context.WithCancelCause(context.Background())
+	saveGate := make(chan struct{}, 1)
+	saveGate <- struct{}{}
 	session := &Session{
 		path: absolute, resolvedPath: resolved, mode: info.Mode(), base: base, journal: journal, generation: generation, tree: tree,
 		undoStore: undo, sessionMarker: marker, hasBOM: scan.hasBOM, eol: scan.eol, recoveryDir: config.RecoveryDir,
 		sessionDir: config.SessionDir, config: config, fingerprint: fingerprint, diskIdentity: identityFor(info, scan.contentHash),
 		stopSync: make(chan struct{}), syncDone: make(chan struct{}), checkpointRequest: make(chan uint64, 1), operations: operations,
 		events: newEventHub(config.Limits.EventHistory), coordinateLineage: coordinate.NewLineage(), closeDone: make(chan struct{}),
+		saveGate: saveGate, lifecycleContext: lifecycleContext, cancelLifecycle: cancelLifecycle,
 	}
 	if journal != nil {
 		if err := session.replay(replay); err != nil {
+			cancelLifecycle(ErrClosed)
 			return nil, errors.Join(err, generation.retireAndWait(false), undo.close(), marker.close(), cleanupOwnedDirectories(config, true))
 		}
 		if replay.Truncated {
 			if err := journal.RepairTail(replay.ValidBytes); err != nil {
+				cancelLifecycle(ErrClosed)
 				return nil, errors.Join(err, generation.retireAndWait(false), undo.close(), marker.close(), cleanupOwnedDirectories(config, true))
 			}
 		}
 		session.journalBytes, err = operations.sizeRecovery(journal)
 		if err != nil {
+			cancelLifecycle(ErrClosed)
 			return nil, errors.Join(err, generation.retireAndWait(false), undo.close(), marker.close(), cleanupOwnedDirectories(config, true))
 		}
 	}
@@ -582,7 +611,7 @@ func (s *Session) resetJournalCheckpointLocked() {
 
 func (s *Session) maybeScheduleJournalCheckpointLocked() {
 	threshold := s.config.AutoCheckpointJournalBytes
-	if threshold == 0 || s.closed || s.fault != nil || s.journal == nil ||
+	if threshold == 0 || s.closed || context.Cause(s.lifecycleContext) != nil || s.fault != nil || s.journal == nil ||
 		s.journalBytes < s.nextJournalCheckpoint || s.automaticCheckpointPending {
 		return
 	}
@@ -615,54 +644,65 @@ func (s *Session) ReadAt(p []byte, off int64) (int, error) {
 	return s.tree.ReadAt(p, off)
 }
 
+// Snapshot returns an immutable lease for the current revision. The caller
+// must Close it; all host-facing Snapshot consumers share MaxSnapshotLeases.
 func (s *Session) Snapshot() (uint64, SnapshotLease, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.closed {
-		return 0, nil, ErrClosed
-	}
-	return s.revision, s.generation.acquire(s.tree.Snapshot()), nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.snapshotLocked()
 }
 
 // CoordinateIndex builds a bounded-query UTF-8 coordinate index for one
 // immutable Session revision. The returned Index owns its Snapshot lease and
 // must be closed by the caller.
 func (s *Session) CoordinateIndex(ctx context.Context, options coordinate.Options) (*coordinate.Index, error) {
+	operationContext, finish, err := s.operationContext(ctx)
+	if errors.Is(err, ErrInvalidContext) {
+		return nil, coordinate.ErrInvalidContext
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
 	revision, snapshot, err := s.Snapshot()
 	if err != nil {
 		return nil, err
 	}
 	options.Lineage = s.coordinateLineage
-	return coordinate.BuildOwned(ctx, snapshot, revision, options)
+	return coordinate.BuildOwned(operationContext, snapshot, revision, options)
 }
 
 // VirtualPager builds a format-neutral logical Page and Fragment pager for one
 // immutable Session revision. The returned Pager owns its Snapshot lease and
 // must be closed by the caller.
 func (s *Session) VirtualPager(ctx context.Context, options virtual.Options) (*virtual.Pager, error) {
-	if ctx == nil {
+	operationContext, finish, err := s.operationContext(ctx)
+	if errors.Is(err, ErrInvalidContext) {
 		return nil, virtual.ErrInvalidContext
 	}
-	if err := ctx.Err(); err != nil {
+	if err != nil {
 		return nil, err
 	}
+	defer finish()
 	revision, snapshot, err := s.Snapshot()
 	if err != nil {
 		return nil, err
 	}
-	return virtual.BuildOwned(ctx, snapshot, revision, options)
+	return virtual.BuildOwned(operationContext, snapshot, revision, options)
 }
 
 // RebuildCoordinateIndex derives the current revision's index from a previous
 // Session index and the exact ChangeMap chain between them. The new index keeps
 // its own Snapshot lease; the previous index remains independently usable.
 func (s *Session) RebuildCoordinateIndex(ctx context.Context, previous *coordinate.Index, changes coordinate.ChangeMap) (*coordinate.Index, error) {
-	if ctx == nil {
+	operationContext, finish, err := s.operationContext(ctx)
+	if errors.Is(err, ErrInvalidContext) {
 		return nil, coordinate.ErrInvalidContext
 	}
-	if err := ctx.Err(); err != nil {
+	if err != nil {
 		return nil, err
 	}
+	defer finish()
 	if previous == nil {
 		return nil, coordinate.ErrInvalidIndex
 	}
@@ -676,18 +716,20 @@ func (s *Session) RebuildCoordinateIndex(ctx context.Context, previous *coordina
 	if revision != changes.AfterRevision() {
 		return nil, errors.Join(coordinate.ErrRevisionMismatch, snapshot.Close())
 	}
-	return coordinate.RebuildOwned(ctx, snapshot, previous, changes)
+	return coordinate.RebuildOwned(operationContext, snapshot, previous, changes)
 }
 
 // RefreshCoordinateIndex rebuilds the current index from a previous index made
 // by this Session and the retained ChangeMap chain between revisions.
 func (s *Session) RefreshCoordinateIndex(ctx context.Context, previous *coordinate.Index) (*coordinate.Index, error) {
-	if ctx == nil {
+	operationContext, finish, err := s.operationContext(ctx)
+	if errors.Is(err, ErrInvalidContext) {
 		return nil, coordinate.ErrInvalidContext
 	}
-	if err := ctx.Err(); err != nil {
+	if err != nil {
 		return nil, err
 	}
+	defer finish()
 	if previous == nil {
 		return nil, coordinate.ErrInvalidIndex
 	}
@@ -695,28 +737,33 @@ func (s *Session) RefreshCoordinateIndex(ctx context.Context, previous *coordina
 		return nil, coordinate.ErrLineageMismatch
 	}
 	previousStats := previous.Stats()
-	s.mu.RLock()
-	if s.closed {
-		s.mu.RUnlock()
+	s.mu.Lock()
+	if s.closed || context.Cause(s.lifecycleContext) != nil {
+		s.mu.Unlock()
 		return nil, ErrClosed
 	}
 	history := s.changeHistory.clone()
-	snapshot := s.generation.acquire(s.tree.Snapshot())
-	s.mu.RUnlock()
+	_, snapshot, err := s.snapshotLocked()
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
 	changes, err := history.between(previousStats.Revision, history.currentRevision)
 	if err != nil {
 		return nil, errors.Join(err, snapshot.Close())
 	}
-	return coordinate.RebuildOwned(ctx, snapshot, previous, changes)
+	return coordinate.RebuildOwned(operationContext, snapshot, previous, changes)
 }
 
 func (s *Session) ApplyBatch(ctx context.Context, expectedRevision uint64, operations []ReplaceOperation) (ApplyResult, error) {
-	if ctx == nil {
-		return ApplyResult{}, ErrInvalidContext
+	operationContext, finish, err := s.operationContext(ctx)
+	if err != nil {
+		return ApplyResult{}, err
 	}
+	defer finish()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed || context.Cause(s.lifecycleContext) != nil {
 		return ApplyResult{}, ErrClosed
 	}
 	if s.fault != nil {
@@ -729,10 +776,13 @@ func (s *Session) ApplyBatch(ctx context.Context, expectedRevision uint64, opera
 		changes, _ := coordinate.Identity(s.revision, s.tree.Len()) // Session lengths are always nonnegative.
 		return ApplyResult{Revision: s.revision, ByteLength: s.tree.Len(), Dirty: s.dirty, Changes: changes}, nil
 	}
+	if err := contextError(operationContext); err != nil {
+		return ApplyResult{}, err
+	}
 	if len(operations) > s.config.Limits.MaxBatchOperations {
 		return ApplyResult{}, fmt.Errorf("%w: transaction has %d operations, maximum is %d", ErrLimitExceeded, len(operations), s.config.Limits.MaxBatchOperations)
 	}
-	changes, err := s.applyOperationsLocked(ctx, operations, true)
+	changes, err := s.applyOperationsLocked(operationContext, operations, true)
 	if err != nil {
 		return ApplyResult{}, err
 	}
@@ -760,7 +810,7 @@ func (s *Session) applyOperationsLocked(ctx context.Context, operations []Replac
 	}
 	// Staging has already proved every range and intermediate length valid.
 	changes, _ := coordinate.NewChangeMap(beforeRevision, beforeRevision+uint64(len(staged)), beforeLength, edits)
-	if err := ctx.Err(); err != nil {
+	if err := contextError(ctx); err != nil {
 		return coordinate.ChangeMap{}, err
 	}
 	recoveryOperations := make([]recovery.ReplaceOperation, len(staged))
@@ -779,6 +829,9 @@ func (s *Session) applyOperationsLocked(ctx context.Context, operations []Replac
 	if err := checkJournalQuota(anticipatedBytes, batchBytes, s.config.Limits.MaxJournalBytes); err != nil {
 		return coordinate.ChangeMap{}, err
 	}
+	if err := contextError(ctx); err != nil {
+		return coordinate.ChangeMap{}, err
+	}
 	if err := s.ensureJournalLocked(); err != nil {
 		return coordinate.ChangeMap{}, err
 	}
@@ -789,12 +842,18 @@ func (s *Session) applyOperationsLocked(ctx context.Context, operations []Replac
 	if err != nil {
 		return coordinate.ChangeMap{}, err
 	}
+	if err := contextError(ctx); err != nil {
+		return coordinate.ChangeMap{}, errors.Join(err, s.journal.RepairTail(appendResult.BatchOffset))
+	}
 	finalTree, err := s.operations.cloneTree(s.tree)
 	if err != nil {
 		_ = s.journal.RepairTail(appendResult.BatchOffset)
 		return coordinate.ChangeMap{}, err
 	}
 	for index, operation := range staged {
+		if err := contextError(ctx); err != nil {
+			return coordinate.ChangeMap{}, errors.Join(err, s.journal.RepairTail(appendResult.BatchOffset))
+		}
 		piece := store.Piece{}
 		if len(operation.inserted) > 0 {
 			piece = store.Piece{
@@ -811,6 +870,9 @@ func (s *Session) applyOperationsLocked(ctx context.Context, operations []Replac
 	entry := historyEntry{}
 	if recordHistory {
 		for _, operation := range staged {
+			if err := contextError(ctx); err != nil {
+				return coordinate.ChangeMap{}, errors.Join(err, s.journal.RepairTail(appendResult.BatchOffset))
+			}
 			forwardRef, historyErr := s.historyText(operation.inserted)
 			if historyErr != nil {
 				return coordinate.ChangeMap{}, errors.Join(historyErr, s.journal.RepairTail(appendResult.BatchOffset))
@@ -865,7 +927,7 @@ func (s *Session) stageOperationsLocked(ctx context.Context, operations []Replac
 	var stagingBytes []byte
 	result := make([]stagedOperation, 0, len(operations))
 	for _, op := range operations {
-		if err := ctx.Err(); err != nil {
+		if err := contextError(ctx); err != nil {
 			return nil, err
 		}
 		if !utf8.ValidString(op.Insert) {
@@ -911,10 +973,24 @@ func cloneDocumentTree(source *store.Tree) *store.Tree {
 }
 
 func (s *Session) Undo() (ApplyResult, error) {
+	return s.UndoContext(context.Background())
+}
+
+// UndoContext applies the newest inverse transaction. Cancellation before
+// publication leaves the current revision and history stacks unchanged.
+func (s *Session) UndoContext(ctx context.Context) (ApplyResult, error) {
+	operationContext, finish, err := s.operationContext(ctx)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	defer finish()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed || context.Cause(s.lifecycleContext) != nil {
 		return ApplyResult{}, ErrClosed
+	}
+	if err := contextError(operationContext); err != nil {
+		return ApplyResult{}, err
 	}
 	if s.fault != nil {
 		return ApplyResult{}, errors.Join(ErrFaulted, s.fault)
@@ -923,11 +999,11 @@ func (s *Session) Undo() (ApplyResult, error) {
 		return ApplyResult{}, ErrNothingToUndo
 	}
 	entry := s.undo[len(s.undo)-1]
-	operations, err := s.materializeHistory(entry.inverse)
+	operations, err := s.materializeHistory(operationContext, entry.inverse)
 	if err != nil {
 		return ApplyResult{}, err
 	}
-	changes, err := s.applyOperationsLocked(context.Background(), operations, false)
+	changes, err := s.applyOperationsLocked(operationContext, operations, false)
 	if err != nil {
 		return ApplyResult{}, err
 	}
@@ -939,10 +1015,24 @@ func (s *Session) Undo() (ApplyResult, error) {
 }
 
 func (s *Session) Redo() (ApplyResult, error) {
+	return s.RedoContext(context.Background())
+}
+
+// RedoContext reapplies the newest forward transaction. Cancellation before
+// publication leaves the current revision and history stacks unchanged.
+func (s *Session) RedoContext(ctx context.Context) (ApplyResult, error) {
+	operationContext, finish, err := s.operationContext(ctx)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	defer finish()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed || context.Cause(s.lifecycleContext) != nil {
 		return ApplyResult{}, ErrClosed
+	}
+	if err := contextError(operationContext); err != nil {
+		return ApplyResult{}, err
 	}
 	if s.fault != nil {
 		return ApplyResult{}, errors.Join(ErrFaulted, s.fault)
@@ -951,11 +1041,11 @@ func (s *Session) Redo() (ApplyResult, error) {
 		return ApplyResult{}, ErrNothingToRedo
 	}
 	entry := s.redo[len(s.redo)-1]
-	operations, err := s.materializeHistory(entry.forward)
+	operations, err := s.materializeHistory(operationContext, entry.forward)
 	if err != nil {
 		return ApplyResult{}, err
 	}
-	changes, err := s.applyOperationsLocked(context.Background(), operations, false)
+	changes, err := s.applyOperationsLocked(operationContext, operations, false)
 	if err != nil {
 		return ApplyResult{}, err
 	}
@@ -966,9 +1056,12 @@ func (s *Session) Redo() (ApplyResult, error) {
 	return ApplyResult{Revision: s.revision, ByteLength: s.tree.Len(), Dirty: true, Changes: changes}, nil
 }
 
-func (s *Session) materializeHistory(source []historyOperation) ([]ReplaceOperation, error) {
+func (s *Session) materializeHistory(ctx context.Context, source []historyOperation) ([]ReplaceOperation, error) {
 	result := make([]ReplaceOperation, 0, len(source))
 	for _, operation := range source {
+		if err := contextError(ctx); err != nil {
+			return nil, err
+		}
 		insert, err := s.undoStore.read(operation.insert)
 		if err != nil {
 			return nil, err
@@ -1047,12 +1140,18 @@ func (s *Session) discardPreparedJournal(prepared *preparedJournalRebase, remove
 // prepareJournalRebaseLocked builds and syncs the recovery journal that will
 // belong to the replacement base. The caller holds s.mu, preventing an edit
 // from landing only in the old journal after this snapshot is taken.
-func (s *Session) prepareJournalRebaseLocked(fingerprint recovery.Fingerprint, targetRevision uint64) (*preparedJournalRebase, error) {
+func (s *Session) prepareJournalRebaseLocked(ctx context.Context, fingerprint recovery.Fingerprint, targetRevision uint64) (*preparedJournalRebase, error) {
 	newer := make([]pendingOperation, 0, len(s.pending))
 	for _, operation := range s.pending {
+		if err := contextError(ctx); err != nil {
+			return nil, err
+		}
 		if operation.revision > targetRevision {
 			newer = append(newer, operation)
 		}
+	}
+	if err := contextError(ctx); err != nil {
+		return nil, err
 	}
 	path := filepath.Join(s.recoveryDir, journalPrefix(fingerprint)+"."+randomSuffix()+".docengine-journal-v2")
 	journal, replay, err := s.operations.openRecovery(path, fingerprint)
@@ -1072,12 +1171,18 @@ func (s *Session) prepareJournalRebaseLocked(fingerprint recovery.Fingerprint, t
 	}
 	prepared.bytes = size
 	for first := 0; first < len(newer); {
+		if err := contextError(ctx); err != nil {
+			return fail(err)
+		}
 		last := first + 1
 		for last < len(newer) && newer[last].group == newer[first].group {
 			last++
 		}
 		batch := make([]recovery.ReplaceOperation, last-first)
 		for index := first; index < last; index++ {
+			if err := contextError(ctx); err != nil {
+				return fail(err)
+			}
 			operation := newer[index]
 			inserted := make([]byte, operation.insertLength)
 			if operation.insertLength > 0 {
@@ -1107,7 +1212,13 @@ func (s *Session) prepareJournalRebaseLocked(fingerprint recovery.Fingerprint, t
 		}
 		first = last
 	}
+	if err := contextError(ctx); err != nil {
+		return fail(err)
+	}
 	if err := s.operations.syncRecovery(journal); err != nil {
+		return fail(err)
+	}
+	if err := contextError(ctx); err != nil {
 		return fail(err)
 	}
 	if err := s.operations.syncParent(path); err != nil {
@@ -1120,14 +1231,43 @@ func (s *Session) prepareJournalRebaseLocked(fingerprint recovery.Fingerprint, t
 	return prepared, nil
 }
 
-func (s *Session) Save() (Metadata, error) { return s.CommitAtLeast(0) }
+func (s *Session) Save() (Metadata, error) {
+	return s.SaveContext(context.Background())
+}
+
+// SaveContext persists the newest revision. Cancellation while waiting for the
+// save serializer or streaming the temporary file leaves the base unchanged.
+// Once atomic replacement commits, the committed result takes precedence over
+// later cancellation.
+func (s *Session) SaveContext(ctx context.Context) (Metadata, error) {
+	return s.CommitAtLeastContext(ctx, 0)
+}
 
 // CommitAtLeast atomically persists a snapshot whose revision is at least the
 // requested revision. New edits continue in the current generation while the
 // snapshot is streamed.
-func (s *Session) CommitAtLeast(expectedRevision uint64) (result Metadata, resultErr error) {
-	s.saveMu.Lock()
-	defer s.saveMu.Unlock()
+func (s *Session) CommitAtLeast(expectedRevision uint64) (Metadata, error) {
+	return s.CommitAtLeastContext(context.Background(), expectedRevision)
+}
+
+// CommitAtLeastContext is CommitAtLeast with bounded waiting and streaming
+// cancellation. Close rejects queued saves and cancels Session-owned automatic
+// checkpoints; an already active host save is governed by its caller's ctx.
+func (s *Session) CommitAtLeastContext(ctx context.Context, expectedRevision uint64) (result Metadata, resultErr error) {
+	if ctx == nil {
+		return Metadata{}, ErrInvalidContext
+	}
+	if err := contextError(ctx); err != nil {
+		return Metadata{}, err
+	}
+	if err := s.acquireSave(ctx); err != nil {
+		return Metadata{}, err
+	}
+	defer s.releaseSave()
+	return s.commitAtLeast(ctx, expectedRevision)
+}
+
+func (s *Session) commitAtLeast(ctx context.Context, expectedRevision uint64) (result Metadata, resultErr error) {
 	var persistence PersistenceProgress
 	var persistenceMetadata Metadata
 	persistenceStarted, persistenceFinished := false, false
@@ -1143,9 +1283,13 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (result Metadata, resul
 	}()
 
 	s.mu.Lock()
-	if s.closed {
+	if s.closed || context.Cause(s.lifecycleContext) != nil {
 		s.mu.Unlock()
 		return Metadata{}, ErrClosed
+	}
+	if err := contextError(ctx); err != nil {
+		s.mu.Unlock()
+		return Metadata{}, err
 	}
 	if s.fault != nil {
 		metadata, fault := s.metadataLocked(), s.fault
@@ -1162,6 +1306,9 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (result Metadata, resul
 			persistence, persistenceMetadata = s.beginPersistenceLocked(s.committedRevision, s.diskIdentity.size)
 			persistenceStarted = true
 			s.mu.Unlock()
+			if err := contextError(ctx); err != nil {
+				return Metadata{}, err
+			}
 			if err := s.operations.syncParent(path); err != nil {
 				s.mu.RLock()
 				metadata := s.metadataLocked()
@@ -1184,6 +1331,7 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (result Metadata, resul
 	targetRevision := s.revision
 	lease := s.generation.acquire(s.tree.Snapshot())
 	path, mode, expectedIdentity := s.resolvedPath, s.mode, s.diskIdentity
+	commitHook := s.commitHook
 	prefix := []byte(nil)
 	if s.hasBOM {
 		prefix = []byte{0xef, 0xbb, 0xbf}
@@ -1197,8 +1345,11 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (result Metadata, resul
 	persistenceStarted = true
 	s.mu.Unlock()
 	defer lease.Close()
-	if s.commitHook != nil {
-		s.commitHook("snapshot")
+	if commitHook != nil {
+		commitHook("snapshot")
+	}
+	if err := contextError(ctx); err != nil {
+		return Metadata{}, err
 	}
 
 	quickInfo, err := s.operations.stat(path)
@@ -1209,7 +1360,7 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (result Metadata, resul
 		return Metadata{}, ErrExternalChange
 	}
 	if quickInfo.ModTime().UnixNano() != expectedIdentity.modTime {
-		current, scanErr := scanDiskIdentity(context.Background(), path, s.operations)
+		current, scanErr := scanDiskIdentity(ctx, path, s.operations)
 		if scanErr != nil {
 			return Metadata{}, scanErr
 		}
@@ -1226,6 +1377,12 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (result Metadata, resul
 		boundaryLocked bool
 	)
 	checkIdentity := func() error {
+		if err := contextError(ctx); err != nil {
+			return err
+		}
+		if commitHook != nil {
+			commitHook("identity")
+		}
 		s.mu.Lock()
 		boundaryLocked = true
 		unlock := func(err error) error {
@@ -1233,7 +1390,10 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (result Metadata, resul
 			s.mu.Unlock()
 			return err
 		}
-		current, scanErr := scanDiskIdentity(context.Background(), path, s.operations)
+		if err := contextError(ctx); err != nil {
+			return unlock(err)
+		}
+		current, scanErr := scanDiskIdentity(ctx, path, s.operations)
 		if scanErr != nil {
 			return unlock(scanErr)
 		}
@@ -1243,16 +1403,19 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (result Metadata, resul
 		copy(newContentHash[:], hasher.Sum(nil))
 		newFingerprint = recovery.FingerprintFor(path, persistence.TotalBytes, newContentHash)
 		var prepareErr error
-		prepared, prepareErr = s.prepareJournalRebaseLocked(newFingerprint, targetRevision)
+		prepared, prepareErr = s.prepareJournalRebaseLocked(ctx, newFingerprint, targetRevision)
 		if prepareErr != nil {
 			return unlock(prepareErr)
+		}
+		if err := contextError(ctx); err != nil {
+			return unlock(errors.Join(err, s.discardPreparedJournal(prepared, true)))
 		}
 		// Keep s.mu held through the atomic replacement. No edit can land only
 		// in the old journal after the synced replacement journal was prepared.
 		return nil
 	}
 	writeContent := func(writer io.Writer) (int64, error) {
-		progressWriter := newSaveProgressWriter(writer, int64(len(prefix)), persistence.TotalBytes, func(completed int64) {
+		progressWriter := newSaveProgressWriter(contextWriter{ctx: ctx, writer: writer}, int64(len(prefix)), persistence.TotalBytes, func(completed int64) {
 			persistence.CompletedBytes = completed
 			s.publishPersistenceEvent(EventSaveProgress, persistenceMetadata, persistence, nil)
 		})
@@ -1353,25 +1516,53 @@ func (s *Session) CommitAtLeast(expectedRevision uint64) (result Metadata, resul
 }
 
 func (s *Session) Close() error {
-	// Save may install a replacement source generation after its immutable
-	// snapshot has been streamed. Stop background checkpoint scheduling before
-	// waiting for saveMu so the checkpoint worker cannot deadlock behind Close.
-	s.mu.Lock()
-	if s.closed {
-		done := s.closeDone
-		s.mu.Unlock()
-		<-done
+	return s.CloseContext(context.Background())
+}
+
+// CloseContext starts the one shared shutdown and waits for its resource
+// barrier. If ctx expires, cleanup continues independently; a later Close or
+// CloseContext observes the same final result.
+func (s *Session) CloseContext(ctx context.Context) error {
+	if ctx == nil {
+		return ErrInvalidContext
+	}
+	select {
+	case <-s.closeDone:
 		s.mu.RLock()
 		err := s.closeErr
 		s.mu.RUnlock()
 		return err
+	default:
 	}
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	s.closeOnce.Do(func() {
+		// Cancel Session-owned background work and Context-aware mutation/build
+		// operations before waiting for s.mu. An active host Save keeps its
+		// caller's Context and is serialized with resource retirement below.
+		s.cancelLifecycle(ErrClosed)
+		go s.finishClose()
+	})
+	select {
+	case <-s.closeDone:
+		s.mu.RLock()
+		err := s.closeErr
+		s.mu.RUnlock()
+		return err
+	case <-ctx.Done():
+		return contextError(ctx)
+	}
+}
+
+func (s *Session) finishClose() {
+	s.mu.Lock()
 	s.closed = true
 	close(s.stopSync)
 	s.mu.Unlock()
 	<-s.syncDone
-	s.saveMu.Lock()
-	defer s.saveMu.Unlock()
+	<-s.saveGate
+	defer func() { s.saveGate <- struct{}{} }()
 	s.mu.Lock()
 	s.automaticCheckpointPending = false
 	dirty, generation := s.dirty, s.generation
@@ -1391,9 +1582,9 @@ func (s *Session) Close() error {
 	s.events.close()
 	s.mu.Lock()
 	s.closeErr = err
+	s.closeCompleted = true
 	close(s.closeDone)
 	s.mu.Unlock()
-	return err
 }
 
 func (s *Session) syncLoop() {
@@ -1413,7 +1604,7 @@ func (s *Session) syncLoop() {
 				s.mu.Unlock()
 			}
 		case target := <-s.checkpointRequest:
-			metadata, _ := s.CommitAtLeast(target)
+			metadata, _ := s.CommitAtLeastContext(s.lifecycleContext, target)
 			s.mu.Lock()
 			s.automaticCheckpointPending = false
 			if metadata.CommittedRevision >= target {
@@ -1556,7 +1747,7 @@ func scanOpenedBaseWithChange(ctx context.Context, file readStatFile, path strin
 	}
 	buffer := make([]byte, scanBufferSize)
 	for offset := int64(0); offset < initial.Size(); {
-		if err := ctx.Err(); err != nil {
+		if err := contextError(ctx); err != nil {
 			return baseScan{}, err
 		}
 		want := min(int64(len(buffer)), initial.Size()-offset)
@@ -1582,7 +1773,7 @@ func scanOpenedBaseWithChange(ctx context.Context, file readStatFile, path strin
 	if !validator.Complete() {
 		return baseScan{}, ErrInvalidUTF8
 	}
-	if err := ctx.Err(); err != nil {
+	if err := contextError(ctx); err != nil {
 		return baseScan{}, err
 	}
 	pathInfo, err := stat(path)
@@ -1639,7 +1830,7 @@ func scanDiskIdentityOpenedWithChange(ctx context.Context, path string, file rea
 	hasher := sha256.New()
 	buffer := make([]byte, scanBufferSize)
 	for offset := int64(0); offset < initial.Size(); {
-		if err := ctx.Err(); err != nil {
+		if err := contextError(ctx); err != nil {
 			return fileIdentity{}, err
 		}
 		want := min(int64(len(buffer)), initial.Size()-offset)

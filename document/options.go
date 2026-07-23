@@ -19,6 +19,8 @@ const (
 	MaximumChangeHistory       = 4_096
 	DefaultMaxAnchorBatch      = 65_536
 	MaximumAnchorBatch         = 1_048_576
+	DefaultMaxSnapshotLeases   = 1_024
+	MaximumSnapshotLeases      = 1_048_576
 	DefaultJournalSyncInterval = time.Second
 )
 
@@ -43,6 +45,9 @@ type SessionLimits struct {
 	EventHistory       int
 	ChangeHistory      int
 	MaxAnchorBatch     int
+	// MaxSnapshotLeases bounds host-owned Snapshot, coordinate Index, and
+	// virtual Pager leases across all current and retired source generations.
+	MaxSnapshotLeases int
 }
 
 type OpenOptions struct {
@@ -93,6 +98,9 @@ func resolveOpenOptions(options OpenOptions) (SessionConfig, error) {
 	if limits.MaxAnchorBatch == 0 {
 		limits.MaxAnchorBatch = DefaultMaxAnchorBatch
 	}
+	if limits.MaxSnapshotLeases == 0 {
+		limits.MaxSnapshotLeases = DefaultMaxSnapshotLeases
+	}
 	if limits.MaxBatchOperations < 0 || limits.MaxBatchOperations > DefaultMaxBatchOperations {
 		return SessionConfig{}, fmt.Errorf("%w: MaxBatchOperations must be between 1 and %d", ErrInvalidOptions, DefaultMaxBatchOperations)
 	}
@@ -113,6 +121,9 @@ func resolveOpenOptions(options OpenOptions) (SessionConfig, error) {
 	}
 	if limits.MaxAnchorBatch < 0 || limits.MaxAnchorBatch > MaximumAnchorBatch {
 		return SessionConfig{}, fmt.Errorf("%w: MaxAnchorBatch must be between 1 and %d", ErrInvalidOptions, MaximumAnchorBatch)
+	}
+	if limits.MaxSnapshotLeases < 0 || limits.MaxSnapshotLeases > MaximumSnapshotLeases {
+		return SessionConfig{}, fmt.Errorf("%w: MaxSnapshotLeases must be between 1 and %d", ErrInvalidOptions, MaximumSnapshotLeases)
 	}
 	syncInterval := options.JournalSyncInterval
 	if syncInterval == 0 {

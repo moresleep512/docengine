@@ -78,6 +78,7 @@ jobs:
       - run: go test ./document -run=^$ -fuzz=FuzzSessionConcurrentSaveEdit -fuzztime=10s
       - run: go test ./document -run=^$ -fuzz=FuzzSessionCrashRecovery -fuzztime=10s
       - run: go test ./document -run=^$ -fuzz=FuzzSessionJournalQuotaIsAtomic -fuzztime=10s
+      - run: go test ./document -run=^$ -fuzz=FuzzSessionLifecycleBudgets -fuzztime=10s
       - run: go test ./document -run=^$ -fuzz=FuzzUTF8ReplacementBoundaries -fuzztime=10s
       - run: go test ./document -run=^$ -fuzz=FuzzEventHubStateMachine -fuzztime=10s
       - run: go test ./document -run=^$ -fuzz=FuzzChangeHistoryStateMachine -fuzztime=10s

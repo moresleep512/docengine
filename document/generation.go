@@ -166,3 +166,31 @@ func (l *snapshotLease) Close() error {
 	l.mu.Unlock()
 	return generation.release()
 }
+
+// trackedSnapshotLease accounts for every lease handed to a host-facing
+// Session API. The underlying generation owns the actual source handles; the
+// Session owns the cross-generation resource budget.
+type trackedSnapshotLease struct {
+	lease   SnapshotLease
+	session *Session
+	once    sync.Once
+	err     error
+}
+
+func (l *trackedSnapshotLease) Len() int64 { return l.lease.Len() }
+
+func (l *trackedSnapshotLease) ReadAt(p []byte, off int64) (int, error) {
+	return l.lease.ReadAt(p, off)
+}
+
+func (l *trackedSnapshotLease) WriteTo(w io.Writer) (int64, error) {
+	return l.lease.WriteTo(w)
+}
+
+func (l *trackedSnapshotLease) Close() error {
+	l.once.Do(func() {
+		l.session.releaseSnapshotLease()
+		l.err = l.lease.Close()
+	})
+	return l.err
+}
